@@ -80,9 +80,17 @@ impl Renderer {
             return None;
         }
 
-        // Initialize pool if needed
+        // Create overlay and render first to get actual pixmap dimensions
+        let overlay = Overlay::new(self.width, self.height, self.scale, config);
+        let pixmap = if show_full {
+            overlay.render_full(hints, input, selected_index)?
+        } else {
+            overlay.render_initial()?
+        };
+
+        // Initialize pool based on actual pixmap size (physical/scaled dimensions)
         if self.pool.is_none() {
-            let size = (self.width * self.height * 4) as usize;
+            let size = (pixmap.width() * pixmap.height() * 4) as usize;
             match SlotPool::new(size, shm) {
                 Ok(pool) => self.pool = Some(pool),
                 Err(e) => {
@@ -93,14 +101,6 @@ impl Renderer {
         }
 
         let pool = self.pool.as_mut()?;
-
-        // Create overlay and render
-        let overlay = Overlay::new(self.width, self.height, self.scale, config);
-        let pixmap = if show_full {
-            overlay.render_full(hints, input, selected_index)?
-        } else {
-            overlay.render_initial()?
-        };
 
         let stride = pixmap.width() as i32 * 4;
 

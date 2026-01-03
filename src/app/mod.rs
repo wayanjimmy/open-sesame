@@ -397,6 +397,11 @@ impl CompositorHandler for App {
         new_factor: i32,
     ) {
         self.renderer.set_scale(new_factor as f32);
+
+        // Tell compositor about the buffer scale
+        if let Some(ref layer_surface) = self.layer_surface {
+            layer_surface.wl_surface().set_buffer_scale(new_factor);
+        }
     }
 
     fn transform_changed(
