@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 core-types  = { workspace = true }
 serde       = { workspace = true }
@@ -19,3 +22,4 @@ thiserror   = { workspace = true }
 [dev-dependencies]
 tokio-test  = { workspace = true }
 tempfile    = { workspace = true }
+serde_json  = { workspace = true }

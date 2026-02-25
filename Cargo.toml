@@ -58,6 +58,7 @@ extension-sdk   = { path = "extension-sdk" }
 serde           = { version = "1", features = ["derive"] }
 postcard        = { version = "1", features = ["use-std"] }
 toml            = "1"
+serde_json      = "1"
 
 # -- Types & Errors --
 thiserror       = "2"
@@ -151,3 +152,28 @@ tokio-test      = "0.4"
 
 # -- Build/xtask --
 flate2          = "1"
+
+# ============================================================================
+# Workspace Lints
+# ============================================================================
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# ============================================================================
+# Release Profiles
+# ============================================================================
+
+[profile.release]
+lto = "thin"
+strip = true
+opt-level = 3
+codegen-units = 1
+
+[profile.release-full]
+inherits = "release"
+lto = "fat"
