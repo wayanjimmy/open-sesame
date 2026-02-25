@@ -9,3 +9,16 @@
 //! The `cosmic` feature flag enables COSMIC-specific protocol support
 //! (cosmic-toplevel-info-v1, cosmic-workspace). This pulls in GPL-3.0
 //! dependencies — enable only when building for COSMIC desktop.
+
+#[cfg(target_os = "linux")]
+pub mod compositor;
+#[cfg(target_os = "linux")]
+pub mod clipboard;
+#[cfg(target_os = "linux")]
+pub mod dbus;
+#[cfg(target_os = "linux")]
+pub mod input;
+#[cfg(target_os = "linux")]
+pub mod sandbox;
+#[cfg(target_os = "linux")]
+pub mod systemd;
