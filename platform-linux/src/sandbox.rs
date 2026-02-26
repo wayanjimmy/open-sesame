@@ -121,8 +121,7 @@ pub fn apply_seccomp(profile: &SeccompProfile) -> core_types::Result<()> {
     use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 
     // Default action: kill the process on any disallowed syscall.
-    // TODO: revert to KillProcess after identifying blocked syscalls
-    let mut filter = ScmpFilterContext::new(ScmpAction::Log)
+    let mut filter = ScmpFilterContext::new(ScmpAction::KillProcess)
         .map_err(|e| core_types::Error::Platform(format!("seccomp new_filter failed: {e}")))?;
 
     for syscall_name in &profile.allowed_syscalls {

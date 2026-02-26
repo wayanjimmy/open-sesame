@@ -713,7 +713,7 @@ fn apply_sandbox() {
             "set_robust_list".into(), "set_tid_address".into(),
             "rseq".into(), "sched_getaffinity".into(),
             "prlimit64".into(), "prctl".into(),
-            "getpid".into(), "gettid".into(), "geteuid".into(),
+            "getpid".into(), "gettid".into(), "getuid".into(), "geteuid".into(),
             "kill".into(),
             // Epoll / event loop (tokio)
             "epoll_wait".into(), "epoll_ctl".into(),
