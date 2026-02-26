@@ -708,25 +708,32 @@ fn apply_sandbox() {
             "mmap".into(), "mprotect".into(), "munmap".into(),
             "mlock".into(), "munlock".into(), "madvise".into(),
             "brk".into(),
-            // Synchronisation / threading
+            // Process / threading
             "futex".into(), "clone3".into(), "clone".into(),
-            "set_robust_list".into(), "rseq".into(),
-            "sched_getaffinity".into(), "prlimit64".into(),
+            "set_robust_list".into(), "set_tid_address".into(),
+            "rseq".into(), "sched_getaffinity".into(),
+            "prlimit64".into(), "prctl".into(),
+            "getpid".into(), "gettid".into(), "geteuid".into(),
+            "kill".into(),
             // Epoll / event loop (tokio)
             "epoll_wait".into(), "epoll_ctl".into(),
-            "epoll_create1".into(), "eventfd2".into(), "poll".into(),
+            "epoll_create1".into(), "eventfd2".into(),
+            "poll".into(), "ppoll".into(),
+            // Timers (tokio runtime)
+            "clock_gettime".into(), "timer_create".into(),
+            "timer_settime".into(), "timer_delete".into(),
             // Networking / IPC
             "socket".into(), "connect".into(), "sendto".into(),
             "recvfrom".into(), "socketpair".into(),
             "sendmsg".into(), "recvmsg".into(),
+            "shutdown".into(), "getsockopt".into(),
             // Signals
             "sigaltstack".into(), "rt_sigaction".into(),
             "rt_sigprocmask".into(), "rt_sigreturn".into(),
             "tgkill".into(),
-            // Time
-            "clock_gettime".into(),
             // Misc
-            "exit_group".into(), "getrandom".into(),
+            "exit_group".into(), "exit".into(), "getrandom".into(),
+            "restart_syscall".into(),
             "pipe2".into(), "dup".into(), "ioctl".into(),
         ],
     };
