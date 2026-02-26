@@ -7,8 +7,63 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::ops::Deref;
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
+use zeroize::Zeroize;
+
+// ============================================================================
+// SensitiveBytes — zeroize-on-drop wrapper for secret byte fields
+// ============================================================================
+
+/// Sensitive byte buffer with automatic zeroize-on-drop.
+///
+/// Used for secret values and passwords in IPC `EventKind` variants.
+/// Zeroes the backing memory when dropped to prevent heap forensics.
+/// Debug output is redacted to prevent log exposure.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct SensitiveBytes(Vec<u8>);
+
+impl SensitiveBytes {
+    #[must_use]
+    pub fn new(data: Vec<u8>) -> Self {
+        Self(data)
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Drop for SensitiveBytes {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for SensitiveBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[REDACTED; {} bytes]", self.0.len())
+    }
+}
+
+impl From<Vec<u8>> for SensitiveBytes {
+    fn from(data: Vec<u8>) -> Self {
+        Self(data)
+    }
+}
 
 // ============================================================================
 // Identity Types
@@ -140,17 +195,13 @@ impl fmt::Display for SecretRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum SensitivityClass {
+    #[default]
     Public,
     Confidential,
     Secret,
     TopSecret,
-}
-
-impl Default for SensitivityClass {
-    fn default() -> Self {
-        Self::Public
-    }
 }
 
 // ============================================================================
@@ -159,21 +210,17 @@ impl Default for SensitivityClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum SecurityLevel {
     /// Events visible to all subscribers including extensions.
     Open,
     /// Events visible to authenticated daemons only.
+    #[default]
     Internal,
     /// Events visible only to daemons holding the current profile's security context.
     ProfileScoped,
     /// Events visible only to the secrets daemon.
     SecretsOnly,
-}
-
-impl Default for SecurityLevel {
-    fn default() -> Self {
-        Self::Internal
-    }
 }
 
 // ============================================================================
@@ -198,7 +245,9 @@ impl Timestamp {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
         Self {
+            #[allow(clippy::cast_possible_truncation)] // Uptime > 584 years before truncation
             monotonic_ns: mono.as_nanos() as u64,
+            #[allow(clippy::cast_possible_truncation)] // Wall clock > 584M years before truncation
             wall_ms: wall.as_millis() as u64,
         }
     }
@@ -212,7 +261,7 @@ impl Timestamp {
 /// Postcard does not support `#[serde(tag = "...", content = "...")]`.
 /// JSON output uses `{"VariantName": {...}}` format which is still
 /// fully deserializable and forward-compatible via `#[serde(other)]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum EventKind {
     // -- Window Manager Events --
@@ -237,19 +286,28 @@ pub enum EventKind {
     },
 
     // -- Profile Events --
-    ProfileSwitchRequested {
-        from: ProfileId,
-        to: ProfileId,
+    ProfileActivationBegun {
+        target: ProfileId,
         trigger: String,
     },
-    ProfileSwitchBegun {
-        from: ProfileId,
-        to: ProfileId,
-    },
-    ProfileSwitched {
-        from: ProfileId,
-        to: ProfileId,
+    ProfileActivated {
+        target: ProfileId,
         duration_ms: u32,
+    },
+    ProfileDeactivationBegun {
+        target: ProfileId,
+    },
+    ProfileDeactivated {
+        target: ProfileId,
+        duration_ms: u32,
+    },
+    ProfileActivationFailed {
+        target: ProfileId,
+        reason: String,
+    },
+    DefaultProfileChanged {
+        previous: ProfileId,
+        current: ProfileId,
     },
     ContextChanged {
         changed_signals: Vec<String>,
@@ -329,9 +387,270 @@ pub enum EventKind {
         locked_keys: Vec<String>,
     },
 
+    // -- RPC: Secrets (all scoped by trust profile name) --
+    SecretGet {
+        profile: TrustProfileName,
+        key: String,
+    },
+    SecretGetResponse {
+        key: String,
+        /// Secret value bytes. Plaintext over Noise-encrypted IPC transport
+        /// (default). With `ipc-field-encryption` feature on daemon-secrets,
+        /// this is additionally AES-256-GCM encrypted per-field.
+        value: SensitiveBytes,
+    },
+    SecretSet {
+        profile: TrustProfileName,
+        key: String,
+        /// Secret value bytes. Plaintext over Noise-encrypted IPC transport
+        /// (default). With `ipc-field-encryption` feature on daemon-secrets,
+        /// this is additionally AES-256-GCM encrypted per-field.
+        value: SensitiveBytes,
+    },
+    SecretSetResponse {
+        success: bool,
+    },
+    SecretDelete {
+        profile: TrustProfileName,
+        key: String,
+    },
+    SecretDeleteResponse {
+        success: bool,
+    },
+    SecretList {
+        profile: TrustProfileName,
+    },
+    SecretListResponse {
+        keys: Vec<String>,
+    },
+
+    // -- RPC: Profile Activation --
+    ProfileActivate {
+        target: ProfileId,
+        profile_name: TrustProfileName,
+    },
+    ProfileActivateResponse {
+        success: bool,
+    },
+    ProfileDeactivate {
+        target: ProfileId,
+        profile_name: TrustProfileName,
+    },
+    ProfileDeactivateResponse {
+        success: bool,
+    },
+    ProfileList,
+    ProfileListResponse {
+        profiles: Vec<ProfileSummary>,
+    },
+    SetDefaultProfile {
+        profile_name: TrustProfileName,
+    },
+    SetDefaultProfileResponse {
+        success: bool,
+    },
+
+    // -- RPC: Status --
+    StatusRequest,
+    StatusResponse {
+        active_profiles: Vec<TrustProfileName>,
+        default_profile: TrustProfileName,
+        daemon_uptimes_ms: Vec<(DaemonId, u64)>,
+        locked: bool,
+    },
+
+    // -- RPC: Unlock/Lock --
+    UnlockRequest {
+        /// Master password bytes (transmitted over UCred-authenticated Unix socket only).
+        password: SensitiveBytes,
+    },
+    UnlockResponse {
+        success: bool,
+    },
+    LockRequest,
+    LockResponse {
+        success: bool,
+    },
+
+    // -- RPC: Window Manager --
+    WmListWindows,
+    WmListWindowsResponse {
+        windows: Vec<Window>,
+    },
+    WmActivateWindow {
+        window_id: String,
+    },
+    WmActivateWindowResponse {
+        success: bool,
+    },
+    WmOverlayShown,
+    WmOverlayDismissed,
+
+    // -- RPC: Launcher --
+    LaunchQuery {
+        query: String,
+        max_results: u32,
+        /// Trust profile context for scoped frecency and launch environment.
+        #[serde(default)]
+        profile: Option<TrustProfileName>,
+    },
+    LaunchQueryResponse {
+        results: Vec<LaunchResult>,
+    },
+    LaunchExecute {
+        entry_id: String,
+        /// Trust profile context — injected as `SESAME_PROFILE` env var in spawned process.
+        #[serde(default)]
+        profile: Option<TrustProfileName>,
+    },
+    LaunchExecuteResponse {
+        pid: u32,
+    },
+
     // Forward compatibility: unknown events deserialize to this variant.
     #[serde(other)]
     Unknown,
+}
+
+/// Implement `fmt::Debug` for `EventKind` with automatic redaction of sensitive variants.
+///
+/// **Sensitive variants** (containing passwords, secret values) are listed in the first section
+/// with explicit `[REDACTED; N bytes]` substitution. **All other variants** are listed in the
+/// second section and get standard `debug_struct` output generated by the macro.
+///
+/// Adding a new non-sensitive variant: add one line to the second section.
+/// Adding a new sensitive variant: add to the first section with explicit redaction.
+/// The compiler enforces exhaustiveness — forgetting a variant is a compile error.
+macro_rules! impl_event_debug {
+    (
+        sensitive {
+            $( $sens_variant:ident { $($sens_field:ident $( => $redact:tt)?),* } ),* $(,)?
+        }
+        transparent {
+            $( $name:ident $({ $($field:ident),* })? ),* $(,)?
+        }
+    ) => {
+        impl fmt::Debug for EventKind {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    $(
+                        Self::$sens_variant { $($sens_field),* } => {
+                            let mut s = f.debug_struct(stringify!($sens_variant));
+                            $(
+                                impl_event_debug!(@field s, $sens_field $( => $redact)?);
+                            )*
+                            s.finish()
+                        }
+                    )*
+                    $(
+                        Self::$name $({ $($field),* })? => {
+                            let mut s = f.debug_struct(stringify!($name));
+                            $( $(s.field(stringify!($field), $field);)* )?
+                            s.finish()
+                        }
+                    )*
+                }
+            }
+        }
+    };
+    // Field helper: redacted
+    (@field $s:expr, $field:ident => REDACTED) => {
+        $s.field(stringify!($field), &format_args!("[REDACTED; {} bytes]", $field.len()));
+    };
+    // Field helper: transparent (print as-is)
+    (@field $s:expr, $field:ident) => {
+        $s.field(stringify!($field), $field);
+    };
+}
+
+impl_event_debug! {
+    sensitive {
+        SecretGetResponse { key, value => REDACTED },
+        SecretSet { profile, key, value => REDACTED },
+        UnlockRequest { password => REDACTED },
+    }
+    transparent {
+        WindowFocused { window_id, app_id, workspace_id },
+        WindowMoved { window_id, from_workspace, to_workspace },
+        WorkspaceSwitched { from, to, monitor_id },
+        LayoutChanged { workspace_id, layout_name },
+        ProfileActivationBegun { target, trigger },
+        ProfileActivated { target, duration_ms },
+        ProfileDeactivationBegun { target },
+        ProfileDeactivated { target, duration_ms },
+        ProfileActivationFailed { target, reason },
+        DefaultProfileChanged { previous, current },
+        ContextChanged { changed_signals },
+        ClipboardChanged { entry_id, sensitivity, content_type, profile_id },
+        ClipboardEntryExpired { entry_id },
+        ClipboardScopeSealed { profile_id },
+        HotkeyFired { sequence, layer, action },
+        LayerChanged { from, to, trigger_app },
+        MacroTriggered { macro_id, expansion_preview },
+        SecretResolved { secret_ref, ttl_remaining_s },
+        SecretExpired { secret_ref },
+        SsoSessionExpired { profile_id, provider },
+        AppLaunched { app_id, launch_action, profile_id },
+        QuerySubmitted { query, result_count, latency_ms },
+        DaemonStarted { daemon_id, version, capabilities },
+        DaemonStopped { daemon_id, reason },
+        ConfigReloaded { daemon_id, changed_keys },
+        PolicyApplied { source, locked_keys },
+        SecretGet { profile, key },
+        SecretSetResponse { success },
+        SecretDelete { profile, key },
+        SecretDeleteResponse { success },
+        SecretList { profile },
+        SecretListResponse { keys },
+        ProfileActivate { target, profile_name },
+        ProfileActivateResponse { success },
+        ProfileDeactivate { target, profile_name },
+        ProfileDeactivateResponse { success },
+        ProfileList,
+        ProfileListResponse { profiles },
+        SetDefaultProfile { profile_name },
+        SetDefaultProfileResponse { success },
+        StatusRequest,
+        StatusResponse { active_profiles, default_profile, daemon_uptimes_ms, locked },
+        UnlockResponse { success },
+        LockRequest,
+        LockResponse { success },
+        WmListWindows,
+        WmListWindowsResponse { windows },
+        WmActivateWindow { window_id },
+        WmActivateWindowResponse { success },
+        WmOverlayShown,
+        WmOverlayDismissed,
+        LaunchQuery { query, max_results, profile },
+        LaunchQueryResponse { results },
+        LaunchExecute { entry_id, profile },
+        LaunchExecuteResponse { pid },
+        Unknown,
+    }
+}
+
+// ============================================================================
+// RPC Support Types
+// ============================================================================
+
+/// Summary of a profile for list responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileSummary {
+    pub id: ProfileId,
+    pub name: TrustProfileName,
+    /// Whether this profile's vault is currently open and serving secrets.
+    pub is_active: bool,
+    /// Whether this profile is the default for new unscoped launches.
+    pub is_default: bool,
+}
+
+/// A single launcher result entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchResult {
+    pub entry_id: String,
+    pub name: String,
+    pub icon: Option<String>,
+    pub score: f64,
 }
 
 // ============================================================================
@@ -371,6 +690,12 @@ pub enum Error {
     #[error("profile isolation: access to {resource} denied by isolation contract")]
     IsolationDenied { resource: String },
 
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -379,6 +704,159 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// ============================================================================
+// TrustProfileName — validated, path-safe trust profile identifier
+// ============================================================================
+
+/// A validated, path-safe trust profile identifier.
+///
+/// Invariants (enforced at construction, impossible to violate):
+/// - Non-empty, max 64 bytes
+/// - ASCII alphanumeric, hyphens, underscores only: `[a-zA-Z0-9][a-zA-Z0-9_-]*`
+/// - Not `.` or `..` (path traversal)
+/// - No whitespace, no path separators, no null bytes
+///
+/// Maps 1:1 to a `SQLCipher` vault file: `vaults/{name}.db`
+/// Maps 1:1 to a BLAKE3 KDF context: `"pds v1 vault-key {name}"`
+/// Maps 1:1 to a frecency DB: `launcher/{name}.frecency.db`
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct TrustProfileName(String);
+
+impl TrustProfileName {
+    /// Validate a trust profile name. Returns a human-readable error on failure.
+    fn validate(name: &str) -> std::result::Result<(), String> {
+        if name.is_empty() {
+            return Err("trust profile name must not be empty".into());
+        }
+        if name.len() > 64 {
+            return Err(format!(
+                "trust profile name exceeds 64 bytes (got {}): '{name}'",
+                name.len()
+            ));
+        }
+        if name == "." || name == ".." {
+            return Err(format!("trust profile name '{name}' is a path traversal component"));
+        }
+        if !name.as_bytes()[0].is_ascii_alphanumeric() {
+            return Err(format!(
+                "trust profile name must start with alphanumeric, got '{}'",
+                name.chars().next().unwrap_or('?')
+            ));
+        }
+        for (i, b) in name.bytes().enumerate() {
+            if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                return Err(format!(
+                    "trust profile name contains invalid byte 0x{b:02x} at position {i}: \
+                     must contain only [a-zA-Z0-9_-]"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<String> for TrustProfileName {
+    type Error = Error;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Self::validate(&value).map_err(Error::Validation)?;
+        Ok(Self(value))
+    }
+}
+
+impl TryFrom<&str> for TrustProfileName {
+    type Error = Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        Self::validate(value).map_err(Error::Validation)?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl<'de> Deserialize<'de> for TrustProfileName {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::validate(&s).map_err(serde::de::Error::custom)?;
+        Ok(Self(s))
+    }
+}
+
+impl Deref for TrustProfileName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for TrustProfileName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TrustProfileName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<TrustProfileName> for String {
+    fn from(name: TrustProfileName) -> String {
+        name.0
+    }
+}
+
+// ============================================================================
+// LaunchProfile — trust profile composition at launch time
+// ============================================================================
+
+/// Specifies which trust profiles to stack when launching an application.
+///
+/// Trust profiles compose: launching with `[corporate-aws, local, azure-client]`
+/// means the process gets secrets from all three, with precedence determined
+/// by list ordering (last = highest priority).
+///
+/// Not fully implemented yet — currently used as single `TrustProfileName`
+/// via `LaunchProfile::single()`. The struct exists so trust profile stacking
+/// is an additive change, not a rewrite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchProfile {
+    /// Trust profiles to compose. Ordered by precedence: last = highest priority.
+    pub trust_profiles: Vec<TrustProfileName>,
+    /// How to handle secret key conflicts across stacked profiles.
+    #[serde(default)]
+    pub conflict_policy: ConflictPolicy,
+}
+
+impl LaunchProfile {
+    /// Create a launch profile with a single trust profile (current usage).
+    #[must_use]
+    pub fn single(name: TrustProfileName) -> Self {
+        Self {
+            trust_profiles: vec![name],
+            conflict_policy: ConflictPolicy::default(),
+        }
+    }
+}
+
+/// How to resolve secret key conflicts when multiple trust profiles are stacked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictPolicy {
+    /// Abort with actionable error, no secret leakage.
+    #[default]
+    Strict,
+    /// Log warning, higher-precedence (later in list) wins.
+    Warn,
+    /// Silently use higher-precedence value.
+    Last,
+}
 
 // ============================================================================
 // Window and Geometry Types
@@ -538,12 +1016,182 @@ mod tests {
         }
 
         #[test]
+        fn trust_profile_name_roundtrip_postcard_prop(s in "[a-zA-Z][a-zA-Z0-9_-]{0,63}") {
+            let name = TrustProfileName::try_from(s).unwrap();
+            let bytes = postcard::to_allocvec(&name).unwrap();
+            let decoded: TrustProfileName = postcard::from_bytes(&bytes).unwrap();
+            prop_assert_eq!(name, decoded);
+        }
+
+        #[test]
         fn geometry_roundtrip_postcard(x in any::<i32>(), y in any::<i32>(), w in any::<u32>(), h in any::<u32>()) {
             let geo = Geometry { x, y, width: w, height: h };
             let bytes = postcard::to_allocvec(&geo).unwrap();
             let decoded: Geometry = postcard::from_bytes(&bytes).unwrap();
             prop_assert_eq!(geo, decoded);
         }
+    }
+
+    // -- TrustProfileName validation --
+
+    #[test]
+    fn trust_profile_name_valid() {
+        for name in ["default", "work", "corporate-aws", "my_profile", "a", "A1-b_2"] {
+            assert!(
+                TrustProfileName::try_from(name).is_ok(),
+                "expected '{name}' to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_profile_name_rejects_empty() {
+        assert!(TrustProfileName::try_from("").is_err());
+    }
+
+    #[test]
+    fn trust_profile_name_rejects_path_traversal() {
+        assert!(TrustProfileName::try_from(".").is_err());
+        assert!(TrustProfileName::try_from("..").is_err());
+        assert!(TrustProfileName::try_from("../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn trust_profile_name_rejects_slashes() {
+        assert!(TrustProfileName::try_from("foo/bar").is_err());
+        assert!(TrustProfileName::try_from("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn trust_profile_name_rejects_spaces_and_special() {
+        assert!(TrustProfileName::try_from("foo bar").is_err());
+        assert!(TrustProfileName::try_from("foo\0bar").is_err());
+        assert!(TrustProfileName::try_from("-leading").is_err());
+        assert!(TrustProfileName::try_from("_leading").is_err());
+    }
+
+    #[test]
+    fn trust_profile_name_rejects_over_64() {
+        let long = "a".repeat(65);
+        assert!(TrustProfileName::try_from(long).is_err());
+    }
+
+    #[test]
+    fn trust_profile_name_roundtrip_json() {
+        let name = TrustProfileName::try_from("corporate-aws").unwrap();
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, "\"corporate-aws\"");
+        let decoded: TrustProfileName = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, name);
+    }
+
+    #[test]
+    fn trust_profile_name_roundtrip_postcard() {
+        let name = TrustProfileName::try_from("my-profile").unwrap();
+        let bytes = postcard::to_allocvec(&name).unwrap();
+        let decoded: TrustProfileName = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, name);
+    }
+
+    #[test]
+    fn trust_profile_name_json_rejects_invalid() {
+        let result: std::result::Result<TrustProfileName, _> = serde_json::from_str("\"../../etc\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trust_profile_name_deref_to_str() {
+        let name = TrustProfileName::try_from("work").unwrap();
+        let s: &str = &name;
+        assert_eq!(s, "work");
+    }
+
+    #[test]
+    fn trust_profile_name_display() {
+        let name = TrustProfileName::try_from("work").unwrap();
+        assert_eq!(format!("{name}"), "work");
+    }
+
+    // -- ConflictPolicy --
+
+    #[test]
+    fn conflict_policy_default_is_strict() {
+        assert_eq!(ConflictPolicy::default(), ConflictPolicy::Strict);
+    }
+
+    #[test]
+    fn conflict_policy_roundtrip_json() {
+        for policy in [ConflictPolicy::Strict, ConflictPolicy::Warn, ConflictPolicy::Last] {
+            let json = serde_json::to_string(&policy).unwrap();
+            let decoded: ConflictPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, policy);
+        }
+    }
+
+    // -- LaunchProfile --
+
+    #[test]
+    fn launch_profile_single() {
+        let name = TrustProfileName::try_from("work").unwrap();
+        let lp = LaunchProfile::single(name.clone());
+        assert_eq!(lp.trust_profiles.len(), 1);
+        assert_eq!(lp.trust_profiles[0], name);
+        assert_eq!(lp.conflict_policy, ConflictPolicy::Strict);
+    }
+
+    // -- SensitiveBytes --
+
+    #[test]
+    fn sensitive_bytes_debug_redacts() {
+        let sb = SensitiveBytes::new(b"super_secret".to_vec());
+        let debug = format!("{sb:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("super_secret"));
+        assert!(debug.contains("12 bytes"));
+    }
+
+    #[test]
+    fn sensitive_bytes_accessors() {
+        let sb = SensitiveBytes::new(vec![1, 2, 3]);
+        assert_eq!(sb.as_bytes(), &[1, 2, 3]);
+        assert_eq!(sb.len(), 3);
+        assert!(!sb.is_empty());
+
+        let empty = SensitiveBytes::new(vec![]);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn sensitive_bytes_from_vec() {
+        let sb: SensitiveBytes = vec![0xAA, 0xBB].into();
+        assert_eq!(sb.as_bytes(), &[0xAA, 0xBB]);
+    }
+
+    // -- EventKind Debug redaction --
+
+    #[test]
+    fn event_kind_debug_redacts_secrets() {
+        let unlock = EventKind::UnlockRequest { password: SensitiveBytes::new(b"hunter2".to_vec()) };
+        let debug = format!("{unlock:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("hunter2"));
+
+        let get_resp = EventKind::SecretGetResponse { key: "api-key".into(), value: SensitiveBytes::new(b"secret123".to_vec()) };
+        let debug = format!("{get_resp:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("secret123"));
+        assert!(debug.contains("api-key")); // key name is NOT redacted
+
+        let set = EventKind::SecretSet {
+            profile: TrustProfileName::try_from("work").unwrap(),
+            key: "db-pass".into(),
+            value: SensitiveBytes::new(b"p@ssw0rd".to_vec()),
+        };
+        let debug = format!("{set:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("p@ssw0rd"));
+        assert!(debug.contains("db-pass"));
+        assert!(debug.contains("work"));
     }
 
     // -- EventKind forward compatibility --

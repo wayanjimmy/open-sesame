@@ -17,7 +17,7 @@ members = [
     "daemon-snippets",
     "daemon-profile",
     "daemon-secrets",
-    "cli-pds",
+    "open-sesame",
     "extension-host",
     "extension-sdk",
 ]
@@ -67,20 +67,26 @@ uuid            = { version = "1", features = ["v7", "serde"] }
 bytes           = "1.11.1"                      # MANDATORY pin: RUSTSEC-2026-0007
 
 # -- Async --
-tokio           = { version = "1", features = ["rt", "net", "io-util", "sync", "macros", "time", "signal"] }
+tokio           = { version = "1", features = ["rt", "net", "io-util", "sync", "macros", "time", "signal", "fs"] }
+futures-util    = { version = "0.3", default-features = false, features = ["std"] }
 
 # -- Crypto --
-aes-gcm         = "0.10.3"                      # MANDATORY pin: CVE-2023-42811
+aes-gcm         = { version = "0.10.3", features = ["zeroize"] }  # MANDATORY pin: CVE-2023-42811
+aes             = { version = "0.8", features = ["zeroize"] }    # SEC-012: zeroize AES key schedule on drop
 argon2          = "0.5"
 zeroize         = { version = "1", features = ["derive"] }
-secrecy         = { version = "0.10", features = ["serde"] }
-age             = { version = "0.11", features = ["armor"] }
+blake3          = "1.8"
+getrandom       = "0.2"
+snow            = "0.10"
 
 # -- Database --
 rusqlite        = { version = "0.38", features = ["bundled-sqlcipher"] }
 
 # -- Fuzzy --
-nucleo          = "0.5"
+# TODO: pinned to git HEAD because crates.io 0.5.0 does not expose
+# Snapshot::matches() (added in helix-editor/nucleo#57, unreleased).
+# Revert to crates.io version once nucleo publishes a release with this API.
+nucleo          = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9" }
 
 # -- Config --
 notify          = "8"
@@ -104,6 +110,7 @@ owo-colors          = "4"
 evdev                   = { version = "0.13", features = ["tokio", "stream-trait"] }
 wayland-client          = "0.31"
 wayland-protocols       = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr   = { version = "0.3", features = ["client"] }
 smithay-client-toolkit  = { version = "0.20", features = ["xkbcommon"] }
 cosmic-client-toolkit   = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit" }
 cosmic-protocols        = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-protocols" }
@@ -112,8 +119,7 @@ landlock                = "0.4"
 libseccomp              = "0.4"
 sd-notify               = "0.4"
 libc                    = "0.2"
-fontconfig              = "0.10"
-ron                     = "0.11"
+rustix                  = { version = "1", default-features = false, features = ["process"] }
 
 # -- Linux UI --
 gtk4                = { version = "0.10", features = ["v4_16"] }
@@ -131,8 +137,6 @@ windows             = "0.62"
 
 # -- Daemon-specific --
 regex                       = "1"
-minijinja                   = { version = "2", features = ["builtins", "macros", "fuel", "json", "urlencode"] }
-pcsc                        = "2"
 freedesktop-desktop-entry   = "0.8"
 
 # -- Extensions --

@@ -1,26 +1,34 @@
 //! Profile schema, context-driven activation, isolation contracts, and atomic switching.
 //!
-//! Phase 1 scope: schema types only. Runtime logic (context engine, switch
-//! transaction, audit logging) is deferred to Phase 2.
+//! Phase 1: schema types (`ProfileState`, `ContextSignal`, `IsolationContract`, `AuditEntry`).
+//! Phase 2: runtime logic (`ContextEngine`, `AuditLogger` with BLAKE3 hash chain).
 #![forbid(unsafe_code)]
+
+pub mod context;
+pub mod audit;
 
 use core_types::{AppId, ProfileId, SensitivityClass};
 use serde::{Deserialize, Serialize};
+
+pub use context::ContextEngine;
+pub use audit::{AuditLogger, verify_chain};
 
 // ============================================================================
 // Profile State Machine
 // ============================================================================
 
-/// The lifecycle state of the profile system.
+/// The lifecycle state of an individual profile.
+///
+/// Multiple profiles may be active concurrently. Each profile has its own
+/// independent state — there is no global "active profile" singleton.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileState {
-    /// A profile is active and stable.
+    /// Profile is inactive (vault closed, no secrets served).
+    Inactive,
+    /// Profile is active (vault open, serving secrets).
     Active(ProfileId),
-    /// A profile switch is in progress.
-    Switching {
-        from: ProfileId,
-        to: ProfileId,
-    },
+    /// Profile activation or deactivation is in progress.
+    Transitioning(ProfileId),
 }
 
 // ============================================================================
@@ -67,11 +75,20 @@ pub enum IsolatedResource {
 impl IsolationContract {
     /// Evaluate whether a cross-profile data access is permitted.
     ///
-    /// Phase 1: always denies (strict isolation by default).
-    /// Phase 2: evaluates the condition expression.
+    /// Evaluates the condition expression against the given sensitivity class.
+    /// Default: deny all cross-profile access (ADR-SEC-005: assume APT).
+    ///
+    /// Currently supports:
+    /// - `"always"` → always deny (explicit strict isolation)
+    /// - `"sensitivity <= public"` → allow only Public sensitivity
+    /// - All other expressions → deny (fail-closed)
     #[must_use]
-    pub fn permits(&self, _sensitivity: SensitivityClass) -> bool {
-        false
+    pub fn permits(&self, sensitivity: SensitivityClass) -> bool {
+        match self.condition.as_str() {
+            "sensitivity <= public" => sensitivity == SensitivityClass::Public,
+            // Fail-closed: unknown conditions deny access
+            _ => false,
+        }
     }
 }
 
@@ -88,7 +105,7 @@ pub struct AuditEntry {
     pub timestamp_ms: u64,
     /// The profile operation that occurred.
     pub action: AuditAction,
-    /// SHA-256 hash of the previous entry (hex string). Empty for first entry.
+    /// BLAKE3 hash of the previous entry (hex string). Empty for first entry.
     pub prev_hash: String,
 }
 
@@ -96,9 +113,11 @@ pub struct AuditEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AuditAction {
-    ProfileSwitched { from: ProfileId, to: ProfileId, duration_ms: u32 },
-    ProfileSwitchFailed { from: ProfileId, to: ProfileId, reason: String },
-    IsolationViolationAttempt { from_profile: String, resource: IsolatedResource },
+    ProfileActivated { target: ProfileId, duration_ms: u32 },
+    ProfileDeactivated { target: ProfileId, duration_ms: u32 },
+    ProfileActivationFailed { target: ProfileId, reason: String },
+    DefaultProfileChanged { previous: ProfileId, current: ProfileId },
+    IsolationViolationAttempt { from_profile: core_types::TrustProfileName, resource: IsolatedResource },
     SecretAccessed { profile_id: ProfileId, secret_ref: String },
 }
 
@@ -120,6 +139,20 @@ mod tests {
     }
 
     #[test]
+    fn isolation_contract_public_only() {
+        let contract = IsolationContract {
+            from_profile: "work".into(),
+            to_profile: "personal".into(),
+            resource: IsolatedResource::Frecency,
+            condition: "sensitivity <= public".into(),
+        };
+        assert!(contract.permits(SensitivityClass::Public));
+        assert!(!contract.permits(SensitivityClass::Confidential));
+        assert!(!contract.permits(SensitivityClass::Secret));
+        assert!(!contract.permits(SensitivityClass::TopSecret));
+    }
+
+    #[test]
     fn profile_state_active() {
         let id = ProfileId::from_uuid(Uuid::from_u128(1));
         let state = ProfileState::Active(id);
@@ -131,9 +164,8 @@ mod tests {
         let entry = AuditEntry {
             sequence: 1,
             timestamp_ms: 1_000_000,
-            action: AuditAction::ProfileSwitched {
-                from: ProfileId::from_uuid(Uuid::from_u128(1)),
-                to: ProfileId::from_uuid(Uuid::from_u128(2)),
+            action: AuditAction::ProfileActivated {
+                target: ProfileId::from_uuid(Uuid::from_u128(1)),
                 duration_ms: 42,
             },
             prev_hash: String::new(),

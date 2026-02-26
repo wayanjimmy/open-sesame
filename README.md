@@ -117,51 +117,53 @@ All packages include [SLSA Build Provenance](https://slsa.dev/) attestations:
 gh attestation verify "open-sesame-linux-$(uname -m).deb" --owner ScopeCreep-zip
 ```
 
-### Building from Source
+### Building from Source (v2)
 
-Requires COSMIC desktop environment and development tools.
+#### Nix (Recommended)
 
-**Prerequisites:**
-
-```bash
-# Install mise (https://mise.jdx.dev/)
-curl https://mise.run | sh
-
-# Clone repository
-git clone https://github.com/ScopeCreep-zip/open-sesame.git
-cd open-sesame
-
-# Install dependencies
-mise run setup
-```
-
-**Build and install:**
+The flake provides a complete dev environment with all native dependencies:
 
 ```bash
-# Build .deb package
-mise run build:deb
-
-# Install
-mise run install
+nix develop
+cargo check --workspace
 ```
 
-**Development workflow:**
+#### Debian/Ubuntu/Pop!_OS (Bare Metal)
+
+Install system library headers required by native crate dependencies:
 
 ```bash
-# Format code
-mise run fmt
+# Required for all builds
+sudo apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libpcsclite-dev
 
-# Run tests and linters
-mise run test
+# Required for GTK4 UI crates (daemon-wm, daemon-launcher)
+sudo apt-get install -y libgtk-4-dev
 
-# Build debug binary and run
-mise run dev
-
-# Clean everything
-mise run clean:all
+# gtk4-layer-shell C library (required for daemon-wm, daemon-launcher on Wayland)
+# NOT packaged in Ubuntu 24.04 -- must build from source:
+#   https://github.com/wmww/gtk4-layer-shell
+# Or skip those crates:
+#   cargo check --workspace --exclude daemon-wm --exclude daemon-launcher
 ```
 
-See `mise run help` for all available tasks.
+Minimum Rust toolchain: see `rust-toolchain.toml` (currently channel 1.91).
+
+```bash
+cargo check --workspace
+```
+
+#### What Each System Package Provides
+
+| apt package | Crate(s) | Purpose |
+|---|---|---|
+| `libssl-dev` | `rusqlite` (bundled-sqlcipher) | OpenSSL headers for SQLCipher encryption |
+| `libpcsclite-dev` | `pcsc` | Smart card reader access for hardware key profile activation |
+| `libgtk-4-dev` | `gtk4` | GTK4 UI toolkit for overlay windows |
+| `libgtk4-layer-shell` (from source) | `gtk4-layer-shell` | Wayland layer-shell protocol for overlay positioning |
 
 ---
 

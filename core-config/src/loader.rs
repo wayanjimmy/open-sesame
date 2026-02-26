@@ -40,16 +40,16 @@ pub fn resolve_config_paths(profile_name: Option<&str>) -> Vec<PathBuf> {
 
     // Drop-in fragments (sorted alphabetically)
     let dropin_dir = base.join("config.d");
-    if dropin_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&dropin_dir) {
-            let mut fragments: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
-                .collect();
-            fragments.sort();
-            paths.extend(fragments);
-        }
+    if dropin_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&dropin_dir)
+    {
+        let mut fragments: Vec<PathBuf> = entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+        fragments.sort();
+        paths.extend(fragments);
     }
 
     // Profile overrides
@@ -98,8 +98,8 @@ fn merge_config(base: &mut Config, overlay: &Config) {
     }
 
     // Global settings
-    if overlay.global.default_profile != GlobalConfigDefaults::DEFAULT_PROFILE {
-        base.global.default_profile.clone_from(&overlay.global.default_profile);
+    if overlay.global.default_profile.as_ref() != GlobalConfigDefaults::DEFAULT_PROFILE {
+        base.global.default_profile = overlay.global.default_profile.clone();
     }
 
     // Profiles: overlay profiles merge into base by name
@@ -128,8 +128,14 @@ fn merge_profile(base: &mut crate::schema::ProfileConfig, overlay: &crate::schem
     if overlay.clipboard.max_history != crate::schema::ClipboardConfig::default().max_history {
         base.clipboard.max_history = overlay.clipboard.max_history;
     }
-    if overlay.wm.gap_size != crate::schema::WmConfig::default().gap_size {
-        base.wm.gap_size = overlay.wm.gap_size;
+    if overlay.wm.hint_keys != crate::schema::WmConfig::default().hint_keys {
+        base.wm.hint_keys.clone_from(&overlay.wm.hint_keys);
+    }
+    if overlay.wm.overlay_delay_ms != crate::schema::WmConfig::default().overlay_delay_ms {
+        base.wm.overlay_delay_ms = overlay.wm.overlay_delay_ms;
+    }
+    if overlay.wm.max_visible_windows != crate::schema::WmConfig::default().max_visible_windows {
+        base.wm.max_visible_windows = overlay.wm.max_visible_windows;
     }
 }
 
@@ -197,7 +203,7 @@ mod tests {
         // with defaults (paths won't exist).
         let config = Config::default();
         assert_eq!(config.config_version, 2);
-        assert_eq!(config.global.default_profile, "default");
+        assert_eq!(&*config.global.default_profile, "default");
     }
 
     #[test]
@@ -207,7 +213,7 @@ mod tests {
         overlay.profiles.insert(
             "work".into(),
             crate::schema::ProfileConfig {
-                name: "work".into(),
+                name: core_types::TrustProfileName::try_from("work").unwrap(),
                 color: Some("#ff0000".into()),
                 ..Default::default()
             },

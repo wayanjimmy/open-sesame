@@ -12,7 +12,6 @@ core-config  = { workspace = true }
 core-ipc     = { workspace = true }
 core-fuzzy   = { workspace = true }
 core-profile = { workspace = true }
-core-secrets = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }

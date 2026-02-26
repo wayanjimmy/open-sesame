@@ -63,20 +63,39 @@ impl SecureBytes {
 
 impl Drop for SecureBytes {
     fn drop(&mut self) {
-        // Zero the memory before releasing
+        #[cfg(unix)]
+        let original_len = self.inner.len();
+        #[cfg(unix)]
+        let original_ptr = self.inner.as_ptr();
+
+        // Zero the memory before releasing.
+        // zeroize() overwrites all bytes with 0x00 then sets len to 0.
         self.inner.zeroize();
 
         #[cfg(unix)]
         {
-            // SAFETY: munlock the previously mlock'd region.
-            // The Vec is still alive (we're in Drop, before dealloc).
-            unsafe {
-                libc::munlock(
-                    self.inner.as_ptr().cast::<libc::c_void>(),
-                    self.inner.len(),
-                );
+            // SAFETY: munlock the previously mlock'd region using the
+            // pointer and length captured BEFORE zeroize cleared them.
+            // The Vec's backing allocation is still alive (we're in Drop,
+            // before dealloc), even though its logical length is now 0.
+            if original_len > 0 {
+                unsafe {
+                    libc::munlock(
+                        original_ptr.cast::<libc::c_void>(),
+                        original_len,
+                    );
+                }
             }
         }
+    }
+}
+
+impl Clone for SecureBytes {
+    /// Clone allocates a new `Vec`, copies bytes, and applies `mlock` +
+    /// `MADV_DONTDUMP` to the new allocation. Both the original and clone
+    /// independently zeroize + munlock on drop.
+    fn clone(&self) -> Self {
+        Self::new(self.inner.clone())
     }
 }
 

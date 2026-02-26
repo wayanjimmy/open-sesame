@@ -8,12 +8,14 @@
 
 mod message;
 mod framing;
+pub mod noise;
 mod transport;
 mod server;
 mod client;
 
 pub use message::Message;
-pub use framing::{encode_frame, decode_frame, read_frame, write_frame};
-pub use transport::{PeerCredentials, socket_path};
-pub use server::BusServer;
+pub use framing::{encode_frame, decode_frame};
+pub use noise::{NoiseTransport, generate_keypair};
+pub use transport::{PeerCredentials, extract_ucred, local_credentials, socket_path};
+pub use server::{BusServer, SubscriptionFilter};
 pub use client::BusClient;

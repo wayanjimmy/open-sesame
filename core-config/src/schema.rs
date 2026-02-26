@@ -37,8 +37,8 @@ impl Default for Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GlobalConfig {
-    /// Default profile on startup.
-    pub default_profile: String,
+    /// Default trust profile on startup.
+    pub default_profile: core_types::TrustProfileName,
 
     /// IPC bus configuration.
     pub ipc: IpcConfig,
@@ -50,7 +50,7 @@ pub struct GlobalConfig {
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
-            default_profile: "default".into(),
+            default_profile: core_types::TrustProfileName::try_from("default").expect("hardcoded valid name"),
             ipc: IpcConfig::default(),
             logging: LogConfig::default(),
         }
@@ -109,8 +109,8 @@ impl Default for LogConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfileConfig {
-    pub name: String,
-    pub extends: Option<String>,
+    pub name: core_types::TrustProfileName,
+    pub extends: Option<core_types::TrustProfileName>,
     pub color: Option<String>,
     pub icon: Option<String>,
     pub activation: ActivationConfig,
@@ -129,7 +129,7 @@ pub struct ProfileConfig {
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
-            name: String::new(),
+            name: core_types::TrustProfileName::try_from("default").expect("hardcoded valid name"),
             extends: None,
             color: None,
             icon: None,
@@ -149,7 +149,7 @@ impl Default for ProfileConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ActivationConfig {
-    /// WiFi SSID triggers.
+    /// `WiFi` SSID triggers.
     pub wifi_ssids: Vec<String>,
     /// USB device triggers (vendor:product pairs).
     pub usb_devices: Vec<String>,
@@ -199,21 +199,42 @@ pub struct InputConfig {
     pub layers: BTreeMap<String, BTreeMap<String, String>>,
 }
 
-/// Window manager configuration for a profile.
+/// Window manager overlay configuration for a profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WmConfig {
-    /// Gap size between tiled windows (pixels).
-    pub gap_size: u32,
-    /// Default layout name.
-    pub default_layout: String,
+    /// Characters used for Vimium-style window hints (each char = one hint key).
+    pub hint_keys: String,
+    /// Delay (ms) before transitioning from border-only to full overlay.
+    pub overlay_delay_ms: u32,
+    /// Delay (ms) after activation before dismissing the overlay.
+    pub activation_delay_ms: u32,
+    /// Border width (px) for the focused window indicator.
+    pub border_width: f32,
+    /// Border color as hex (e.g., "#89b4fa").
+    pub border_color: String,
+    /// Number of recent windows for quick-switch (Alt-release during border-only).
+    pub quick_switch_threshold: u32,
+    /// Show window titles in the overlay.
+    pub show_title: bool,
+    /// Show app IDs in the overlay.
+    pub show_app_id: bool,
+    /// Maximum windows visible in the overlay list.
+    pub max_visible_windows: u32,
 }
 
 impl Default for WmConfig {
     fn default() -> Self {
         Self {
-            gap_size: 8,
-            default_layout: "tiling".into(),
+            hint_keys: "asdfghjkl".into(),
+            overlay_delay_ms: 150,
+            activation_delay_ms: 200,
+            border_width: 4.0,
+            border_color: "#89b4fa".into(),
+            quick_switch_threshold: 2,
+            show_title: true,
+            show_app_id: false,
+            max_visible_windows: 20,
         }
     }
 }
@@ -271,7 +292,7 @@ pub struct PlatformOverrides {
 /// A system policy override that locks a configuration key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyOverride {
-    /// Dotted key path (e.g. "clipboard.max_history").
+    /// Dotted key path (e.g. "`clipboard.max_history`").
     pub key: String,
     /// The enforced value.
     pub value: toml::Value,

@@ -1,6 +1,6 @@
 [package]
 name = "daemon-wm"
-description = "Window manager daemon: tiling layouts, workspace management, overlay HUD"
+description = "Window manager daemon: Wayland overlay window switcher with letter-hint navigation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,6 +17,8 @@ tracing-subscriber = { workspace = true }
 clap         = { workspace = true }
 anyhow       = { workspace = true }
 serde        = { workspace = true }
+dirs         = { workspace = true }
+libc         = { workspace = true }
 
 [features]
 default = []

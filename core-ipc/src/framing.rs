@@ -1,6 +1,14 @@
-//! Length-prefixed postcard frame encoding/decoding.
+//! Postcard serialization and length-prefixed wire framing.
 //!
-//! Wire format: `[4-byte big-endian payload length][postcard-encoded payload]`
+//! Two layers:
+//! - **Serialization:** `encode_frame` / `decode_frame` convert between typed values
+//!   and postcard byte payloads. These are symmetric: encode produces what decode consumes.
+//! - **Wire I/O:** `write_frame` / `read_frame` add/strip a 4-byte big-endian length
+//!   prefix for socket transport. The length prefix is a wire concern only — internal
+//!   channels (bus routing, `BusServer::publish`, subscriber mpsc channels) carry raw
+//!   postcard payloads without it.
+//!
+//! Wire format on the socket: `[4-byte BE length][postcard payload]`
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,23 +16,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Maximum frame payload size (16 MiB). Prevents OOM from malformed length prefixes.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
-/// Encode a value into a length-prefixed frame.
+/// Serialize a value to postcard bytes.
+///
+/// Symmetric with [`decode_frame`]: `decode_frame(encode_frame(v)) == v`.
+///
+/// The returned bytes are suitable for `BusServer::publish()`, internal channel
+/// transport, and as input to `write_frame()` for socket I/O.
 ///
 /// # Errors
 ///
 /// Returns an error if postcard serialization fails.
 pub fn encode_frame<T: Serialize>(value: &T) -> core_types::Result<Vec<u8>> {
-    let payload = postcard::to_allocvec(value)
-        .map_err(|e| core_types::Error::Ipc(format!("serialization failed: {e}")))?;
-    let len = u32::try_from(payload.len())
-        .map_err(|_| core_types::Error::Ipc("payload exceeds u32 length".into()))?;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    postcard::to_allocvec(value)
+        .map_err(|e| core_types::Error::Ipc(format!("serialization failed: {e}")))
 }
 
-/// Decode a value from a postcard-encoded payload (without length prefix).
+/// Deserialize a value from postcard bytes.
+///
+/// Symmetric with [`encode_frame`]: `decode_frame(encode_frame(v)) == v`.
 ///
 /// # Errors
 ///
@@ -91,11 +100,8 @@ mod tests {
             SecurityLevel::Internal,
             std::time::Instant::now(),
         );
-        let frame = encode_frame(&msg).unwrap();
-        // First 4 bytes are length
-        let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
-        assert_eq!(len, frame.len() - 4);
-        let decoded: crate::message::Message<EventKind> = decode_frame(&frame[4..]).unwrap();
+        let payload = encode_frame(&msg).unwrap();
+        let decoded: crate::message::Message<EventKind> = decode_frame(&payload).unwrap();
         assert!(matches!(decoded.payload, EventKind::DaemonStarted { .. }));
     }
 

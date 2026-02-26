@@ -9,7 +9,7 @@ use crate::schema::Config;
 
 /// Watches config file paths for changes and triggers reload + validation.
 pub struct ConfigWatcher {
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
     current: Arc<RwLock<Config>>,
 }
 
@@ -23,8 +23,24 @@ impl ConfigWatcher {
     ///
     /// Returns an error if the filesystem watcher cannot be initialized.
     pub fn new(
-        config_paths: Vec<PathBuf>,
+        config_paths: &[PathBuf],
         initial_config: Config,
+    ) -> core_types::Result<(Self, Arc<RwLock<Config>>)> {
+        Self::with_callback(config_paths, initial_config, None)
+    }
+
+    /// Create a new config watcher with an optional reload notification callback.
+    ///
+    /// The callback is invoked on the notify thread after a successful config
+    /// reload. Use this to bridge into async runtimes (e.g. send on a channel).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the filesystem watcher cannot be initialized.
+    pub fn with_callback(
+        config_paths: &[PathBuf],
+        initial_config: Config,
+        on_reload: Option<Box<dyn Fn() + Send + Sync>>,
     ) -> core_types::Result<(Self, Arc<RwLock<Config>>)> {
         let current = Arc::new(RwLock::new(initial_config));
         let current_clone = Arc::clone(&current);
@@ -45,10 +61,11 @@ impl ConfigWatcher {
                                     for d in &diags {
                                         warn!(message = %d.message, "config diagnostic");
                                     }
-                                } else {
-                                    if let Ok(mut guard) = current_clone.write() {
-                                        *guard = new_config;
-                                        info!("config reloaded successfully");
+                                } else if let Ok(mut guard) = current_clone.write() {
+                                    *guard = new_config;
+                                    info!("config reloaded successfully");
+                                    if let Some(ref cb) = on_reload {
+                                        cb();
                                     }
                                 }
                             }
@@ -66,17 +83,16 @@ impl ConfigWatcher {
         .map_err(|e| core_types::Error::Config(format!("failed to create watcher: {e}")))?;
 
         let mut w = Self {
-            _watcher: watcher,
+            watcher,
             current: Arc::clone(&current),
         };
 
-        for path in &config_paths {
-            if let Some(parent) = path.parent() {
-                if parent.exists() {
-                    if let Err(e) = w._watcher.watch(parent, RecursiveMode::NonRecursive) {
-                        warn!(path = %parent.display(), error = %e, "failed to watch config directory");
-                    }
-                }
+        for path in config_paths {
+            if let Some(parent) = path.parent()
+                && parent.exists()
+                && let Err(e) = w.watcher.watch(parent, RecursiveMode::NonRecursive)
+            {
+                warn!(path = %parent.display(), error = %e, "failed to watch config directory");
             }
         }
 

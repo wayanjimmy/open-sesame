@@ -12,7 +12,9 @@
 mod secure_bytes;
 mod encryption;
 mod kdf;
+pub mod hkdf;
 
 pub use secure_bytes::SecureBytes;
 pub use encryption::EncryptionKey;
 pub use kdf::derive_key_argon2;
+pub use hkdf::{derive_vault_key, derive_clipboard_key, derive_ipc_auth_token, derive_ipc_encryption_key, derive_kek, derive_key};

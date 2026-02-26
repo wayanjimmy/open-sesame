@@ -13,8 +13,10 @@ serde       = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 zeroize     = { workspace = true }
-secrecy     = { workspace = true }
 tokio       = { workspace = true }
+rusqlite    = { workspace = true }
+blake3      = { workspace = true }
+getrandom   = { workspace = true }
 
 [dev-dependencies]
 proptest    = { workspace = true }

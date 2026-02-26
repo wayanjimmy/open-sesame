@@ -14,7 +14,7 @@ core-types  = { workspace = true }
 aes-gcm     = { workspace = true }
 argon2      = { workspace = true }
 zeroize     = { workspace = true }
-secrecy     = { workspace = true }
+blake3      = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 
