@@ -217,11 +217,13 @@ fn apply_sandbox() {
             access: FsAccess::ReadWrite,
         },
         // Wayland socket access (use $WAYLAND_DISPLAY, default wayland-1 for COSMIC).
+        // ReadWriteFile because the socket is a non-directory fd — directory-only
+        // landlock flags (ReadDir, MakeDir, etc.) cause PartiallyEnforced.
         LandlockRule {
             path: std::path::PathBuf::from(&runtime_dir).join(
                 std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-1".into()),
             ),
-            access: FsAccess::ReadWrite,
+            access: FsAccess::ReadWriteFile,
         },
         // MRU state file.
         LandlockRule {

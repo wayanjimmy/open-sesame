@@ -18,6 +18,10 @@ use landlock::{
 pub enum FsAccess {
     ReadOnly,
     ReadWrite,
+    /// Read-write for non-directory paths (sockets, regular files).
+    /// Excludes directory-only flags (ReadDir, MakeDir, etc.) that would
+    /// cause landlock to report PartiallyEnforced on non-directory fds.
+    ReadWriteFile,
     Execute,
 }
 
@@ -59,6 +63,7 @@ pub fn apply_landlock(rules: &[LandlockRule]) -> core_types::Result<EnforcementS
         let access = match rule.access {
             FsAccess::ReadOnly => AccessFs::from_read(abi),
             FsAccess::ReadWrite => AccessFs::from_all(abi),
+            FsAccess::ReadWriteFile => AccessFs::from_file(abi),
             FsAccess::Execute => AccessFs::Execute.into(),
         };
         let path_fd = PathFd::new(&rule.path)
