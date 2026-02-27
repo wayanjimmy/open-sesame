@@ -114,4 +114,30 @@ mod tests {
         let decoded = read_frame(&mut cursor).await.unwrap();
         assert_eq!(decoded, payload);
     }
+
+    // SECURITY INVARIANT: Frames exceeding MAX_FRAME_SIZE must be rejected on
+    // read to prevent OOM from malformed or malicious length prefixes (NIST SC-5).
+    #[tokio::test]
+    async fn oversized_frame_rejected_on_read() {
+        let oversized_len: u32 = MAX_FRAME_SIZE + 1;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&oversized_len.to_be_bytes());
+        // Don't need actual payload bytes — read_frame should reject at the length check.
+        buf.extend(std::iter::repeat_n(0u8, 64));
+        let mut cursor = &buf[..];
+        let result = read_frame(&mut cursor).await;
+        assert!(result.is_err(), "frame exceeding MAX_FRAME_SIZE must be rejected");
+    }
+
+    // SECURITY INVARIANT: Zero-length frames must roundtrip correctly —
+    // edge case that must not panic or produce garbage.
+    #[tokio::test]
+    async fn zero_length_frame_roundtrips() {
+        let payload: &[u8] = &[];
+        let mut buf = Vec::new();
+        write_frame(&mut buf, payload).await.unwrap();
+        let mut cursor = &buf[..];
+        let decoded = read_frame(&mut cursor).await.unwrap();
+        assert!(decoded.is_empty());
+    }
 }

@@ -3,10 +3,20 @@
 //! Tests hint assignment, hint matching, MRU state parsing, and state machine
 //! transitions. These tests do NOT require a running daemon or Wayland compositor.
 
-use daemon_wm::hints::{assign_hints, assign_app_hints, match_input, MatchResult, auto_key_for_app};
-use daemon_wm::mru;
+use core_config::WmKeyBinding;
+use daemon_wm::hints::{assign_hints, assign_app_hints, match_input, MatchResult, auto_key_for_app, key_for_app};
 use daemon_wm::state::{WmState, Action};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+
+fn make_bindings(entries: &[(&str, &[&str])]) -> BTreeMap<String, WmKeyBinding> {
+    entries.iter().map(|(k, apps)| {
+        (k.to_string(), WmKeyBinding {
+            apps: apps.iter().map(|s| s.to_string()).collect(),
+            launch: None,
+        })
+    }).collect()
+}
 
 // ============================================================================
 // Hint Assignment
@@ -105,7 +115,8 @@ fn auto_key_from_simple_name() {
 #[test]
 fn app_hints_groups_by_app() {
     let apps = vec!["firefox", "firefox", "ghostty", "code"];
-    let result = assign_app_hints(&apps, "fgcasdjkl");
+    let empty: BTreeMap<String, WmKeyBinding> = BTreeMap::new();
+    let result = assign_app_hints(&apps, "fgcasdjkl", &empty);
     assert_eq!(result.len(), 4);
 
     // Firefox windows should get "f" and "ff".
@@ -175,7 +186,7 @@ fn state_quick_switch_on_fast_release() {
     let mut state = WmState::new();
     state.on_activate();
     // Release within 500ms window.
-    let action = state.on_modifier_release(500);
+    let action = state.on_modifier_release(250, 500);
     assert_eq!(action, Action::QuickSwitch);
     assert!(state.is_idle());
 }
@@ -187,7 +198,7 @@ fn state_slow_release_forces_overlay() {
         frame_count: 0,
     };
     // Release after overlay_delay_ms=150 has passed.
-    let action = state.on_modifier_release(150);
+    let action = state.on_modifier_release(100, 150);
     assert_eq!(action, Action::ShowOverlay);
 }
 
@@ -263,6 +274,7 @@ fn state_backspace_from_pending_returns_to_overlay() {
         target: 0,
         pending_key: None,
         entered_at: Instant::now(),
+        input_buffer: String::new(),
     };
     let action = state.on_backspace();
     assert_eq!(action, Action::ShowOverlay);
@@ -289,6 +301,7 @@ fn state_activation_timeout() {
         target: 2,
         pending_key: None,
         entered_at: Instant::now() - Duration::from_millis(300),
+        input_buffer: String::new(),
     };
     let action = state.check_activation_timeout(200);
     assert_eq!(action, Action::ActivateWindow(2));
@@ -301,9 +314,202 @@ fn state_activation_not_yet_timed_out() {
         target: 2,
         pending_key: None,
         entered_at: Instant::now(),
+        input_buffer: String::new(),
     };
     let action = state.check_activation_timeout(5000);
     assert_eq!(action, Action::None);
+}
+
+// ============================================================================
+// TASK-01: Alt release in FullOverlay / PendingActivation
+// ============================================================================
+
+#[test]
+fn state_alt_release_full_overlay_activates() {
+    let mut state = WmState::FullOverlay {
+        input_buffer: String::new(),
+        selection: 2,
+        window_count: 5,
+    };
+    let action = state.on_modifier_release(250, 500);
+    assert_eq!(action, Action::ActivateWindow(2));
+    assert!(state.is_idle());
+}
+
+#[test]
+fn state_alt_release_pending_activates() {
+    let mut state = WmState::PendingActivation {
+        target: 1,
+        pending_key: None,
+        entered_at: Instant::now(),
+        input_buffer: String::new(),
+    };
+    let action = state.on_modifier_release(250, 500);
+    assert_eq!(action, Action::ActivateWindow(1));
+    assert!(state.is_idle());
+}
+
+// ============================================================================
+// TASK-02: Char in BorderOnly
+// ============================================================================
+
+#[test]
+fn state_char_in_border_transitions_to_overlay() {
+    let mut state = WmState::new();
+    state.on_activate();
+    let action = state.on_char('g');
+    assert_eq!(action, Action::ShowOverlay);
+    assert_eq!(state.input_buffer(), Some("g"));
+}
+
+// ============================================================================
+// TASK-03: Tab in BorderOnly
+// ============================================================================
+
+#[test]
+fn state_tab_in_border_transitions_to_overlay() {
+    let mut state = WmState::new();
+    state.on_activate();
+    let action = state.on_selection_down();
+    assert_eq!(action, Action::ShowOverlay);
+    assert_eq!(state.selection(), Some(1));
+}
+
+#[test]
+fn state_shift_tab_in_border_transitions() {
+    let mut state = WmState::new();
+    state.on_activate();
+    let action = state.on_selection_up();
+    assert_eq!(action, Action::ShowOverlay);
+    state.set_window_count(5);
+    assert_eq!(state.selection(), Some(4));
+}
+
+// ============================================================================
+// TASK-06: Config-driven key_for_app
+// ============================================================================
+
+#[test]
+fn key_for_app_with_bindings() {
+    let bindings = make_bindings(&[("f", &["firefox", "org.mozilla.firefox"])]);
+    assert_eq!(key_for_app("firefox", &bindings), Some('f'));
+    assert_eq!(key_for_app("org.mozilla.firefox", &bindings), Some('f'));
+}
+
+#[test]
+fn key_for_app_falls_back_to_auto() {
+    let bindings: BTreeMap<String, WmKeyBinding> = BTreeMap::new();
+    assert_eq!(key_for_app("firefox", &bindings), Some('f'));
+    assert_eq!(key_for_app("unknown-app", &bindings), Some('u'));
+}
+
+#[test]
+fn key_for_app_case_insensitive() {
+    let bindings = make_bindings(&[("g", &["Ghostty"])]);
+    assert_eq!(key_for_app("ghostty", &bindings), Some('g'));
+}
+
+#[test]
+fn key_for_app_last_segment_match() {
+    let bindings = make_bindings(&[("g", &["ghostty"])]);
+    assert_eq!(key_for_app("com.mitchellh.ghostty", &bindings), Some('g'));
+}
+
+#[test]
+fn assign_app_hints_with_config_overrides() {
+    let bindings = make_bindings(&[("x", &["firefox"])]);
+    let apps = vec!["firefox", "ghostty"];
+    let result = assign_app_hints(&apps, "xgasdjkl", &bindings);
+    let hint_strs: Vec<&str> = result.iter().map(|(h, _)| h.as_str()).collect();
+    // firefox should get 'x' from config override
+    assert!(hint_strs.contains(&"x"));
+    // ghostty falls back to auto 'g'
+    assert!(hint_strs.contains(&"g"));
+}
+
+// ============================================================================
+// TASK-08: Launcher mode activation
+// ============================================================================
+
+#[test]
+fn state_launcher_mode_skips_border() {
+    let mut state = WmState::new();
+    let action = state.on_activate_launcher();
+    assert_eq!(action, Action::ShowOverlay);
+    assert!(matches!(state, WmState::FullOverlay { .. }));
+}
+
+#[test]
+fn state_launcher_mode_from_non_idle_is_noop() {
+    let mut state = WmState::FullOverlay {
+        input_buffer: String::new(),
+        selection: 0,
+        window_count: 5,
+    };
+    assert_eq!(state.on_activate_launcher(), Action::None);
+}
+
+// ============================================================================
+// TASK-16: Backspace from PendingActivation preserves input
+// ============================================================================
+
+#[test]
+fn backspace_from_pending_preserves_input_minus_last() {
+    let mut state = WmState::FullOverlay {
+        input_buffer: String::new(),
+        selection: 0,
+        window_count: 5,
+    };
+    state.on_char('g');
+    state.on_char('g');
+    assert_eq!(state.input_buffer(), Some("gg"));
+    // Simulate hint match -> PendingActivation
+    let action = state.on_hint_match(2);
+    assert_eq!(action, Action::ActivateWindow(2));
+    assert!(matches!(state, WmState::PendingActivation { .. }));
+    // Backspace should return to FullOverlay with "g" (input minus last char)
+    let action = state.on_backspace();
+    assert_eq!(action, Action::ShowOverlay);
+    assert_eq!(state.input_buffer(), Some("g"));
+}
+
+// ============================================================================
+// TASK-17: Escape from PendingActivation
+// ============================================================================
+
+#[test]
+fn escape_from_pending_activation_dismisses() {
+    let mut state = WmState::PendingActivation {
+        target: 2,
+        pending_key: None,
+        entered_at: Instant::now(),
+        input_buffer: String::new(),
+    };
+    assert_eq!(state.on_escape(), Action::Dismiss);
+    assert!(state.is_idle());
+}
+
+// ============================================================================
+// TASK-09: Launch-or-focus hints
+// ============================================================================
+
+#[test]
+fn launch_for_key_returns_command() {
+    use daemon_wm::hints::launch_for_key;
+    let mut bindings = BTreeMap::new();
+    bindings.insert("g".to_string(), WmKeyBinding {
+        apps: vec!["ghostty".to_string()],
+        launch: Some("ghostty".to_string()),
+    });
+    assert_eq!(launch_for_key('g', &bindings), Some("ghostty"));
+    assert_eq!(launch_for_key('z', &bindings), None);
+}
+
+#[test]
+fn launch_for_key_none_when_no_launch() {
+    use daemon_wm::hints::launch_for_key;
+    let bindings = make_bindings(&[("c", &["chromium"])]);
+    assert_eq!(launch_for_key('c', &bindings), None);
 }
 
 // ============================================================================

@@ -13,6 +13,8 @@
 #[cfg(target_os = "linux")]
 pub mod compositor;
 #[cfg(target_os = "linux")]
+pub mod cosmic_theme;
+#[cfg(target_os = "linux")]
 pub mod clipboard;
 #[cfg(target_os = "linux")]
 pub mod dbus;
@@ -20,5 +22,7 @@ pub mod dbus;
 pub mod input;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
+#[cfg(target_os = "linux")]
+pub mod security;
 #[cfg(target_os = "linux")]
 pub mod systemd;

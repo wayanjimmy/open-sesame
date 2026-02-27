@@ -20,6 +20,10 @@ anyhow       = { workspace = true }
 serde        = { workspace = true }
 regex        = { workspace = true }
 rusqlite     = { workspace = true }
+dirs         = { workspace = true }
+uuid         = { workspace = true }
+snow         = { workspace = true }
+zeroize      = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux      = { workspace = true }

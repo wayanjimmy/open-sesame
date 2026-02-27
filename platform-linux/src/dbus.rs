@@ -265,7 +265,132 @@ impl SecretServiceProxy {
 /// Compositor-agnostic global hotkey registration. Supported on COSMIC,
 /// KDE Plasma 6.4+, and niri via xdg-desktop-portal.
 pub struct GlobalShortcutsProxy {
-    _private: (),
+    conn: zbus::Connection,
+    session_path: Option<OwnedObjectPath>,
+}
+
+impl GlobalShortcutsProxy {
+    pub async fn new(bus: &SessionBus) -> core_types::Result<Self> {
+        Ok(Self {
+            conn: bus.conn.clone(),
+            session_path: None,
+        })
+    }
+
+    pub async fn create_session(&mut self, app_id: &str) -> core_types::Result<()> {
+        let proxy = zbus::Proxy::new(
+            &self.conn,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.GlobalShortcuts",
+        )
+        .await
+        .map_err(|e| core_types::Error::Platform(format!("GlobalShortcuts proxy failed: {e}")))?;
+
+        let session_token = format!("pds_{app_id}");
+        let mut options = std::collections::HashMap::new();
+        options.insert("session_handle_token", Value::new(session_token.clone()));
+        options.insert("handle_token", Value::new(format!("pds_req_{app_id}")));
+
+        let (_request_path,): (OwnedObjectPath,) = proxy
+            .call("CreateSession", &(options,))
+            .await
+            .map_err(|e| {
+                core_types::Error::Platform(format!("GlobalShortcuts CreateSession failed: {e}"))
+            })?;
+
+        // Construct the session object path from the token per xdg-desktop-portal spec:
+        // /org/freedesktop/portal/desktop/session/{sender}/{token}
+        // where sender is the D-Bus unique name with ':' and '.' replaced by '_'.
+        let sender = self.conn.unique_name()
+            .ok_or_else(|| core_types::Error::Platform("no D-Bus unique name".into()))?;
+        let sender_clean = sender.as_str()
+            .trim_start_matches(':')
+            .replace('.', "_");
+        let session_obj = format!(
+            "/org/freedesktop/portal/desktop/session/{sender_clean}/{session_token}"
+        );
+        self.session_path = Some(
+            OwnedObjectPath::try_from(session_obj).map_err(|e| {
+                core_types::Error::Platform(format!("invalid session path: {e}"))
+            })?,
+        );
+
+        tracing::debug!(session = ?self.session_path, "GlobalShortcuts session created");
+        Ok(())
+    }
+
+    pub async fn bind_shortcuts(
+        &self,
+        shortcuts: &[(String, String)],
+    ) -> core_types::Result<()> {
+        let Some(session) = &self.session_path else {
+            return Err(core_types::Error::Platform(
+                "no GlobalShortcuts session — call create_session first".into(),
+            ));
+        };
+
+        let proxy = zbus::Proxy::new(
+            &self.conn,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.GlobalShortcuts",
+        )
+        .await
+        .map_err(|e| core_types::Error::Platform(format!("GlobalShortcuts proxy failed: {e}")))?;
+
+        let shortcut_defs: Vec<(String, std::collections::HashMap<&str, Value<'_>>)> = shortcuts
+            .iter()
+            .map(|(id, description)| {
+                let mut props = std::collections::HashMap::new();
+                props.insert("description", Value::new(description.as_str()));
+                (id.clone(), props)
+            })
+            .collect();
+
+        let options: std::collections::HashMap<&str, Value<'_>> = std::collections::HashMap::new();
+
+        let _: (OwnedObjectPath,) = proxy
+            .call("BindShortcuts", &(session, shortcut_defs, "", options))
+            .await
+            .map_err(|e| {
+                core_types::Error::Platform(format!("GlobalShortcuts BindShortcuts failed: {e}"))
+            })?;
+
+        tracing::debug!(count = shortcuts.len(), "shortcuts bound via portal");
+        Ok(())
+    }
+
+    pub async fn list_shortcuts(&self) -> core_types::Result<Vec<String>> {
+        let Some(session) = &self.session_path else {
+            return Err(core_types::Error::Platform(
+                "no GlobalShortcuts session".into(),
+            ));
+        };
+
+        let proxy = zbus::Proxy::new(
+            &self.conn,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.GlobalShortcuts",
+        )
+        .await
+        .map_err(|e| core_types::Error::Platform(format!("GlobalShortcuts proxy failed: {e}")))?;
+
+        let options: std::collections::HashMap<&str, Value<'_>> = std::collections::HashMap::new();
+        let _: (OwnedObjectPath,) = proxy
+            .call("ListShortcuts", &(session, options))
+            .await
+            .map_err(|e| {
+                core_types::Error::Platform(format!("GlobalShortcuts ListShortcuts failed: {e}"))
+            })?;
+
+        Ok(vec![])
+    }
+
+    pub fn session_path(&self) -> Option<&OwnedObjectPath> {
+        self.session_path.as_ref()
+    }
 }
 
 // ============================================================================

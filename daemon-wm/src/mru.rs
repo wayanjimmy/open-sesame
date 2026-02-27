@@ -107,17 +107,21 @@ pub fn previous_window() -> Option<String> {
 }
 
 /// Reorder a window list for MRU display: move current window to end.
+///
+/// The closure returns a `String` rather than `&str` because ID types
+/// (e.g. `WindowId`) format via `Display` without storing a `String` field
+/// that could be borrowed.
 pub fn reorder<T, F>(windows: &mut Vec<T>, get_id: F)
 where
-    F: Fn(&T) -> &str,
+    F: Fn(&T) -> String,
 {
     let state = load();
     let Some(current_id) = &state.current else {
         return;
     };
 
-    if let Some(pos) = windows.iter().position(|w| get_id(w) == current_id)
-        && pos < windows.len() - 1
+    if let Some(pos) = windows.iter().position(|w| get_id(w) == *current_id)
+        && pos < windows.len().saturating_sub(1)
     {
         let window = windows.remove(pos);
         windows.push(window);

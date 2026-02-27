@@ -59,6 +59,7 @@ impl BusClient {
         daemon_id: DaemonId,
         path: &Path,
         server_public_key: &[u8; 32],
+        client_keypair: &snow::Keypair,
     ) -> core_types::Result<Self> {
         let stream = connect_with_retry(path, 3, Duration::from_millis(100)).await?;
 
@@ -71,15 +72,12 @@ impl BusClient {
         let mut reader = tokio::io::BufReader::new(reader);
         let mut writer = tokio::io::BufWriter::new(writer);
 
-        // Generate ephemeral client keypair (per-process lifetime).
-        let client_keypair = crate::noise::generate_keypair()?;
-
         // Perform Noise IK handshake.
         let transport = crate::noise::client_handshake(
             &mut reader,
             &mut writer,
             server_public_key,
-            &client_keypair,
+            client_keypair,
             &local_creds,
             &server_creds,
         )
@@ -111,8 +109,11 @@ impl BusClient {
                             break;
                         }
                     }
-                    Some(payload) = outbound_rx.recv() => {
-                        if let Err(e) = transport.write_encrypted_frame(&mut writer, &payload).await {
+                    Some(mut payload) = outbound_rx.recv() => {
+                        let result = transport.write_encrypted_frame(&mut writer, &payload).await;
+                        // Zeroize plaintext postcard buffer after encryption (H-009).
+                        zeroize::Zeroize::zeroize(&mut payload);
+                        if let Err(e) = result {
                             tracing::debug!(error = %e, "encrypted write failed, closing client");
                             break;
                         }
@@ -141,6 +142,8 @@ impl BusClient {
         self.outbound_tx.send(payload).await.map_err(|_| {
             core_types::Error::Ipc("outbound channel closed".into())
         })?;
+        // Payload ownership transferred to channel. The I/O task zeroizes
+        // the buffer after Noise encryption (see outbound_rx select! arm).
         Ok(())
     }
 
@@ -200,8 +203,11 @@ impl BusClient {
     ///
     /// Returns `None` if the server disconnected.
     pub async fn recv(&mut self) -> Option<Message<EventKind>> {
-        let payload = self.inbound_rx.recv().await?;
-        match decode_frame(&payload) {
+        let mut payload = self.inbound_rx.recv().await?;
+        let result = decode_frame(&payload);
+        // Zeroize raw postcard bytes — may contain serialized secret values (H-009).
+        zeroize::Zeroize::zeroize(&mut payload);
+        match result {
             Ok(msg) => Some(msg),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to decode inbound frame");
@@ -220,6 +226,120 @@ impl BusClient {
     #[must_use]
     pub fn epoch(&self) -> Instant {
         self.epoch
+    }
+
+    /// Connect to the IPC bus with keypair re-read on each attempt (H-019).
+    ///
+    /// On crash-restart, daemon-profile may regenerate the daemon's keypair.
+    /// Each retry re-reads the keypair from disk to pick up the new one.
+    /// Returns the connected client and the keypair (caller must zeroize
+    /// `keypair.private` after use — `snow::Keypair` has no `Drop` zeroize).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if all attempts fail (keypair read or connect).
+    pub async fn connect_with_keypair_retry(
+        daemon_name: &str,
+        daemon_id: DaemonId,
+        socket_path: &Path,
+        server_pub: &[u8; 32],
+        max_attempts: u32,
+        backoff: Duration,
+    ) -> core_types::Result<(Self, crate::noise::ZeroizingKeypair)> {
+        let mut last_err = None;
+        for attempt in 1..=max_attempts {
+            // Re-read keypair on each attempt (daemon-profile may have regenerated it).
+            let (private_key, public_key) = match crate::noise::read_daemon_keypair(daemon_name).await {
+                Ok(kp) => kp,
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "keypair read failed, retrying");
+                    last_err = Some(e);
+                    if attempt < max_attempts {
+                        tokio::time::sleep(backoff * attempt).await;
+                    }
+                    continue;
+                }
+            };
+            // ZeroizingKeypair: Drop zeroizes private key even on panic.
+            let client_keypair = crate::noise::ZeroizingKeypair::new(snow::Keypair {
+                private: private_key.to_vec(),
+                public: public_key.to_vec(),
+            });
+
+            match Self::connect_encrypted(daemon_id, socket_path, server_pub, client_keypair.as_inner()).await {
+                Ok(client) => {
+                    return Ok((client, client_keypair));
+                }
+                Err(e) => {
+                    // client_keypair dropped here -- ZeroizingKeypair::drop() zeroizes private key.
+                    tracing::warn!(attempt, error = %e, "IPC connect failed, retrying");
+                    last_err = Some(e);
+                    if attempt < max_attempts {
+                        tokio::time::sleep(backoff * attempt).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            core_types::Error::Ipc(format!("connect failed after {max_attempts} attempts"))
+        }))
+    }
+
+    /// Handle a `KeyRotationPending` event: re-read keypair from disk, verify
+    /// the announced pubkey matches, reconnect with the new key, and re-announce.
+    ///
+    /// Returns the new `BusClient` on success. The caller should replace their
+    /// existing client with the returned one.
+    ///
+    /// **Rotation cascade invariant**: The re-announce uses the SAME `daemon_id`
+    /// passed in (not a new one). `DaemonTracker` in daemon-profile only triggers
+    /// revocation when `old_id != new_id`, so planned rotations (same `DaemonId`)
+    /// do not cascade. Only crash-restarts (new `DaemonId`) trigger revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if keypair read, pubkey verification, or reconnect fails.
+    pub async fn handle_key_rotation(
+        daemon_name: &str,
+        daemon_id: DaemonId,
+        socket_path: &Path,
+        server_pub: &[u8; 32],
+        announced_pubkey: &[u8; 32],
+        capabilities: Vec<String>,
+        version: &str,
+    ) -> core_types::Result<Self> {
+        let (new_private, new_public) = crate::noise::read_daemon_keypair(daemon_name).await?;
+
+        if new_public != *announced_pubkey {
+            return Err(core_types::Error::Ipc(
+                "rotated pubkey mismatch: disk vs announced — possible tampering".into(),
+            ));
+        }
+
+        // ZeroizingKeypair: Drop zeroizes private key even on panic.
+        let kp = crate::noise::ZeroizingKeypair::new(snow::Keypair {
+            private: new_private.to_vec(),
+            public: new_public.to_vec(),
+        });
+        let new_client = Self::connect_encrypted(daemon_id, socket_path, server_pub, kp.as_inner()).await?;
+        // kp dropped here -- ZeroizingKeypair::drop() zeroizes private key.
+
+        // Re-announce on the new connection.
+        if let Err(e) = new_client
+            .publish(
+                core_types::EventKind::DaemonStarted {
+                    daemon_id,
+                    version: version.into(),
+                    capabilities,
+                },
+                core_types::SecurityLevel::Internal,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, daemon = daemon_name, "re-announce after key rotation failed");
+        }
+
+        Ok(new_client)
     }
 }
 

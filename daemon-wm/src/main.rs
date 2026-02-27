@@ -2,9 +2,10 @@
 //!
 //! Tracks open windows via wlr-foreign-toplevel-management-v1, maintains MRU
 //! ordering, and serves WmListWindows/WmActivateWindow RPC requests over the
-//! encrypted IPC bus. The overlay rendering pipeline (layer-shell surface,
-//! hint labels, input handling) is initialized when compositor detection
-//! succeeds.
+//! encrypted IPC bus. When activated (via WmActivateOverlay IPC), drives the
+//! overlay lifecycle through the state machine: border-only phase, full overlay
+//! with letter hints, hint matching, selection, and window activation via the
+//! compositor backend.
 //!
 //! Landlock: Wayland socket, fontconfig, cache dir (MRU state).
 //! No network access beyond local IPC.
@@ -13,6 +14,11 @@ use anyhow::Context;
 use clap::Parser;
 use core_ipc::{BusClient, Message};
 use core_types::{DaemonId, EventKind, SecurityLevel, Window};
+use daemon_wm::hints::{self, MatchResult};
+use daemon_wm::mru;
+use daemon_wm::overlay::{self, OverlayCmd, OverlayEvent, WindowInfo};
+use daemon_wm::render::OverlayTheme;
+use daemon_wm::state::{Action, WmState};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -33,10 +39,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("daemon-wm starting");
 
+    // -- Process hardening (NIST SC-4, SI-11) --
+    #[cfg(target_os = "linux")]
+    platform_linux::security::harden_process();
+
     // Load config.
     let config = core_config::load_config(None)
         .context("failed to load config")?;
-    let _wm_config = config
+    let wm_config = config
         .profiles
         .values()
         .next()
@@ -44,24 +54,42 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
 
     tracing::info!(
-        hint_keys = %_wm_config.hint_keys,
-        overlay_delay_ms = _wm_config.overlay_delay_ms,
+        hint_keys = %wm_config.hint_keys,
+        overlay_delay_ms = wm_config.overlay_delay_ms,
         "wm config loaded"
     );
 
-    // Sandbox (Linux).
-    #[cfg(target_os = "linux")]
-    apply_sandbox();
+    // Config hot-reload (M-6).
+    let config_paths = core_config::resolve_config_paths(None);
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(4);
+    let (_config_watcher, config_state) = core_config::ConfigWatcher::with_callback(
+        &config_paths,
+        config,
+        Some(Box::new(move || { let _ = reload_tx.blocking_send(()); })),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Connect to IPC bus.
+    // Mutable config for hot-reload.
+    let wm_config = Arc::new(Mutex::new(wm_config));
+
+    // Connect to IPC bus: read keypair BEFORE sandbox (H-017, NIST AC-6).
     let socket_path = core_ipc::socket_path()
         .context("failed to resolve IPC socket path")?;
     let server_pub = core_ipc::noise::read_bus_public_key().await
         .context("daemon-profile is not running (no bus public key found)")?;
     let daemon_id = DaemonId::new();
-    let mut client = BusClient::connect_encrypted(daemon_id, &socket_path, &server_pub)
-        .await
-        .context("failed to connect to IPC bus")?;
+
+    // Connect with keypair retry (H-019: daemon-profile may regenerate on crash-restart).
+    let (mut client, _client_keypair) = BusClient::connect_with_keypair_retry(
+        "daemon-wm", daemon_id, &socket_path, &server_pub, 5,
+        std::time::Duration::from_millis(500),
+    ).await.context("failed to connect to IPC bus")?;
+    // ZeroizingKeypair: private key zeroized on drop (no manual zeroize needed).
+    drop(_client_keypair);
+
+    // Sandbox (Linux) — applied AFTER keypair read + connect, BEFORE IPC traffic.
+    // Per-daemon Landlock key file isolation (H-017, NIST AC-6).
+    #[cfg(target_os = "linux")]
+    apply_sandbox();
 
     // Announce startup.
     client
@@ -79,20 +107,97 @@ async fn main() -> anyhow::Result<()> {
     // Window list — populated by compositor backend (when available).
     let windows: Arc<Mutex<Vec<Window>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // Compositor backend — try to detect, but continue without it.
-    // The daemon still serves RPC requests with an empty window list.
+    // Compositor backend: shared via Arc for both polling and activation.
     #[cfg(target_os = "linux")]
-    {
+    let backend: Option<Arc<Box<dyn platform_linux::compositor::CompositorBackend>>> = {
         match platform_linux::compositor::detect_compositor() {
             Ok(backend) => {
                 tracing::info!(backend = backend.name(), "compositor backend detected");
-                // TODO: spawn toplevel monitor task when backend is implemented.
+                let arc = Arc::new(backend);
+                let poll_backend = Arc::clone(&arc);
+                let win_ref = Arc::clone(&windows);
+                tokio::spawn(async move {
+                    loop {
+                        match poll_backend.list_windows().await {
+                            Ok(win_list) => {
+                                *win_ref.lock().await = win_list;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to refresh window list");
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                });
+                Some(arc)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "compositor detection failed; window list will be empty until backend is implemented");
+                tracing::warn!(error = %e, "compositor backend detection failed, falling back to focus_monitor");
+                let win_ref = Arc::clone(&windows);
+                tokio::spawn(async move {
+                    use platform_linux::compositor::FocusEvent;
+                    let (focus_tx, mut focus_rx) = tokio::sync::mpsc::channel::<FocusEvent>(16);
+                    tokio::spawn(platform_linux::compositor::focus_monitor(focus_tx));
+                    while let Some(event) = focus_rx.recv().await {
+                        match event {
+                            FocusEvent::Focus(app_id) => {
+                                let mut guard = win_ref.lock().await;
+                                for w in guard.iter_mut() {
+                                    w.is_focused = false;
+                                }
+                                if !guard.iter().any(|w| w.app_id.as_str() == app_id) {
+                                    guard.push(Window {
+                                        id: core_types::WindowId::new(),
+                                        app_id: core_types::AppId::new(&app_id),
+                                        title: app_id.clone(),
+                                        workspace_id: core_types::WorkspaceId::new(),
+                                        monitor_id: core_types::MonitorId::new(),
+                                        geometry: core_types::Geometry { x: 0, y: 0, width: 0, height: 0 },
+                                        is_focused: true,
+                                        is_minimized: false,
+                                        is_fullscreen: false,
+                                        profile_id: core_types::ProfileId::new(),
+                                    });
+                                } else {
+                                    for w in guard.iter_mut() {
+                                        if w.app_id.as_str() == app_id {
+                                            w.is_focused = true;
+                                        }
+                                    }
+                                }
+                            }
+                            FocusEvent::Closed(app_id) => {
+                                let mut guard = win_ref.lock().await;
+                                guard.retain(|w| w.app_id.as_str() != app_id);
+                            }
+                        }
+                    }
+                });
+                None
             }
         }
-    }
+    };
+
+    // -- Overlay lifecycle --
+    // State machine lives on the tokio thread. Overlay GTK4 surface on a
+    // dedicated thread, communicating via channels.
+    let mut wm_state = WmState::new();
+    let mut current_hints: Vec<String> = Vec::new();
+    let mut current_windows: Vec<Window> = Vec::new();
+
+    let (overlay_cmd_tx, mut overlay_event_rx) = {
+        let cfg = wm_config.lock().await;
+        let theme = OverlayTheme::from_config(&cfg);
+        let show_app_id = cfg.show_app_id;
+        let show_title = cfg.show_title;
+        drop(cfg);
+        overlay::spawn_overlay(theme, show_app_id, show_title)
+    };
+
+    // Border-only -> FullOverlay transition timer.
+    let mut border_tick: Option<tokio::time::Interval> = None;
+    // PendingActivation timeout timer.
+    let mut activation_tick: Option<tokio::time::Interval> = None;
 
     // Platform readiness.
     #[cfg(target_os = "linux")]
@@ -110,6 +215,131 @@ async fn main() -> anyhow::Result<()> {
                 #[cfg(target_os = "linux")]
                 platform_linux::systemd::notify_watchdog();
             }
+
+            // Border-only frame tick — drives overlay_delay transition.
+            Some(()) = async {
+                if let Some(ref mut tick) = border_tick {
+                    tick.tick().await;
+                    Some(())
+                } else {
+                    std::future::pending::<Option<()>>().await
+                }
+            } => {
+                let cfg = wm_config.lock().await;
+                let action = wm_state.on_frame(cfg.overlay_delay_ms);
+                drop(cfg);
+                handle_action(
+                    &action, &mut wm_state, &wm_config, &windows,
+                    &mut current_hints, &mut current_windows,
+                    &overlay_cmd_tx,
+                    #[cfg(target_os = "linux")] &backend,
+                    &mut client,
+                    &mut border_tick, &mut activation_tick,
+                ).await;
+            }
+
+            // PendingActivation timeout tick.
+            Some(()) = async {
+                if let Some(ref mut tick) = activation_tick {
+                    tick.tick().await;
+                    Some(())
+                } else {
+                    std::future::pending::<Option<()>>().await
+                }
+            } => {
+                let cfg = wm_config.lock().await;
+                let action = wm_state.check_activation_timeout(cfg.activation_delay_ms);
+                drop(cfg);
+                handle_action(
+                    &action, &mut wm_state, &wm_config, &windows,
+                    &mut current_hints, &mut current_windows,
+                    &overlay_cmd_tx,
+                    #[cfg(target_os = "linux")] &backend,
+                    &mut client,
+                    &mut border_tick, &mut activation_tick,
+                ).await;
+            }
+
+            // Overlay keyboard events.
+            Some(event) = overlay_event_rx.recv() => {
+                let action = {
+                    let cfg = wm_config.lock().await;
+                    match event {
+                        OverlayEvent::KeyChar(ch) => {
+                            let action = wm_state.on_char(ch);
+                            // If transitioning from BorderOnly, dispatch ShowOverlay
+                            // first to populate hints before checking for match.
+                            if action == Action::ShowOverlay {
+                                drop(cfg);
+                                handle_action(
+                                    &action, &mut wm_state, &wm_config, &windows,
+                                    &mut current_hints, &mut current_windows,
+                                    &overlay_cmd_tx,
+                                    #[cfg(target_os = "linux")] &backend,
+                                    &mut client,
+                                    &mut border_tick, &mut activation_tick,
+                                ).await;
+                                // Now check for hint match with populated hints.
+                                if let Some(input) = wm_state.input_buffer() {
+                                    let match_action = match hints::match_input(input, &current_hints) {
+                                        MatchResult::Exact(idx) => wm_state.on_hint_match(idx),
+                                        _ => Action::Redraw,
+                                    };
+                                    handle_action(
+                                        &match_action, &mut wm_state, &wm_config, &windows,
+                                        &mut current_hints, &mut current_windows,
+                                        &overlay_cmd_tx,
+                                        #[cfg(target_os = "linux")] &backend,
+                                        &mut client,
+                                        &mut border_tick, &mut activation_tick,
+                                    ).await;
+                                }
+                                continue;
+                            }
+                            // Check for hint match after character input.
+                            if let Some(input) = wm_state.input_buffer() {
+                                match hints::match_input(input, &current_hints) {
+                                    MatchResult::Exact(idx) => wm_state.on_hint_match(idx),
+                                    MatchResult::NoMatch => {
+                                        // Launch-or-focus: if input is a single key with a launch command
+                                        // and no windows matched, launch the app.
+                                        if input.len() == 1 {
+                                            let key = input.chars().next().unwrap();
+                                            if let Some(cmd) = hints::launch_for_key(key, &cfg.key_bindings) {
+                                                Action::LaunchApp(cmd.to_string())
+                                            } else {
+                                                action
+                                            }
+                                        } else {
+                                            action
+                                        }
+                                    }
+                                    _ => action,
+                                }
+                            } else {
+                                action
+                            }
+                        }
+                        OverlayEvent::Backspace => wm_state.on_backspace(),
+                        OverlayEvent::SelectionDown => wm_state.on_selection_down(),
+                        OverlayEvent::SelectionUp => wm_state.on_selection_up(),
+                        OverlayEvent::Confirm => wm_state.on_confirm(),
+                        OverlayEvent::Escape => wm_state.on_escape(),
+                        OverlayEvent::ModifierReleased => {
+                            wm_state.on_modifier_release(cfg.quick_switch_threshold_ms, cfg.overlay_delay_ms)
+                        }
+                    }
+                };
+                handle_action(
+                    &action, &mut wm_state, &wm_config, &windows,
+                    &mut current_hints, &mut current_windows,
+                    &overlay_cmd_tx,
+                    #[cfg(target_os = "linux")] &backend,
+                    &mut client,
+                    &mut border_tick, &mut activation_tick,
+                ).await;
+            }
+
             Some(msg) = client.recv() => {
                 let response_event = match &msg.payload {
                     EventKind::WmListWindows => {
@@ -119,24 +349,80 @@ async fn main() -> anyhow::Result<()> {
 
                     EventKind::WmActivateWindow { window_id } => {
                         let win_list = windows.lock().await;
-                        let found = win_list.iter().any(|w| {
+                        let found_window_id = win_list.iter().find(|w| {
                             w.id.to_string() == *window_id
                                 || w.app_id.as_str() == window_id
-                        });
+                        }).map(|w| w.id);
 
-                        if found {
+                        if let Some(wid) = found_window_id {
                             // Record MRU state.
                             let origin = win_list.iter()
                                 .find(|w| w.is_focused)
                                 .map(|w| w.id.to_string());
-                            daemon_wm::mru::save(origin.as_deref(), window_id);
+                            drop(win_list);
+                            mru::save(origin.as_deref(), window_id);
 
-                            tracing::info!(window_id, "window activation requested");
+                            // Actually activate the window via compositor backend.
+                            #[cfg(target_os = "linux")]
+                            if let Some(ref backend) = backend
+                                && let Err(e) = backend.activate_window(&wid).await
+                            {
+                                tracing::warn!(error = %e, "compositor activate_window failed");
+                            }
+
+                            tracing::info!(window_id, "window activated");
                             Some(EventKind::WmActivateWindowResponse { success: true })
                         } else {
+                            drop(win_list);
                             tracing::warn!(window_id, "window not found for activation");
                             Some(EventKind::WmActivateWindowResponse { success: false })
                         }
+                    }
+
+                    EventKind::WmActivateOverlay => {
+                        tracing::info!("overlay activation requested via IPC");
+                        let action = wm_state.on_activate();
+                        handle_action(
+                            &action, &mut wm_state, &wm_config, &windows,
+                            &mut current_hints, &mut current_windows,
+                            &overlay_cmd_tx,
+                            #[cfg(target_os = "linux")] &backend,
+                            &mut client,
+                            &mut border_tick, &mut activation_tick,
+                        ).await;
+                        None // WmOverlayShown published by handle_action
+                    }
+
+                    EventKind::WmActivateOverlayLauncher => {
+                        tracing::info!("launcher-mode overlay activation requested via IPC");
+                        let action = wm_state.on_activate_launcher();
+                        handle_action(
+                            &action, &mut wm_state, &wm_config, &windows,
+                            &mut current_hints, &mut current_windows,
+                            &overlay_cmd_tx,
+                            #[cfg(target_os = "linux")] &backend,
+                            &mut client,
+                            &mut border_tick, &mut activation_tick,
+                        ).await;
+                        None
+                    }
+
+                    // H-018: Key rotation — reconnect with new keypair (R-006: shared handler).
+                    EventKind::KeyRotationPending { daemon_name, new_pubkey, grace_period_s }
+                        if daemon_name == "daemon-wm" =>
+                    {
+                        tracing::info!(grace_period_s, "key rotation pending, will reconnect with new keypair");
+                        match BusClient::handle_key_rotation(
+                            "daemon-wm", daemon_id, &socket_path, &server_pub, new_pubkey,
+                            vec!["wm".into(), "window-switcher".into()], env!("CARGO_PKG_VERSION"),
+                        ).await {
+                            Ok(new_client) => {
+                                client = new_client;
+                                tracing::info!("reconnected with rotated keypair");
+                            }
+                            Err(e) => tracing::error!(error = %e, "key rotation reconnect failed"),
+                        }
+                        None
                     }
 
                     // Ignore events not addressed to us.
@@ -156,6 +442,32 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Some(()) = reload_rx.recv() => {
+                tracing::info!("config reloaded");
+                // Update WmConfig from hot-reloaded config.
+                let new_wm = {
+                    let guard = config_state.read().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    guard
+                        .profiles
+                        .values()
+                        .next()
+                        .map(|p| p.wm.clone())
+                        .unwrap_or_default()
+                };
+
+                let theme = OverlayTheme::from_config(&new_wm);
+                let _ = overlay_cmd_tx.send(OverlayCmd::UpdateTheme(Box::new(theme)));
+
+                *wm_config.lock().await = new_wm;
+
+                client.publish(
+                    EventKind::ConfigReloaded {
+                        daemon_id,
+                        changed_keys: vec!["wm".into()],
+                    },
+                    SecurityLevel::Internal,
+                ).await.ok();
+            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("SIGINT received, shutting down");
                 break;
@@ -166,6 +478,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Shutdown overlay thread.
+    let _ = overlay_cmd_tx.send(OverlayCmd::Quit);
 
     // Shutdown.
     client
@@ -181,6 +496,194 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("daemon-wm shut down");
     Ok(())
+}
+
+/// Dispatch a state machine `Action` to the overlay and compositor.
+///
+/// Translates abstract state machine actions into concrete overlay commands,
+/// compositor backend calls, MRU state updates, and IPC event publications.
+#[allow(clippy::too_many_arguments)]
+async fn handle_action(
+    action: &Action,
+    wm_state: &mut WmState,
+    wm_config: &Arc<Mutex<core_config::WmConfig>>,
+    windows: &Arc<Mutex<Vec<Window>>>,
+    current_hints: &mut Vec<String>,
+    current_windows: &mut Vec<Window>,
+    overlay_cmd_tx: &std::sync::mpsc::Sender<OverlayCmd>,
+    #[cfg(target_os = "linux")] backend: &Option<Arc<Box<dyn platform_linux::compositor::CompositorBackend>>>,
+    client: &mut BusClient,
+    border_tick: &mut Option<tokio::time::Interval>,
+    activation_tick: &mut Option<tokio::time::Interval>,
+) {
+    // TASK-12: Detect overlay thread crash on channel send failure.
+    let send_overlay = |cmd: OverlayCmd| -> bool {
+        if overlay_cmd_tx.send(cmd).is_err() {
+            tracing::error!("overlay thread has exited unexpectedly");
+            false
+        } else {
+            true
+        }
+    };
+
+    match action {
+        Action::ShowBorder => {
+            if !send_overlay(OverlayCmd::ShowBorder) {
+                *wm_state = WmState::Idle;
+                return;
+            }
+
+            // Start frame tick for border -> full overlay transition (~60fps).
+            *border_tick = Some(tokio::time::interval(std::time::Duration::from_millis(16)));
+
+            client.publish(EventKind::WmOverlayShown, SecurityLevel::Internal).await.ok();
+        }
+
+        Action::ShowOverlay => {
+            // Stop border tick, we're now in full overlay.
+            *border_tick = None;
+
+            let cfg = wm_config.lock().await;
+            let mut win_list = windows.lock().await.clone();
+
+            // MRU reorder: move currently focused to end.
+            mru::reorder(&mut win_list, |w| w.id.to_string());
+
+            // Truncate to max visible.
+            win_list.truncate(cfg.max_visible_windows as usize);
+
+            // Assign hints based on app IDs.
+            let app_ids: Vec<&str> = win_list.iter().map(|w| w.app_id.as_str()).collect();
+            let app_hints = hints::assign_app_hints(&app_ids, &cfg.hint_keys, &cfg.key_bindings);
+            let hint_strings: Vec<String> = app_hints.iter().map(|(h, _)| h.clone()).collect();
+
+            // Update state machine with window count.
+            wm_state.set_window_count(win_list.len());
+
+            // Store for hint matching.
+            *current_hints = hint_strings.clone();
+            *current_windows = win_list.clone();
+
+            let overlay_windows: Vec<WindowInfo> = win_list.iter().map(|w| WindowInfo {
+                app_id: w.app_id.to_string(),
+                title: w.title.clone(),
+            }).collect();
+            if !send_overlay(OverlayCmd::ShowFull {
+                windows: overlay_windows,
+                hints: hint_strings,
+            }) {
+                *wm_state = WmState::Idle;
+            }
+        }
+
+        Action::ActivateWindow(idx) => {
+            if let Some(window) = current_windows.get(*idx) {
+                let origin = current_windows.iter()
+                    .find(|w| w.is_focused)
+                    .map(|w| w.id.to_string());
+                let target_id = window.id.to_string();
+                mru::save(origin.as_deref(), &target_id);
+
+                #[cfg(target_os = "linux")]
+                if let Some(backend) = backend
+                    && let Err(e) = backend.activate_window(&window.id).await
+                {
+                    tracing::warn!(error = %e, "compositor activate_window failed");
+                }
+
+                tracing::info!(window_id = %target_id, app_id = %window.app_id, "window activated via overlay");
+            }
+
+            // Reset state machine to Idle — prevents double activation from
+            // PendingActivation timeout tick firing after we've already activated.
+            *wm_state = WmState::Idle;
+
+            // Hide overlay and reset.
+            send_overlay(OverlayCmd::Hide);
+
+            *border_tick = None;
+            *activation_tick = None;
+            *current_hints = Vec::new();
+            *current_windows = Vec::new();
+
+            client.publish(EventKind::WmOverlayDismissed, SecurityLevel::Internal).await.ok();
+        }
+
+        Action::QuickSwitch => {
+            if let Some(prev_id) = mru::previous_window() {
+                tracing::info!(previous = %prev_id, "quick-switch to previous window");
+
+                #[cfg(target_os = "linux")]
+                if let Some(backend) = backend {
+                    let win_list = windows.lock().await;
+                    if let Some(w) = win_list.iter().find(|w| w.id.to_string() == prev_id)
+                        && let Err(e) = backend.activate_window(&w.id).await
+                    {
+                        tracing::warn!(error = %e, "quick-switch activate failed");
+                    }
+                }
+            }
+
+            *wm_state = WmState::Idle;
+
+            send_overlay(OverlayCmd::Hide);
+
+            *border_tick = None;
+            *activation_tick = None;
+
+            client.publish(EventKind::WmOverlayDismissed, SecurityLevel::Internal).await.ok();
+        }
+
+        Action::Dismiss => {
+            *wm_state = WmState::Idle;
+
+            send_overlay(OverlayCmd::Hide);
+
+            *border_tick = None;
+            *activation_tick = None;
+            *current_hints = Vec::new();
+            *current_windows = Vec::new();
+
+            client.publish(EventKind::WmOverlayDismissed, SecurityLevel::Internal).await.ok();
+        }
+
+        Action::Redraw => {
+            // Send updated input/selection to overlay for redraw.
+            let input = wm_state.input_buffer().unwrap_or("").to_string();
+            let selection = wm_state.selection().unwrap_or(0);
+            send_overlay(OverlayCmd::UpdateInput { input, selection });
+
+            // If we entered PendingActivation, start the activation timeout.
+            if matches!(wm_state, WmState::PendingActivation { .. }) && activation_tick.is_none() {
+                *activation_tick = Some(tokio::time::interval(std::time::Duration::from_millis(50)));
+            }
+        }
+
+        Action::LaunchApp(cmd) => {
+            tracing::info!(command = %cmd, "launch-or-focus: launching app");
+
+            // Hide overlay and reset to idle.
+            *wm_state = WmState::Idle;
+            send_overlay(OverlayCmd::Hide);
+            *border_tick = None;
+            *activation_tick = None;
+            *current_hints = Vec::new();
+            *current_windows = Vec::new();
+
+            // Publish launch request via IPC for daemon-launcher to handle.
+            client.publish(
+                EventKind::LaunchExecute {
+                    entry_id: cmd.clone(),
+                    profile: None,
+                },
+                SecurityLevel::Internal,
+            ).await.ok();
+
+            client.publish(EventKind::WmOverlayDismissed, SecurityLevel::Internal).await.ok();
+        }
+
+        Action::None => {}
+    }
 }
 
 /// Wait for SIGTERM (Unix).
@@ -211,10 +714,32 @@ fn apply_sandbox() {
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("open-sesame");
 
+    let pds_dir = std::path::PathBuf::from(&runtime_dir).join("pds");
+    let keys_dir = pds_dir.join("keys");
+
     let rules = vec![
+        // H-017: Per-daemon key file isolation (NIST AC-6). Only daemon-wm's keypair.
         LandlockRule {
-            path: std::path::PathBuf::from(&runtime_dir).join("pds"),
-            access: FsAccess::ReadWrite,
+            path: keys_dir.join("daemon-wm.key"),
+            access: FsAccess::ReadOnly,
+        },
+        LandlockRule {
+            path: keys_dir.join("daemon-wm.pub"),
+            access: FsAccess::ReadOnly,
+        },
+        LandlockRule {
+            path: keys_dir.join("daemon-wm.checksum"),
+            access: FsAccess::ReadOnly,
+        },
+        // Bus public key: needed if reconnect ever happens.
+        LandlockRule {
+            path: pds_dir.join("bus.pub"),
+            access: FsAccess::ReadOnly,
+        },
+        // Bus socket: connect + read/write IPC traffic.
+        LandlockRule {
+            path: pds_dir.join("bus.sock"),
+            access: FsAccess::ReadWriteFile,
         },
         // Wayland socket access (use $WAYLAND_DISPLAY, default wayland-1 for COSMIC).
         // ReadWriteFile because the socket is a non-directory fd — directory-only
@@ -237,6 +762,13 @@ fn apply_sandbox() {
         },
         LandlockRule {
             path: std::path::PathBuf::from("/usr/share/fonts"),
+            access: FsAccess::ReadOnly,
+        },
+        // COSMIC desktop theme (read-only, for native theme integration).
+        LandlockRule {
+            path: dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
+                .join("cosmic"),
             access: FsAccess::ReadOnly,
         },
     ];

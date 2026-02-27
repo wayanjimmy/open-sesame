@@ -378,6 +378,20 @@ pub enum EventKind {
         daemon_id: DaemonId,
         reason: String,
     },
+    /// Key rotation: daemon-profile announces a new pubkey for a daemon (H-018).
+    /// Daemons must re-read their keypair and reconnect within the grace period.
+    KeyRotationPending {
+        /// The daemon whose key is being rotated.
+        daemon_name: String,
+        /// New X25519 public key (exactly 32 bytes).
+        new_pubkey: [u8; 32],
+        /// Grace period in seconds before old key is revoked.
+        grace_period_s: u32,
+    },
+    /// Key rotation completed: the registry has been updated (H-018).
+    KeyRotationComplete {
+        daemon_name: String,
+    },
     ConfigReloaded {
         daemon_id: DaemonId,
         changed_keys: Vec<String>,
@@ -483,6 +497,10 @@ pub enum EventKind {
     WmActivateWindowResponse {
         success: bool,
     },
+    /// Trigger the window switcher overlay.
+    WmActivateOverlay,
+    /// Trigger the overlay in launcher mode (skip border-only, start in `FullOverlay`).
+    WmActivateOverlayLauncher,
     WmOverlayShown,
     WmOverlayDismissed,
 
@@ -505,6 +523,64 @@ pub enum EventKind {
     },
     LaunchExecuteResponse {
         pid: u32,
+    },
+
+    // -- RPC: Clipboard --
+    ClipboardHistory {
+        profile: TrustProfileName,
+        #[serde(default = "default_clipboard_limit")]
+        limit: u32,
+    },
+    ClipboardHistoryResponse {
+        entries: Vec<ClipboardEntry>,
+    },
+    ClipboardClear {
+        profile: TrustProfileName,
+    },
+    ClipboardClearResponse {
+        success: bool,
+    },
+    ClipboardGet {
+        entry_id: ClipboardEntryId,
+    },
+    ClipboardGetResponse {
+        content: Option<String>,
+        content_type: Option<String>,
+    },
+
+    // -- RPC: Input --
+    InputLayersList,
+    InputLayersListResponse {
+        layers: Vec<InputLayerInfo>,
+    },
+    InputStatus,
+    InputStatusResponse {
+        active_layer: String,
+        grabbed_devices: Vec<String>,
+        remapping_active: bool,
+    },
+
+    // -- RPC: Snippets --
+    SnippetList {
+        profile: TrustProfileName,
+    },
+    SnippetListResponse {
+        snippets: Vec<SnippetInfo>,
+    },
+    SnippetExpand {
+        profile: TrustProfileName,
+        trigger: String,
+    },
+    SnippetExpandResponse {
+        expanded: Option<String>,
+    },
+    SnippetAdd {
+        profile: TrustProfileName,
+        trigger: String,
+        template: String,
+    },
+    SnippetAddResponse {
+        success: bool,
     },
 
     // Forward compatibility: unknown events deserialize to this variant.
@@ -594,6 +670,8 @@ impl_event_debug! {
         QuerySubmitted { query, result_count, latency_ms },
         DaemonStarted { daemon_id, version, capabilities },
         DaemonStopped { daemon_id, reason },
+        KeyRotationPending { daemon_name, new_pubkey, grace_period_s },
+        KeyRotationComplete { daemon_name },
         ConfigReloaded { daemon_id, changed_keys },
         PolicyApplied { source, locked_keys },
         SecretGet { profile, key },
@@ -619,12 +697,30 @@ impl_event_debug! {
         WmListWindowsResponse { windows },
         WmActivateWindow { window_id },
         WmActivateWindowResponse { success },
+        WmActivateOverlay,
+        WmActivateOverlayLauncher,
         WmOverlayShown,
         WmOverlayDismissed,
         LaunchQuery { query, max_results, profile },
         LaunchQueryResponse { results },
         LaunchExecute { entry_id, profile },
         LaunchExecuteResponse { pid },
+        ClipboardHistory { profile, limit },
+        ClipboardHistoryResponse { entries },
+        ClipboardClear { profile },
+        ClipboardClearResponse { success },
+        ClipboardGet { entry_id },
+        ClipboardGetResponse { content, content_type },
+        InputLayersList,
+        InputLayersListResponse { layers },
+        InputStatus,
+        InputStatusResponse { active_layer, grabbed_devices, remapping_active },
+        SnippetList { profile },
+        SnippetListResponse { snippets },
+        SnippetExpand { profile, trigger },
+        SnippetExpandResponse { expanded },
+        SnippetAdd { profile, trigger, template },
+        SnippetAddResponse { success },
         Unknown,
     }
 }
@@ -651,6 +747,37 @@ pub struct LaunchResult {
     pub name: String,
     pub icon: Option<String>,
     pub score: f64,
+}
+
+/// A clipboard history entry summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardEntry {
+    pub entry_id: ClipboardEntryId,
+    pub content_type: String,
+    pub sensitivity: SensitivityClass,
+    pub profile_id: ProfileId,
+    /// Truncated preview (first 80 chars).
+    pub preview: String,
+    pub timestamp_ms: u64,
+}
+
+/// Input layer information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputLayerInfo {
+    pub name: String,
+    pub is_active: bool,
+    pub remap_count: u32,
+}
+
+/// Snippet information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnippetInfo {
+    pub trigger: String,
+    pub template_preview: String,
+}
+
+fn default_clipboard_limit() -> u32 {
+    20
 }
 
 // ============================================================================

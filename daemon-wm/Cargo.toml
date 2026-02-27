@@ -19,15 +19,18 @@ anyhow       = { workspace = true }
 serde        = { workspace = true }
 dirs         = { workspace = true }
 libc         = { workspace = true }
+snow         = { workspace = true }
+zeroize      = { workspace = true }
 
 [features]
-default = []
-gtk = ["dep:gtk4", "dep:gtk4-layer-shell"]
+default = ["gtk"]
+gtk = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:pangocairo"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux      = { workspace = true }
 gtk4                = { workspace = true, optional = true }
 gtk4-layer-shell    = { workspace = true, optional = true }
+pangocairo          = { workspace = true, optional = true }
 tracing-journald    = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -20,6 +20,9 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 blake3       = { workspace = true }
 dirs         = { workspace = true }
+snow         = { workspace = true }
+uuid         = { workspace = true }
+zeroize      = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux      = { workspace = true }

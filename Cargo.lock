@@ -271,6 +271,9 @@ name = "bitflags"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bitvec"
@@ -753,9 +756,7 @@ dependencies = [
  "nucleo",
  "proptest",
  "rusqlite",
- "serde",
  "thiserror 2.0.17",
- "tracing",
 ]
 
 [[package]]
@@ -786,7 +787,7 @@ dependencies = [
 name = "core-ipc"
 version = "0.1.0"
 dependencies = [
- "bytes",
+ "blake3",
  "core-types",
  "postcard",
  "rustix 1.1.2",
@@ -828,7 +829,6 @@ dependencies = [
  "getrandom 0.2.16",
  "proptest",
  "rusqlite",
- "serde",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
@@ -1196,18 +1196,22 @@ dependencies = [
  "core-ipc",
  "core-profile",
  "core-types",
+ "dirs",
  "platform-linux",
  "platform-macos",
  "platform-windows",
  "regex",
  "rusqlite",
  "serde",
+ "snow",
  "tempfile",
  "tokio",
  "tokio-test",
  "tracing",
  "tracing-journald",
  "tracing-subscriber",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1241,7 +1245,6 @@ dependencies = [
  "core-config",
  "core-fuzzy",
  "core-ipc",
- "core-profile",
  "core-types",
  "freedesktop-desktop-entry",
  "gtk4",
@@ -1250,12 +1253,14 @@ dependencies = [
  "platform-macos",
  "platform-windows",
  "serde",
+ "snow",
  "tempfile",
  "tokio",
  "tokio-test",
  "tracing",
  "tracing-journald",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -1275,12 +1280,15 @@ dependencies = [
  "platform-windows",
  "serde",
  "serde_json",
+ "snow",
  "tempfile",
  "tokio",
  "tokio-test",
  "tracing",
  "tracing-journald",
  "tracing-subscriber",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1297,16 +1305,20 @@ dependencies = [
  "core-secrets",
  "core-types",
  "getrandom 0.2.16",
+ "governor",
+ "libc",
  "platform-linux",
  "platform-macos",
  "platform-windows",
  "serde",
+ "snow",
  "tempfile",
  "tokio",
  "tokio-test",
  "tracing",
  "tracing-journald",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -1346,16 +1358,19 @@ dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "libc",
+ "pangocairo",
  "platform-linux",
  "platform-macos",
  "platform-windows",
  "serde",
+ "snow",
  "tempfile",
  "tokio",
  "tokio-test",
  "tracing",
  "tracing-journald",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -1846,6 +1861,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
 
 [[package]]
+name = "futures-timer"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f288b0a4f20f9a56b5d1da57e2227c661b7b16168e2f72365f57b63326e29b24"
+
+[[package]]
 name = "futures-util"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2144,6 +2165,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "governor"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9efcab3c1958580ff1f25a2a41be1668f7603d849bb63af523b208a3cc1223b8"
+dependencies = [
+ "cfg-if",
+ "futures-sink",
+ "futures-timer",
+ "futures-util",
+ "hashbrown 0.16.1",
+ "nonzero_ext",
+ "parking_lot",
+ "portable-atomic",
+ "smallvec",
+ "spinning_top",
+ "web-time",
+]
+
+[[package]]
 name = "graphene-rs"
 version = "0.21.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2313,6 +2353,8 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -2871,6 +2913,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nonzero_ext"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
+
+[[package]]
 name = "normalize-line-endings"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3044,6 +3092,7 @@ dependencies = [
  "tracing",
  "tracing-journald",
  "tracing-subscriber",
+ "uuid",
  "zeroize",
 ]
 
@@ -3090,6 +3139,32 @@ dependencies = [
  "glib-sys",
  "gobject-sys",
  "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "pangocairo"
+version = "0.21.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b36c5c84304072939d860595d9bda2a797d3bd6f7215e20b8ccd0e72d84da8c8"
+dependencies = [
+ "cairo-rs",
+ "glib",
+ "libc",
+ "pango",
+ "pangocairo-sys",
+]
+
+[[package]]
+name = "pangocairo-sys"
+version = "0.21.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eadbb01ad38be76e0d37e329d40ba0f3f9ef261d7b84b05201d7a0f14f819406"
+dependencies = [
+ "cairo-sys-rs",
+ "glib-sys",
+ "libc",
+ "pango-sys",
  "system-deps",
 ]
 
@@ -3158,11 +3233,14 @@ dependencies = [
  "core-types",
  "cosmic-client-toolkit",
  "cosmic-protocols",
+ "dirs",
  "evdev",
  "futures-util",
  "landlock",
+ "libc",
  "libseccomp",
  "proptest",
+ "ron",
  "sd-notify",
  "serde",
  "smithay-client-toolkit",
@@ -3271,6 +3349,12 @@ dependencies = [
  "opaque-debug",
  "universal-hash",
 ]
+
+[[package]]
+name = "portable-atomic"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "postcard"
@@ -3616,6 +3700,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ron"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63f3aa105dea217ef30d89581b65a4d527a19afc95ef5750be3890e8d3c5b837"
+dependencies = [
+ "base64",
+ "bitflags 2.10.0",
+ "serde",
+ "serde_derive",
+ "unicode-ident",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3845,6 +3942,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3963,6 +4066,15 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
+name = "spinning_top"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d96d2d1d716fb500937168cc09353ffdc7a012be8475ac7308e1bdf0e3923300"
 dependencies = [
  "lock_api",
 ]
@@ -4523,6 +4635,7 @@ dependencies = [
  "getrandom 0.4.1",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
@@ -5223,6 +5336,16 @@ name = "web-sys"
 version = "0.3.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10053fbf9a374174094915bbce141e87a6bf32ecd9a002980db4b638405e8962"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

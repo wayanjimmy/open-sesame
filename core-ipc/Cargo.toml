@@ -15,12 +15,12 @@ serde       = { workspace = true }
 postcard    = { workspace = true }
 tokio       = { workspace = true }
 uuid        = { workspace = true }
-bytes       = { workspace = true }
 tracing     = { workspace = true }
 thiserror   = { workspace = true }
 snow        = { workspace = true }
 rustix      = { workspace = true }
 zeroize     = { workspace = true }
+blake3      = { workspace = true }
 
 [dev-dependencies]
 tokio-test  = { workspace = true }

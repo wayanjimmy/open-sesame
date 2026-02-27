@@ -59,6 +59,18 @@ enum Command {
     #[command(subcommand)]
     Wm(WmCmd),
 
+    /// Clipboard operations.
+    #[command(subcommand)]
+    Clipboard(ClipboardCmd),
+
+    /// Input remapper operations.
+    #[command(subcommand)]
+    Input(InputCmd),
+
+    /// Snippet operations.
+    #[command(subcommand)]
+    Snippet(SnippetCmd),
+
     /// Run a command with profile-scoped secrets as environment variables.
     ///
     /// Each secret key is transformed to an env var: uppercase, hyphens become
@@ -215,6 +227,75 @@ enum LaunchCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum ClipboardCmd {
+    /// Show clipboard history for a profile.
+    History {
+        /// Profile name.
+        #[arg(short, long)]
+        profile: String,
+
+        /// Maximum entries to show.
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: u32,
+    },
+
+    /// Clear clipboard history for a profile.
+    Clear {
+        /// Profile name.
+        #[arg(short, long)]
+        profile: String,
+    },
+
+    /// Get a specific clipboard entry by ID.
+    Get {
+        /// Clipboard entry ID.
+        entry_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InputCmd {
+    /// List configured input layers.
+    Layers,
+
+    /// Show input daemon status (active layer, grabbed devices).
+    Status,
+}
+
+#[derive(Subcommand)]
+enum SnippetCmd {
+    /// List snippets for a profile.
+    List {
+        /// Profile name.
+        #[arg(short, long)]
+        profile: String,
+    },
+
+    /// Expand a snippet trigger.
+    Expand {
+        /// Profile name.
+        #[arg(short, long)]
+        profile: String,
+
+        /// Trigger string.
+        trigger: String,
+    },
+
+    /// Add a new snippet.
+    Add {
+        /// Profile name.
+        #[arg(short, long)]
+        profile: String,
+
+        /// Trigger string.
+        trigger: String,
+
+        /// Template body.
+        template: String,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
@@ -260,6 +341,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 cmd_launch_run(&entry_id, profile.as_deref()).await
             }
         },
+        Command::Clipboard(sub) => match sub {
+            ClipboardCmd::History { profile, limit } => cmd_clipboard_history(&profile, limit).await,
+            ClipboardCmd::Clear { profile } => cmd_clipboard_clear(&profile).await,
+            ClipboardCmd::Get { entry_id } => cmd_clipboard_get(&entry_id).await,
+        },
+        Command::Input(sub) => match sub {
+            InputCmd::Layers => cmd_input_layers().await,
+            InputCmd::Status => cmd_input_status().await,
+        },
+        Command::Snippet(sub) => match sub {
+            SnippetCmd::List { profile } => cmd_snippet_list(&profile).await,
+            SnippetCmd::Expand { profile, trigger } => cmd_snippet_expand(&profile, &trigger).await,
+            SnippetCmd::Add { profile, trigger, template } => {
+                cmd_snippet_add(&profile, &trigger, &template).await
+            }
+        },
         Command::Env { profile, prefix, command } => {
             cmd_env(&profile, prefix.as_deref(), &command).await
         }
@@ -278,7 +375,12 @@ async fn connect() -> anyhow::Result<BusClient> {
         .context("daemon-profile is not running (no bus public key found)")?;
 
     let daemon_id = DaemonId::new();
-    BusClient::connect_encrypted(daemon_id, &socket_path, &server_pub)
+
+    // CLI uses ephemeral keypair — server assigns Open clearance for unknown keys.
+    let client_keypair = core_ipc::generate_keypair()
+        .context("failed to generate ephemeral keypair")?;
+
+    BusClient::connect_encrypted(daemon_id, &socket_path, &server_pub, client_keypair.as_inner())
         .await
         .context("failed to connect to IPC bus — is daemon-profile running?")
 }
@@ -929,6 +1031,234 @@ async fn cmd_launch_run(entry_id: &str, profile: Option<&str>) -> anyhow::Result
                 anyhow::bail!("launch failed — desktop entry not found or spawn error");
             }
             println!("Launched {} (PID {})", entry_id.green(), pid);
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Clipboard commands
+// ============================================================================
+
+async fn cmd_clipboard_history(profile: &str, limit: u32) -> anyhow::Result<()> {
+    let client = connect().await?;
+    let profile = TrustProfileName::try_from(profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let event = EventKind::ClipboardHistory { profile, limit };
+
+    match rpc(&client, event, SecurityLevel::Internal).await? {
+        EventKind::ClipboardHistoryResponse { entries } => {
+            if entries.is_empty() {
+                println!("{}", "No clipboard history.".dimmed());
+            } else {
+                let mut table = Table::new();
+                table.load_preset(UTF8_FULL);
+                table.set_header(vec!["ID", "Type", "Sensitivity", "Preview"]);
+
+                for e in &entries {
+                    table.add_row(vec![
+                        &e.entry_id.to_string(),
+                        &e.content_type,
+                        &format!("{:?}", e.sensitivity),
+                        &e.preview,
+                    ]);
+                }
+
+                println!("{table}");
+            }
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    Ok(())
+}
+
+async fn cmd_clipboard_clear(profile: &str) -> anyhow::Result<()> {
+    let client = connect().await?;
+    let profile = TrustProfileName::try_from(profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match rpc(&client, EventKind::ClipboardClear { profile }, SecurityLevel::Internal).await? {
+        EventKind::ClipboardClearResponse { success: true } => {
+            println!("{}", "Clipboard history cleared.".green());
+        }
+        EventKind::ClipboardClearResponse { success: false } => {
+            anyhow::bail!("failed to clear clipboard history");
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    Ok(())
+}
+
+async fn cmd_clipboard_get(entry_id: &str) -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let uuid = entry_id.strip_prefix("clip-").unwrap_or(entry_id);
+    let uuid: uuid::Uuid = uuid.parse()
+        .map_err(|_| anyhow::anyhow!("invalid clipboard entry ID: {entry_id}"))?;
+    let entry_id_parsed = core_types::ClipboardEntryId::from_uuid(uuid);
+
+    match rpc(
+        &client,
+        EventKind::ClipboardGet { entry_id: entry_id_parsed },
+        SecurityLevel::Internal,
+    ).await? {
+        EventKind::ClipboardGetResponse { content: Some(c), content_type } => {
+            if let Some(ct) = content_type {
+                eprintln!("Content-Type: {ct}");
+            }
+            println!("{c}");
+        }
+        EventKind::ClipboardGetResponse { content: None, .. } => {
+            anyhow::bail!("clipboard entry not found or expired");
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Input commands
+// ============================================================================
+
+async fn cmd_input_layers() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    match rpc(&client, EventKind::InputLayersList, SecurityLevel::Internal).await? {
+        EventKind::InputLayersListResponse { layers } => {
+            if layers.is_empty() {
+                println!("{}", "No input layers configured.".dimmed());
+            } else {
+                let mut table = Table::new();
+                table.load_preset(UTF8_FULL);
+                table.set_header(vec!["Layer", "Active", "Remaps"]);
+
+                for l in &layers {
+                    let active = if l.is_active {
+                        "yes".green().to_string()
+                    } else {
+                        "no".dimmed().to_string()
+                    };
+                    table.add_row(vec![&l.name, &active, &l.remap_count.to_string()]);
+                }
+
+                println!("{table}");
+            }
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    Ok(())
+}
+
+async fn cmd_input_status() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    match rpc(&client, EventKind::InputStatus, SecurityLevel::Internal).await? {
+        EventKind::InputStatusResponse {
+            active_layer,
+            grabbed_devices,
+            remapping_active,
+        } => {
+            let status = if remapping_active {
+                "active".green().to_string()
+            } else {
+                "inactive".yellow().to_string()
+            };
+
+            println!("Remapping: {status}");
+            println!("Active layer: {}", active_layer.bold());
+            if grabbed_devices.is_empty() {
+                println!("Grabbed devices: {}", "none".dimmed());
+            } else {
+                println!("Grabbed devices:");
+                for d in &grabbed_devices {
+                    println!("  - {d}");
+                }
+            }
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Snippet commands
+// ============================================================================
+
+async fn cmd_snippet_list(profile: &str) -> anyhow::Result<()> {
+    let client = connect().await?;
+    let profile = TrustProfileName::try_from(profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match rpc(&client, EventKind::SnippetList { profile }, SecurityLevel::Internal).await? {
+        EventKind::SnippetListResponse { snippets } => {
+            if snippets.is_empty() {
+                println!("{}", "No snippets configured.".dimmed());
+            } else {
+                let mut table = Table::new();
+                table.load_preset(UTF8_FULL);
+                table.set_header(vec!["Trigger", "Template Preview"]);
+
+                for s in &snippets {
+                    table.add_row(vec![&s.trigger, &s.template_preview]);
+                }
+
+                println!("{table}");
+            }
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    Ok(())
+}
+
+async fn cmd_snippet_expand(profile: &str, trigger: &str) -> anyhow::Result<()> {
+    let client = connect().await?;
+    let profile = TrustProfileName::try_from(profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let event = EventKind::SnippetExpand {
+        profile,
+        trigger: trigger.to_owned(),
+    };
+
+    match rpc(&client, event, SecurityLevel::Internal).await? {
+        EventKind::SnippetExpandResponse { expanded: Some(text) } => {
+            println!("{text}");
+        }
+        EventKind::SnippetExpandResponse { expanded: None } => {
+            anyhow::bail!("snippet trigger '{trigger}' not found");
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    Ok(())
+}
+
+async fn cmd_snippet_add(profile: &str, trigger: &str, template: &str) -> anyhow::Result<()> {
+    let client = connect().await?;
+    let profile = TrustProfileName::try_from(profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let event = EventKind::SnippetAdd {
+        profile,
+        trigger: trigger.to_owned(),
+        template: template.to_owned(),
+    };
+
+    match rpc(&client, event, SecurityLevel::Internal).await? {
+        EventKind::SnippetAddResponse { success: true } => {
+            println!("Snippet '{}' added.", trigger.green());
+        }
+        EventKind::SnippetAddResponse { success: false } => {
+            anyhow::bail!("failed to add snippet");
         }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }

@@ -167,6 +167,14 @@ pub struct SecretsConfig {
     pub provider: Option<String>,
     /// Pre-resolved secrets for this profile.
     pub secrets: BTreeMap<String, SecretRef>,
+    /// Per-daemon access control for secrets in this profile (H-020, NIST AC-3).
+    ///
+    /// Maps daemon names to lists of allowed secret key names.
+    /// - Present with empty list: no access.
+    /// - Present with keys: access only to listed keys.
+    /// - Absent: unrestricted access (backward compatible default).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub access: BTreeMap<String, Vec<String>>,
 }
 
 /// Clipboard configuration for a profile.
@@ -199,6 +207,17 @@ pub struct InputConfig {
     pub layers: BTreeMap<String, BTreeMap<String, String>>,
 }
 
+/// Per-key app binding for hint assignment and launch-or-focus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WmKeyBinding {
+    /// App ID patterns that match this key.
+    #[serde(default)]
+    pub apps: Vec<String>,
+    /// Command to launch if no matching window exists (launch-or-focus).
+    #[serde(default)]
+    pub launch: Option<String>,
+}
+
 /// Window manager overlay configuration for a profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -213,8 +232,22 @@ pub struct WmConfig {
     pub border_width: f32,
     /// Border color as hex (e.g., "#89b4fa").
     pub border_color: String,
-    /// Number of recent windows for quick-switch (Alt-release during border-only).
-    pub quick_switch_threshold: u32,
+    /// Background overlay color (hex, with optional alpha: "#RRGGBBAA").
+    pub background_color: String,
+    /// Card background color (hex).
+    pub card_color: String,
+    /// Primary text color (hex).
+    pub text_color: String,
+    /// Hint badge color (hex).
+    pub hint_color: String,
+    /// Matched hint badge color (hex).
+    pub hint_matched_color: String,
+    /// Quick-switch threshold in ms -- Alt+Tab released within this time
+    /// activates the previous window instantly (v1 default: 250ms).
+    pub quick_switch_threshold_ms: u32,
+    /// Per-key app bindings for hint assignment and launch-or-focus.
+    #[serde(default)]
+    pub key_bindings: BTreeMap<String, WmKeyBinding>,
     /// Show window titles in the overlay.
     pub show_title: bool,
     /// Show app IDs in the overlay.
@@ -231,7 +264,35 @@ impl Default for WmConfig {
             activation_delay_ms: 200,
             border_width: 4.0,
             border_color: "#89b4fa".into(),
-            quick_switch_threshold: 2,
+            background_color: "#000000c8".into(),
+            card_color: "#1e1e1ef0".into(),
+            text_color: "#ffffff".into(),
+            hint_color: "#646464".into(),
+            hint_matched_color: "#4caf50".into(),
+            quick_switch_threshold_ms: 250,
+            key_bindings: [
+                ("g", vec!["ghostty", "com.mitchellh.ghostty"], Some("ghostty")),
+                ("f", vec!["firefox", "org.mozilla.firefox"], Some("firefox")),
+                ("e", vec!["microsoft-edge"], Some("microsoft-edge")),
+                ("c", vec!["chromium", "google-chrome"], None),
+                ("v", vec!["code", "Code", "cursor", "Cursor"], Some("code")),
+                ("n", vec!["nautilus", "org.gnome.Nautilus"], Some("nautilus")),
+                ("s", vec!["slack", "Slack"], Some("slack")),
+                ("d", vec!["discord", "Discord"], Some("discord")),
+                ("m", vec!["spotify"], Some("spotify")),
+                ("t", vec!["thunderbird"], Some("thunderbird")),
+            ]
+            .into_iter()
+            .map(|(k, apps, launch)| {
+                (
+                    k.to_string(),
+                    WmKeyBinding {
+                        apps: apps.into_iter().map(String::from).collect(),
+                        launch: launch.map(String::from),
+                    },
+                )
+            })
+            .collect(),
             show_title: true,
             show_app_id: false,
             max_visible_windows: 20,

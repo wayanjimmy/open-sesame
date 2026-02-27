@@ -33,6 +33,12 @@
 #[cfg(target_os = "linux")]
 mod key_locker_linux;
 
+mod acl;
+mod rate_limit;
+
+use acl::{audit_secret_access, check_secret_access, check_secret_list_access, check_secret_requester};
+use rate_limit::SecretRateLimiter;
+
 use anyhow::Context;
 use clap::Parser;
 use core_crypto::SecureBytes;
@@ -177,6 +183,15 @@ impl UnlockedState {
     }
 }
 
+// ============================================================================
+// H-013: Secret access audit trail (NIST AU-2, AU-3, AU-12)
+// H-014: Anomaly detection (NIST SI-4, AU-6)
+// H-016: Rate limiting (NIST SC-5, AC-10)
+// H-020: Per-secret access control (NIST AC-3, AC-6)
+//
+// Implementations extracted to `acl` and `rate_limit` modules for testability.
+// ============================================================================
+
 /// Salt file path within the config directory.
 fn salt_path(config_dir: &Path) -> PathBuf {
     config_dir.join("secrets.salt")
@@ -230,19 +245,28 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("daemon-secrets starting");
 
+    // -- Process hardening (NIST SC-4, SI-11) --
+    #[cfg(target_os = "linux")]
+    platform_linux::security::harden_process();
+
     // -- Config --
     let config = core_config::load_config(None)
         .context("failed to load config")?;
     tracing::debug!(?config, "config loaded");
 
+    // Config hot-reload (M-6).
+    let config_paths_for_watch = core_config::resolve_config_paths(None);
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(4);
+    let (_config_watcher, _config_state) = core_config::ConfigWatcher::with_callback(
+        &config_paths_for_watch,
+        config.clone(),
+        Some(Box::new(move || { let _ = reload_tx.blocking_send(()); })),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let config_dir = core_config::config_dir();
     let default_profile: TrustProfileName = config.global.default_profile.clone();
 
-    // -- Sandbox (Linux) --
-    #[cfg(target_os = "linux")]
-    apply_sandbox();
-
-    // -- IPC bus connection (Noise IK encrypted, ADR-SEC-006) --
+    // -- IPC bus connection: read keypair BEFORE sandbox (keypair files need to be open) --
     let socket_path = core_ipc::socket_path()
         .context("failed to resolve IPC socket path")?;
     tracing::info!(path = %socket_path.display(), "connecting to IPC bus");
@@ -250,8 +274,20 @@ async fn main() -> anyhow::Result<()> {
     let daemon_id = DaemonId::new();
     let server_pub = core_ipc::noise::read_bus_public_key().await
         .context("failed to read bus server public key")?;
-    let mut client = BusClient::connect_encrypted(daemon_id, &socket_path, &server_pub).await
-        .context("failed to connect to IPC bus (encrypted)")?;
+
+    // Connect with keypair retry (H-019: daemon-profile may regenerate on crash-restart).
+    // First attempt reads keypair; sandbox applied after successful read.
+    let (mut client, _client_keypair) = BusClient::connect_with_keypair_retry(
+        "daemon-secrets", daemon_id, &socket_path, &server_pub, 5, Duration::from_millis(500),
+    ).await.context("failed to connect to IPC bus")?;
+    // ZeroizingKeypair: private key zeroized on drop (no manual zeroize needed).
+    drop(_client_keypair);
+
+    // -- Sandbox (Linux) -- applied AFTER keypair read, BEFORE IPC traffic.
+    // Per-daemon Landlock key file isolation (H-017, NIST AC-6).
+    #[cfg(target_os = "linux")]
+    apply_sandbox();
+
     tracing::info!("connected to IPC bus (Noise IK encrypted)");
 
     // -- Announce startup --
@@ -278,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
 
     // -- Main event loop: locked phase then unlocked phase --
     let mut unlocked_state: Option<UnlockedState> = None;
+    let mut rate_limiter = SecretRateLimiter::new();
 
     loop {
         tokio::select! {
@@ -291,15 +328,19 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 };
 
-                match handle_message(
-                    &msg,
-                    &mut client,
-                    &mut unlocked_state,
-                    &config_dir,
-                    &default_profile,
-                    cli.ttl,
+                let mut ctx = MessageContext {
+                    client: &mut client,
+                    unlocked_state: &mut unlocked_state,
+                    config_dir: &config_dir,
+                    default_profile: &default_profile,
+                    ttl: cli.ttl,
                     daemon_id,
-                ).await {
+                    rate_limiter: &mut rate_limiter,
+                    config: &config,
+                    socket_path: &socket_path,
+                    server_pub: &server_pub,
+                };
+                match handle_message(&msg, &mut ctx).await {
                     Ok(should_continue) => {
                         if !should_continue {
                             break;
@@ -309,6 +350,16 @@ async fn main() -> anyhow::Result<()> {
                         tracing::error!(error = %e, "message handler failed");
                     }
                 }
+            }
+            Some(()) = reload_rx.recv() => {
+                tracing::info!("config reloaded");
+                client.publish(
+                    EventKind::ConfigReloaded {
+                        daemon_id,
+                        changed_keys: vec!["secrets".into()],
+                    },
+                    SecurityLevel::Internal,
+                ).await.ok();
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("SIGINT received");
@@ -346,71 +397,145 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Handle a single inbound IPC message. Returns false if the daemon should exit.
-async fn handle_message(
-    msg: &Message<EventKind>,
-    client: &mut BusClient,
-    unlocked_state: &mut Option<UnlockedState>,
-    config_dir: &Path,
-    default_profile: &TrustProfileName,
+/// Grouped context for `handle_message` to avoid parameter explosion.
+struct MessageContext<'a> {
+    client: &'a mut BusClient,
+    unlocked_state: &'a mut Option<UnlockedState>,
+    config_dir: &'a Path,
+    default_profile: &'a TrustProfileName,
     ttl: u64,
     daemon_id: DaemonId,
+    rate_limiter: &'a mut SecretRateLimiter,
+    config: &'a core_config::Config,
+    socket_path: &'a Path,
+    server_pub: &'a [u8; 32],
+}
+
+/// Handle a single inbound IPC message. Returns false if the daemon should exit.
+#[allow(clippy::too_many_lines)]
+async fn handle_message(
+    msg: &Message<EventKind>,
+    ctx: &mut MessageContext<'_>,
 ) -> anyhow::Result<bool> {
     let response_event = match &msg.payload {
+        // Daemon announcements — no longer tracked locally (R-009).
+        // Verified identity comes from msg.verified_sender_name stamped by bus server.
+        EventKind::DaemonStarted { .. } => None,
+
+        // H-018: Key rotation — reconnect with new keypair (R-006: shared handler).
+        EventKind::KeyRotationPending { daemon_name, new_pubkey, grace_period_s }
+            if daemon_name == "daemon-secrets" =>
+        {
+            tracing::info!(grace_period_s, "key rotation pending, will reconnect with new keypair");
+            match BusClient::handle_key_rotation(
+                "daemon-secrets", ctx.daemon_id, ctx.socket_path, ctx.server_pub, new_pubkey,
+                vec!["secrets".into(), "keylocker".into()], env!("CARGO_PKG_VERSION"),
+            ).await {
+                Ok(new_client) => {
+                    *ctx.client = new_client;
+                    tracing::info!("reconnected with rotated keypair");
+                }
+                Err(e) => tracing::error!(error = %e, "key rotation reconnect failed"),
+            }
+            None
+        }
+
         // -- Unlock --
         EventKind::UnlockRequest { password } => {
-            if unlocked_state.is_some() {
+            let outcome = if ctx.unlocked_state.is_some() {
                 tracing::warn!("unlock requested but already unlocked");
-                Some(EventKind::UnlockResponse { success: true })
+                "already-unlocked"
             } else {
-                match unlock(password.as_bytes(), config_dir, ttl).await {
+                match unlock(password.as_bytes(), ctx.config_dir, ctx.ttl).await {
                     Ok(state) => {
                         tracing::info!("secrets unlocked");
-                        *unlocked_state = Some(state);
-                        Some(EventKind::UnlockResponse { success: true })
+                        *ctx.unlocked_state = Some(state);
+                        "success"
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "unlock failed");
-                        Some(EventKind::UnlockResponse { success: false })
+                        "failed"
                     }
                 }
-            }
+            };
+            audit_secret_access("unlock", msg.sender, "-", None, outcome);
+            Some(EventKind::UnlockResponse { success: outcome != "failed" })
         }
 
         // -- Lock --
         EventKind::LockRequest => {
-            if let Some(state) = unlocked_state.take() {
+            if let Some(state) = ctx.unlocked_state.take() {
                 drop(state); // SecureBytes zeroizes on drop.
                 // ADR-SEC-001: remove master key from platform keyring.
                 #[cfg(target_os = "linux")]
                 keyring_delete().await;
                 tracing::info!("secrets locked, master key zeroized");
             }
+            audit_secret_access("lock", msg.sender, "-", None, "success");
             Some(EventKind::LockResponse { success: true })
         }
 
         // -- Status --
         EventKind::StatusRequest => {
-            let locked = unlocked_state.is_none();
-            let active_profiles = unlocked_state
+            let locked = ctx.unlocked_state.is_none();
+            let active_profiles = ctx.unlocked_state
                 .as_ref()
                 .map_or_else(Vec::new, |s| s.active_profiles());
             Some(EventKind::StatusResponse {
                 active_profiles,
-                default_profile: default_profile.clone(),
-                daemon_uptimes_ms: vec![(daemon_id, 0)],
+                default_profile: ctx.default_profile.clone(),
+                daemon_uptimes_ms: vec![(ctx.daemon_id, 0)],
                 locked,
             })
         }
 
         // -- Secret Get (profile-scoped) --
         EventKind::SecretGet { profile, key } => {
-            let Some(state) = unlocked_state.as_mut() else {
-                tracing::warn!(profile = %profile, key, "secret get while locked");
-                return send_response(client, msg, EventKind::SecretGetResponse {
+            // R-008/R-009: Use server-verified sender name (NIST IA-9, AC-3).
+            // This is stamped by route_frame from the Noise IK registry — NOT self-declared.
+            let requester_name = msg.verified_sender_name.as_deref();
+
+            // H-014: anomaly detection using verified identity.
+            check_secret_requester(msg.sender, requester_name);
+            // H-016: rate limiting.
+            if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
+                tracing::warn!(
+                    audit = "rate-limit",
+                    requester = %msg.sender,
+                    profile = %profile,
+                    key,
+                    "secret request rate limit exceeded"
+                );
+                audit_secret_access("get", msg.sender, profile, Some(key), "rate-limited");
+                return send_response(ctx.client, msg, EventKind::SecretGetResponse {
                     key: key.clone(),
                     value: SensitiveBytes::new(vec![]),
-                }, daemon_id).await;
+                }, ctx.daemon_id).await;
+            }
+
+            // H-020: Per-secret access control (NIST AC-3, AC-6).
+            if !check_secret_access(ctx.config, profile, requester_name, key) {
+                tracing::warn!(
+                    audit = "access-denied",
+                    requester = %msg.sender,
+                    daemon_name = requester_name.unwrap_or("unknown"),
+                    profile = %profile,
+                    key,
+                    "secret access denied by per-profile ACL"
+                );
+                audit_secret_access("get", msg.sender, profile, Some(key), "denied-acl");
+                return send_response(ctx.client, msg, EventKind::SecretGetResponse {
+                    key: key.clone(),
+                    value: SensitiveBytes::new(vec![]),
+                }, ctx.daemon_id).await;
+            }
+
+            let Some(state) = ctx.unlocked_state.as_mut() else {
+                audit_secret_access("get", msg.sender, profile, Some(key), "denied-locked");
+                return send_response(ctx.client, msg, EventKind::SecretGetResponse {
+                    key: key.clone(),
+                    value: SensitiveBytes::new(vec![]),
+                }, ctx.daemon_id).await;
             };
             match state.vault_for(profile) {
                 Ok(vault) => match vault.resolve(key).await {
@@ -426,6 +551,7 @@ async fn handle_message(
                         #[cfg(not(feature = "ipc-field-encryption"))]
                         let value = SensitiveBytes::new(secret.as_bytes().to_vec());
 
+                        audit_secret_access("get", msg.sender, profile, Some(key), "success");
                         Some(EventKind::SecretGetResponse {
                             key: key.clone(),
                             value,
@@ -433,6 +559,7 @@ async fn handle_message(
                     }
                     Err(e) => {
                         tracing::warn!(profile = %profile, key, error = %e, "secret get failed");
+                        audit_secret_access("get", msg.sender, profile, Some(key), "not-found");
                         Some(EventKind::SecretGetResponse {
                             key: key.clone(),
                             value: SensitiveBytes::new(vec![]),
@@ -441,6 +568,7 @@ async fn handle_message(
                 },
                 Err(e) => {
                     tracing::error!(profile = %profile, error = %e, "vault access failed");
+                    audit_secret_access("get", msg.sender, profile, Some(key), "vault-error");
                     Some(EventKind::SecretGetResponse {
                         key: key.clone(),
                         value: SensitiveBytes::new(vec![]),
@@ -451,16 +579,45 @@ async fn handle_message(
 
         // -- Secret Set (profile-scoped) --
         EventKind::SecretSet { profile, key, value } => {
-            let Some(state) = unlocked_state.as_mut() else {
-                tracing::warn!(profile = %profile, "secret set while locked");
-                return send_response(client, msg, EventKind::SecretSetResponse { success: false }, daemon_id).await;
+            let requester_name = msg.verified_sender_name.as_deref();
+            check_secret_requester(msg.sender, requester_name);
+            if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
+                tracing::warn!(
+                    audit = "rate-limit",
+                    requester = %msg.sender,
+                    profile = %profile,
+                    key,
+                    "secret request rate limit exceeded"
+                );
+                audit_secret_access("set", msg.sender, profile, Some(key), "rate-limited");
+                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false }, ctx.daemon_id).await;
+            }
+
+            // H-020: Per-secret access control (NIST AC-3, AC-6).
+            if !check_secret_access(ctx.config, profile, requester_name, key) {
+                tracing::warn!(
+                    audit = "access-denied",
+                    requester = %msg.sender,
+                    daemon_name = requester_name.unwrap_or("unknown"),
+                    profile = %profile,
+                    key,
+                    "secret access denied by per-profile ACL"
+                );
+                audit_secret_access("set", msg.sender, profile, Some(key), "denied-acl");
+                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false }, ctx.daemon_id).await;
+            }
+
+            let Some(state) = ctx.unlocked_state.as_mut() else {
+                audit_secret_access("set", msg.sender, profile, Some(key), "denied-locked");
+                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false }, ctx.daemon_id).await;
             };
             #[cfg(feature = "ipc-field-encryption")]
             let store_value = match state.decrypt_from_ipc(profile, value.as_bytes()) {
                 Ok(pt) => pt,
                 Err(e) => {
                     tracing::error!(profile = %profile, key, error = %e, "IPC decryption of secret value failed");
-                    return send_response(client, msg, EventKind::SecretSetResponse { success: false }, daemon_id).await;
+                    audit_secret_access("set", msg.sender, profile, Some(key), "decrypt-error");
+                    return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false }, ctx.daemon_id).await;
                 }
             };
             #[cfg(not(feature = "ipc-field-encryption"))]
@@ -484,14 +641,37 @@ async fn handle_message(
                     false
                 }
             };
+            let outcome = if success { "success" } else { "failed" };
+            audit_secret_access("set", msg.sender, profile, Some(key), outcome);
             Some(EventKind::SecretSetResponse { success })
         }
 
         // -- Secret Delete (profile-scoped) --
         EventKind::SecretDelete { profile, key } => {
-            let Some(state) = unlocked_state.as_mut() else {
-                tracing::warn!(profile = %profile, "secret delete while locked");
-                return send_response(client, msg, EventKind::SecretDeleteResponse { success: false }, daemon_id).await;
+            let requester_name = msg.verified_sender_name.as_deref();
+            check_secret_requester(msg.sender, requester_name);
+            if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
+                audit_secret_access("delete", msg.sender, profile, Some(key), "rate-limited");
+                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false }, ctx.daemon_id).await;
+            }
+
+            // H-020: Per-secret access control (NIST AC-3, AC-6).
+            if !check_secret_access(ctx.config, profile, requester_name, key) {
+                tracing::warn!(
+                    audit = "access-denied",
+                    requester = %msg.sender,
+                    daemon_name = requester_name.unwrap_or("unknown"),
+                    profile = %profile,
+                    key,
+                    "secret access denied by per-profile ACL"
+                );
+                audit_secret_access("delete", msg.sender, profile, Some(key), "denied-acl");
+                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false }, ctx.daemon_id).await;
+            }
+
+            let Some(state) = ctx.unlocked_state.as_mut() else {
+                audit_secret_access("delete", msg.sender, profile, Some(key), "denied-locked");
+                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false }, ctx.daemon_id).await;
             };
             let success = match state.vault_for(profile) {
                 Ok(vault) => {
@@ -511,14 +691,38 @@ async fn handle_message(
                     false
                 }
             };
+            let outcome = if success { "success" } else { "failed" };
+            audit_secret_access("delete", msg.sender, profile, Some(key), outcome);
             Some(EventKind::SecretDeleteResponse { success })
         }
 
         // -- Secret List (profile-scoped) --
         EventKind::SecretList { profile } => {
-            let Some(state) = unlocked_state.as_mut() else {
-                tracing::warn!(profile = %profile, "secret list while locked");
-                return send_response(client, msg, EventKind::SecretListResponse { keys: vec![] }, daemon_id).await;
+            let requester_name = msg.verified_sender_name.as_deref();
+            check_secret_requester(msg.sender, requester_name);
+
+            // H-016: rate limiting (re-keyed on verified identity per P1 fix).
+            if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
+                audit_secret_access("list", msg.sender, profile, None, "rate-limited");
+                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![] }, ctx.daemon_id).await;
+            }
+
+            // H-020: ACL check -- deny list if daemon has explicit empty ACL (NIST AC-3, AC-6).
+            if !check_secret_list_access(ctx.config, profile, requester_name) {
+                tracing::warn!(
+                    audit = "access-denied",
+                    requester = %msg.sender,
+                    daemon_name = requester_name.unwrap_or("unknown"),
+                    profile = %profile,
+                    "secret list denied by per-profile ACL"
+                );
+                audit_secret_access("list", msg.sender, profile, None, "denied-acl");
+                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![] }, ctx.daemon_id).await;
+            }
+
+            let Some(state) = ctx.unlocked_state.as_mut() else {
+                audit_secret_access("list", msg.sender, profile, None, "denied-locked");
+                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![] }, ctx.daemon_id).await;
             };
             let keys = match state.vault_for(profile) {
                 Ok(vault) => vault.store().list_keys().await.unwrap_or_default(),
@@ -527,14 +731,16 @@ async fn handle_message(
                     vec![]
                 }
             };
+            let outcome = if keys.is_empty() { "empty" } else { "success" };
+            audit_secret_access("list", msg.sender, profile, None, outcome);
             Some(EventKind::SecretListResponse { keys })
         }
 
         // -- Profile Activate (open vault, register for concurrent access) --
         EventKind::ProfileActivate { profile_name, .. } => {
-            let Some(state) = unlocked_state.as_mut() else {
+            let Some(state) = ctx.unlocked_state.as_mut() else {
                 tracing::warn!(profile = %profile_name, "profile activate while locked");
-                return send_response(client, msg, EventKind::ProfileActivateResponse { success: false }, daemon_id).await;
+                return send_response(ctx.client, msg, EventKind::ProfileActivateResponse { success: false }, ctx.daemon_id).await;
             };
             let success = match state.vault_for(profile_name) {
                 Ok(_) => {
@@ -551,9 +757,9 @@ async fn handle_message(
 
         // -- Profile Deactivate (flush JIT, close vault) --
         EventKind::ProfileDeactivate { profile_name, .. } => {
-            let Some(state) = unlocked_state.as_mut() else {
+            let Some(state) = ctx.unlocked_state.as_mut() else {
                 tracing::warn!(profile = %profile_name, "profile deactivate while locked");
-                return send_response(client, msg, EventKind::ProfileDeactivateResponse { success: false }, daemon_id).await;
+                return send_response(ctx.client, msg, EventKind::ProfileDeactivateResponse { success: false }, ctx.daemon_id).await;
             };
             let success = match state.deactivate_profile(profile_name).await {
                 Ok(()) => true,
@@ -570,7 +776,7 @@ async fn handle_message(
     };
 
     if let Some(event) = response_event {
-        send_response(client, msg, event, daemon_id).await?;
+        send_response(ctx.client, msg, event, ctx.daemon_id).await?;
     }
 
     Ok(true)
@@ -679,14 +885,37 @@ fn apply_sandbox() {
 
     let config_dir = core_config::config_dir();
 
+    let pds_dir = PathBuf::from(&runtime_dir).join("pds");
+    let keys_dir = pds_dir.join("keys");
+
     let rules = vec![
+        // Config dir: vault DBs + salt stored here.
         LandlockRule {
             path: config_dir,
-            access: FsAccess::ReadWrite, // vault DBs + salt stored here
+            access: FsAccess::ReadWrite,
+        },
+        // H-017: Per-daemon key file isolation (NIST AC-6). Only this daemon's keypair.
+        LandlockRule {
+            path: keys_dir.join("daemon-secrets.key"),
+            access: FsAccess::ReadOnly,
         },
         LandlockRule {
-            path: PathBuf::from(&runtime_dir).join("pds"),
-            access: FsAccess::ReadWrite,
+            path: keys_dir.join("daemon-secrets.pub"),
+            access: FsAccess::ReadOnly,
+        },
+        LandlockRule {
+            path: keys_dir.join("daemon-secrets.checksum"),
+            access: FsAccess::ReadOnly,
+        },
+        // Bus public key: needed if reconnect ever happens.
+        LandlockRule {
+            path: pds_dir.join("bus.pub"),
+            access: FsAccess::ReadOnly,
+        },
+        // Bus socket: connect + read/write IPC traffic.
+        LandlockRule {
+            path: pds_dir.join("bus.sock"),
+            access: FsAccess::ReadWriteFile,
         },
         // D-Bus socket — non-directory fd, use ReadWriteFile to avoid
         // PartiallyEnforced from directory-only landlock flags.

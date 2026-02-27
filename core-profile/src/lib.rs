@@ -1,13 +1,13 @@
 //! Profile schema, context-driven activation, isolation contracts, and atomic switching.
 //!
-//! Phase 1: schema types (`ProfileState`, `ContextSignal`, `IsolationContract`, `AuditEntry`).
+//! Phase 1: schema types (`ProfileState`, `ContextSignal`, `AuditEntry`).
 //! Phase 2: runtime logic (`ContextEngine`, `AuditLogger` with BLAKE3 hash chain).
 #![forbid(unsafe_code)]
 
 pub mod context;
 pub mod audit;
 
-use core_types::{AppId, ProfileId, SensitivityClass};
+use core_types::{AppId, ProfileId};
 use serde::{Deserialize, Serialize};
 
 pub use context::ContextEngine;
@@ -51,16 +51,6 @@ pub enum ContextSignal {
 // Isolation Contracts
 // ============================================================================
 
-/// Defines data isolation boundaries between two profiles.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IsolationContract {
-    pub from_profile: String,
-    pub to_profile: String,
-    pub resource: IsolatedResource,
-    /// Condition expression evaluated at runtime (e.g. "sensitivity >= secret").
-    pub condition: String,
-}
-
 /// Resources that can be isolated between profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,26 +60,6 @@ pub enum IsolatedResource {
     Frecency,
     Extensions,
     WindowList,
-}
-
-impl IsolationContract {
-    /// Evaluate whether a cross-profile data access is permitted.
-    ///
-    /// Evaluates the condition expression against the given sensitivity class.
-    /// Default: deny all cross-profile access (ADR-SEC-005: assume APT).
-    ///
-    /// Currently supports:
-    /// - `"always"` → always deny (explicit strict isolation)
-    /// - `"sensitivity <= public"` → allow only Public sensitivity
-    /// - All other expressions → deny (fail-closed)
-    #[must_use]
-    pub fn permits(&self, sensitivity: SensitivityClass) -> bool {
-        match self.condition.as_str() {
-            "sensitivity <= public" => sensitivity == SensitivityClass::Public,
-            // Fail-closed: unknown conditions deny access
-            _ => false,
-        }
-    }
 }
 
 // ============================================================================
@@ -119,38 +89,15 @@ pub enum AuditAction {
     DefaultProfileChanged { previous: ProfileId, current: ProfileId },
     IsolationViolationAttempt { from_profile: core_types::TrustProfileName, resource: IsolatedResource },
     SecretAccessed { profile_id: ProfileId, secret_ref: String },
+    KeyRotationStarted { daemon_name: String, generation: u64 },
+    KeyRotationCompleted { daemon_name: String, generation: u64 },
+    KeyRevoked { daemon_name: String, reason: String, generation: u64 },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use uuid::Uuid;
-
-    #[test]
-    fn isolation_contract_default_denies() {
-        let contract = IsolationContract {
-            from_profile: "work".into(),
-            to_profile: "personal".into(),
-            resource: IsolatedResource::Clipboard,
-            condition: "always".into(),
-        };
-        assert!(!contract.permits(SensitivityClass::Public));
-        assert!(!contract.permits(SensitivityClass::TopSecret));
-    }
-
-    #[test]
-    fn isolation_contract_public_only() {
-        let contract = IsolationContract {
-            from_profile: "work".into(),
-            to_profile: "personal".into(),
-            resource: IsolatedResource::Frecency,
-            condition: "sensitivity <= public".into(),
-        };
-        assert!(contract.permits(SensitivityClass::Public));
-        assert!(!contract.permits(SensitivityClass::Confidential));
-        assert!(!contract.permits(SensitivityClass::Secret));
-        assert!(!contract.permits(SensitivityClass::TopSecret));
-    }
 
     #[test]
     fn profile_state_active() {

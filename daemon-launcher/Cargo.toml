@@ -11,13 +11,14 @@ core-types   = { workspace = true }
 core-config  = { workspace = true }
 core-ipc     = { workspace = true }
 core-fuzzy   = { workspace = true }
-core-profile = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap         = { workspace = true }
 anyhow       = { workspace = true }
 serde        = { workspace = true }
+snow         = { workspace = true }
+zeroize      = { workspace = true }
 
 [features]
 default = []

@@ -3,7 +3,8 @@
 //! Assigns repeated-letter hints to windows based on a configurable key set.
 //! Supports numeric shorthand: "a2" matches "aa", "a3" matches "aaa".
 
-use std::collections::HashMap;
+use core_config::WmKeyBinding;
+use std::collections::{BTreeMap, HashMap};
 
 /// Assigns unique repeated-letter hints from a key set to N items.
 ///
@@ -123,6 +124,32 @@ pub fn auto_key_for_app(app_id: &str) -> Option<char> {
         .map(|c| c.to_ascii_lowercase())
 }
 
+/// Look up the configured hint key for an app_id, falling back to auto-detection.
+#[must_use]
+pub fn key_for_app(app_id: &str, key_bindings: &BTreeMap<String, WmKeyBinding>) -> Option<char> {
+    let app_lower = app_id.to_lowercase();
+    let last_segment = app_id.rsplit('.').next().map(|s| s.to_lowercase());
+
+    for (key, binding) in key_bindings {
+        for pattern in &binding.apps {
+            if pattern == app_id
+                || pattern.to_lowercase() == app_lower
+                || last_segment.as_deref() == Some(&pattern.to_lowercase())
+            {
+                return key.chars().next();
+            }
+        }
+    }
+    auto_key_for_app(app_id)
+}
+
+/// Look up the launch command for a key character.
+#[must_use]
+pub fn launch_for_key(key: char, key_bindings: &BTreeMap<String, WmKeyBinding>) -> Option<&str> {
+    let key_str = key.to_string();
+    key_bindings.get(&key_str).and_then(|b| b.launch.as_deref())
+}
+
 /// Assign hints to windows grouped by app, using configured key mappings.
 ///
 /// Windows sharing the same app get consecutive repetitions of the same base key.
@@ -131,6 +158,7 @@ pub fn auto_key_for_app(app_id: &str) -> Option<char> {
 pub fn assign_app_hints(
     app_ids: &[&str],
     hint_keys: &str,
+    key_bindings: &BTreeMap<String, WmKeyBinding>,
 ) -> Vec<(String, usize)> {
     if app_ids.is_empty() || hint_keys.is_empty() {
         return Vec::new();
@@ -141,7 +169,7 @@ pub fn assign_app_hints(
     let keys: Vec<char> = hint_keys.chars().collect();
 
     for (i, app_id) in app_ids.iter().enumerate() {
-        let key = auto_key_for_app(app_id)
+        let key = key_for_app(app_id, key_bindings)
             .filter(|k| keys.contains(k))
             .unwrap_or(keys[0]);
         by_key.entry(key).or_default().push(i);
@@ -223,10 +251,14 @@ mod tests {
         assert_eq!(auto_key_for_app("firefox"), Some('f'));
     }
 
+    fn empty_bindings() -> BTreeMap<String, WmKeyBinding> {
+        BTreeMap::new()
+    }
+
     #[test]
     fn assign_app_hints_groups() {
         let apps = vec!["firefox", "firefox", "ghostty"];
-        let result = assign_app_hints(&apps, "fgasdjkl");
+        let result = assign_app_hints(&apps, "fgasdjkl", &empty_bindings());
         // Two firefox windows: "f", "ff"; one ghostty: "g"
         let hint_strs: Vec<&str> = result.iter().map(|(h, _)| h.as_str()).collect();
         assert!(hint_strs.contains(&"f"));

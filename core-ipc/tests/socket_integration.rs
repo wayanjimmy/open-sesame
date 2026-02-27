@@ -3,20 +3,70 @@
 //! All tests use Noise IK encrypted transport — the same code path as production.
 //! There is no plaintext transport path.
 
-use core_ipc::{BusClient, BusServer, Message, generate_keypair};
+use core_ipc::{BusClient, BusServer, ClearanceRegistry, Message, ZeroizingKeypair, generate_keypair};
 use core_types::{DaemonId, EventKind, SecurityLevel, TrustProfileName};
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Helper: start an encrypted bus server on a temp socket.
-/// Returns (server, temp_dir, server_public_key).
+/// Helper: start an encrypted bus server with pre-registered client keypairs.
+///
+/// `client_count` keypairs are generated and registered at `SecurityLevel::Internal`.
+/// Returns (server, temp_dir, server_public_key, client_keypairs).
+async fn start_server_with_clients(
+    client_count: usize,
+) -> (BusServer, tempfile::TempDir, [u8; 32], Vec<ZeroizingKeypair>) {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("bus.sock");
+    let server_kp = generate_keypair().unwrap();
+    let server_pub: [u8; 32] = server_kp.public().try_into().unwrap();
+
+    let mut registry = ClearanceRegistry::new();
+    let mut client_keypairs = Vec::with_capacity(client_count);
+
+    for i in 0..client_count {
+        let kp = generate_keypair().unwrap();
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(kp.public());
+        registry.register(pubkey, format!("test-client-{i}"), SecurityLevel::Internal);
+        client_keypairs.push(kp);
+    }
+
+    let server = BusServer::bind(&sock, server_kp.into_inner(), registry).unwrap();
+    (server, dir, server_pub, client_keypairs)
+}
+
+/// Helper: start an encrypted bus server with an empty registry (all clients get Open).
 async fn start_server() -> (BusServer, tempfile::TempDir, [u8; 32]) {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("bus.sock");
     let keypair = generate_keypair().unwrap();
-    let server_pub: [u8; 32] = keypair.public.clone().try_into().unwrap();
-    let server = BusServer::bind(&sock, keypair).unwrap();
+    let server_pub: [u8; 32] = keypair.public().try_into().unwrap();
+    let server = BusServer::bind(&sock, keypair.into_inner(), ClearanceRegistry::new()).unwrap();
     (server, dir, server_pub)
+}
+
+/// Helper: connect a client with a specific keypair.
+async fn connect_with_keypair(
+    id: DaemonId,
+    sock: &std::path::Path,
+    server_pub: &[u8; 32],
+    kp: &ZeroizingKeypair,
+) -> BusClient {
+    BusClient::connect_encrypted(id, sock, server_pub, kp.as_inner())
+        .await
+        .unwrap()
+}
+
+/// Helper: connect a client with an ephemeral (unregistered) keypair.
+async fn connect_client(
+    id: DaemonId,
+    sock: &std::path::Path,
+    server_pub: &[u8; 32],
+) -> BusClient {
+    let kp = generate_keypair().unwrap();
+    BusClient::connect_encrypted(id, sock, server_pub, kp.as_inner())
+        .await
+        .unwrap()
 }
 
 /// Helper: make a DaemonId from a u128.
@@ -29,7 +79,7 @@ async fn server_bind_creates_socket_file() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("pds/bus.sock");
     let keypair = generate_keypair().unwrap();
-    let _server = BusServer::bind(&sock, keypair).unwrap();
+    let _server = BusServer::bind(&sock, keypair.into_inner(), ClearanceRegistry::new()).unwrap();
     assert!(sock.exists(), "socket file should exist after bind");
 }
 
@@ -49,9 +99,7 @@ async fn client_connect_and_server_accept() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let _client = BusClient::connect_encrypted(did(1), &sock, &server_pub)
-        .await
-        .unwrap();
+    let _client = connect_client(did(1), &sock, &server_pub).await;
 
     let count = server_handle.await.unwrap();
     assert_eq!(count, 1, "server should have 1 connected client");
@@ -59,18 +107,14 @@ async fn client_connect_and_server_accept() {
 
 #[tokio::test]
 async fn publish_subscribe_roundtrip() {
-    let (server, dir, server_pub) = start_server().await;
+    let (server, dir, server_pub, kps) = start_server_with_clients(2).await;
     let sock = dir.path().join("bus.sock");
 
     tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let client_a = BusClient::connect_encrypted(did(1), &sock, &server_pub)
-        .await
-        .unwrap();
-    let mut client_b = BusClient::connect_encrypted(did(2), &sock, &server_pub)
-        .await
-        .unwrap();
+    let client_a = connect_with_keypair(did(1), &sock, &server_pub, &kps[0]).await;
+    let mut client_b = connect_with_keypair(did(2), &sock, &server_pub, &kps[1]).await;
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -100,18 +144,14 @@ async fn publish_subscribe_roundtrip() {
 
 #[tokio::test]
 async fn request_response_correlation() {
-    let (server, dir, server_pub) = start_server().await;
+    let (server, dir, server_pub, kps) = start_server_with_clients(2).await;
     let sock = dir.path().join("bus.sock");
 
     tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let client_a = BusClient::connect_encrypted(did(1), &sock, &server_pub)
-        .await
-        .unwrap();
-    let mut client_b = BusClient::connect_encrypted(did(2), &sock, &server_pub)
-        .await
-        .unwrap();
+    let client_a = connect_with_keypair(did(1), &sock, &server_pub, &kps[0]).await;
+    let mut client_b = connect_with_keypair(did(2), &sock, &server_pub, &kps[1]).await;
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -161,9 +201,7 @@ async fn sender_does_not_receive_own_message() {
     tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let mut client = BusClient::connect_encrypted(did(1), &sock, &server_pub)
-        .await
-        .unwrap();
+    let mut client = connect_client(did(1), &sock, &server_pub).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     client
@@ -188,7 +226,8 @@ async fn client_connect_retry_on_missing_socket() {
     let sock = dir.path().join("nonexistent.sock");
     let fake_pub = [0u8; 32];
 
-    let result = BusClient::connect_encrypted(did(1), &sock, &fake_pub).await;
+    let kp = generate_keypair().unwrap();
+    let result = BusClient::connect_encrypted(did(1), &sock, &fake_pub, kp.as_inner()).await;
     let err = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("should fail when socket doesn't exist"),
@@ -207,9 +246,7 @@ async fn request_timeout() {
     tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let client = BusClient::connect_encrypted(did(1), &sock, &server_pub)
-        .await
-        .unwrap();
+    let client = connect_client(did(1), &sock, &server_pub).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let result = client
@@ -240,10 +277,11 @@ async fn noise_handshake_rejects_wrong_key() {
 
     // Generate a WRONG server public key (not the real one)
     let wrong_keypair = generate_keypair().unwrap();
-    let wrong_server_pub: [u8; 32] = wrong_keypair.public.clone().try_into().unwrap();
+    let wrong_server_pub: [u8; 32] = wrong_keypair.public().try_into().unwrap();
 
     // Client attempts to connect expecting the wrong server public key
-    let result = BusClient::connect_encrypted(did(1), &sock, &wrong_server_pub).await;
+    let client_kp = generate_keypair().unwrap();
+    let result = BusClient::connect_encrypted(did(1), &sock, &wrong_server_pub, client_kp.as_inner()).await;
 
     assert!(
         result.is_err(),
@@ -255,26 +293,20 @@ async fn noise_handshake_rejects_wrong_key() {
 
 #[tokio::test]
 async fn secret_response_not_received_by_bystander() {
-    let (server, dir, server_pub) = start_server().await;
+    let (server, dir, server_pub, kps) = start_server_with_clients(3).await;
     let sock = dir.path().join("bus.sock");
 
     tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Connect requester (client A)
-    let client_a = BusClient::connect_encrypted(did(1), &sock, &server_pub)
-        .await
-        .unwrap();
+    let client_a = connect_with_keypair(did(1), &sock, &server_pub, &kps[0]).await;
 
     // Connect bystander (client B) — should NOT receive the response
-    let mut bystander = BusClient::connect_encrypted(did(2), &sock, &server_pub)
-        .await
-        .unwrap();
+    let mut bystander = connect_with_keypair(did(2), &sock, &server_pub, &kps[1]).await;
 
     // Connect simulated secrets daemon (client C)
-    let mut secrets_daemon = BusClient::connect_encrypted(did(3), &sock, &server_pub)
-        .await
-        .unwrap();
+    let mut secrets_daemon = connect_with_keypair(did(3), &sock, &server_pub, &kps[2]).await;
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -339,12 +371,8 @@ async fn uncorrelated_response_is_dropped() {
     tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let client_a = BusClient::connect_encrypted(did(1), &sock, &server_pub)
-        .await
-        .unwrap();
-    let mut client_b = BusClient::connect_encrypted(did(2), &sock, &server_pub)
-        .await
-        .unwrap();
+    let client_a = connect_client(did(1), &sock, &server_pub).await;
+    let mut client_b = connect_client(did(2), &sock, &server_pub).await;
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -371,21 +399,15 @@ async fn uncorrelated_response_is_dropped() {
 
 #[tokio::test]
 async fn multiple_clients_receive_broadcast() {
-    let (server, dir, server_pub) = start_server().await;
+    let (server, dir, server_pub, kps) = start_server_with_clients(3).await;
     let sock = dir.path().join("bus.sock");
 
     tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let sender = BusClient::connect_encrypted(did(1), &sock, &server_pub)
-        .await
-        .unwrap();
-    let mut recv_a = BusClient::connect_encrypted(did(2), &sock, &server_pub)
-        .await
-        .unwrap();
-    let mut recv_b = BusClient::connect_encrypted(did(3), &sock, &server_pub)
-        .await
-        .unwrap();
+    let sender = connect_with_keypair(did(1), &sock, &server_pub, &kps[0]).await;
+    let mut recv_a = connect_with_keypair(did(2), &sock, &server_pub, &kps[1]).await;
+    let mut recv_b = connect_with_keypair(did(3), &sock, &server_pub, &kps[2]).await;
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -411,4 +433,154 @@ async fn multiple_clients_receive_broadcast() {
 
     assert!(matches!(msg_a.payload, EventKind::ConfigReloaded { .. }));
     assert!(matches!(msg_b.payload, EventKind::ConfigReloaded { .. }));
+}
+
+// ===== T-ACL-017: Clearance escalation blocking =====
+// SECURITY INVARIANT: A client registered at Open clearance must not be able
+// to send Internal-level messages. The bus server must silently drop the frame
+// (NIST AC-4, AC-6).
+#[tokio::test]
+async fn clearance_escalation_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("bus.sock");
+    let server_kp = generate_keypair().unwrap();
+    let server_pub: [u8; 32] = server_kp.public().try_into().unwrap();
+
+    // Register one client at Open clearance, one at Internal.
+    let open_kp = generate_keypair().unwrap();
+    let internal_kp = generate_keypair().unwrap();
+    let mut registry = ClearanceRegistry::new();
+    let mut open_pub = [0u8; 32];
+    open_pub.copy_from_slice(open_kp.public());
+    registry.register(open_pub, "low-daemon".into(), SecurityLevel::Open);
+    let mut internal_pub = [0u8; 32];
+    internal_pub.copy_from_slice(internal_kp.public());
+    registry.register(internal_pub, "high-daemon".into(), SecurityLevel::Internal);
+
+    let server = BusServer::bind(&sock, server_kp.into_inner(), registry).unwrap();
+    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let open_client = connect_with_keypair(did(10), &sock, &server_pub, &open_kp).await;
+    let mut internal_client = connect_with_keypair(did(11), &sock, &server_pub, &internal_kp).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Open-clearance client attempts to send an Internal-level message.
+    open_client
+        .publish(
+            EventKind::DaemonStarted {
+                daemon_id: did(10),
+                version: "0.1.0".into(),
+                capabilities: vec![],
+            },
+            SecurityLevel::Internal,
+        )
+        .await
+        .unwrap();
+
+    // Internal client should NOT receive it (frame dropped by clearance check).
+    let result = tokio::time::timeout(Duration::from_millis(200), internal_client.recv()).await;
+    assert!(
+        result.is_err(),
+        "Internal-level message from Open-clearance client must be dropped"
+    );
+}
+
+// ===== T-ACL-018: Sender identity change mid-session =====
+// SECURITY INVARIANT: Once a connection's DaemonId is bound on its first
+// message, any subsequent message with a different DaemonId must be dropped
+// (NIST IA-9, SC-23).
+#[tokio::test]
+async fn sender_identity_change_blocked() {
+    let (server, dir, server_pub, kps) = start_server_with_clients(2).await;
+    let sock = dir.path().join("bus.sock");
+
+    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let sender = connect_with_keypair(did(20), &sock, &server_pub, &kps[0]).await;
+    let mut receiver = connect_with_keypair(did(21), &sock, &server_pub, &kps[1]).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // First message: binds DaemonId 20 to this connection.
+    sender
+        .publish(
+            EventKind::DaemonStarted {
+                daemon_id: did(20),
+                version: "0.1.0".into(),
+                capabilities: vec![],
+            },
+            SecurityLevel::Internal,
+        )
+        .await
+        .unwrap();
+
+    // Receiver should get the first message.
+    let msg = tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+        .await
+        .expect("should receive first message")
+        .expect("channel closed");
+    assert!(matches!(msg.payload, EventKind::DaemonStarted { .. }));
+
+    // Second message: different DaemonId (identity change attempt).
+    let spoofed = Message::new(
+        did(99), // Different from the bound did(20)
+        EventKind::DaemonStarted {
+            daemon_id: did(99),
+            version: "0.1.0".into(),
+            capabilities: vec![],
+        },
+        SecurityLevel::Internal,
+        sender.epoch(),
+    );
+    sender.send(&spoofed).await.unwrap();
+
+    // Receiver must NOT get the spoofed message.
+    let result = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await;
+    assert!(
+        result.is_err(),
+        "message with changed DaemonId mid-session must be dropped"
+    );
+}
+
+// ===== T-ACL-020: verified_sender_name stamping =====
+// SECURITY INVARIANT: Messages routed through the bus must have
+// `verified_sender_name` stamped by the server from the Noise IK registry
+// lookup, not self-declared (NIST IA-9).
+#[tokio::test]
+async fn verified_sender_name_stamped() {
+    let (server, dir, server_pub, kps) = start_server_with_clients(2).await;
+    let sock = dir.path().join("bus.sock");
+
+    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Client 0 is registered as "test-client-0" in the registry.
+    let sender = connect_with_keypair(did(30), &sock, &server_pub, &kps[0]).await;
+    let mut receiver = connect_with_keypair(did(31), &sock, &server_pub, &kps[1]).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    sender
+        .publish(
+            EventKind::DaemonStarted {
+                daemon_id: did(30),
+                version: "0.1.0".into(),
+                capabilities: vec!["fake-name".into()],
+            },
+            SecurityLevel::Internal,
+        )
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+        .await
+        .expect("should receive message")
+        .expect("channel closed");
+
+    // The server must have stamped the registry name, not the self-declared capability.
+    assert_eq!(
+        msg.verified_sender_name.as_deref(),
+        Some("test-client-0"),
+        "verified_sender_name must be stamped from registry, not self-declared"
+    );
 }

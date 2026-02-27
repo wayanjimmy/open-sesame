@@ -18,8 +18,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
-use crate::framing::decode_frame;
+use crate::framing::{decode_frame, encode_frame};
 use crate::message::Message;
+use crate::registry::ClearanceRegistry;
 use crate::transport::{extract_ucred, local_credentials};
 
 /// Subscription filter for event routing.
@@ -35,6 +36,9 @@ pub struct SubscriptionFilter {
 #[allow(dead_code)] // subscriptions used in future subscription-based routing
 struct ConnectionState {
     daemon_id: Option<DaemonId>,
+    /// Registry-verified daemon name from Noise IK handshake.
+    /// `None` for unregistered clients (CLI, Open clearance).
+    verified_name: Option<String>,
     tx: mpsc::Sender<Vec<u8>>,
     peer: crate::transport::PeerCredentials,
     security_clearance: SecurityLevel,
@@ -48,6 +52,9 @@ struct ServerState {
     pending_requests: RwLock<HashMap<Uuid, u64>>,
     next_conn_id: AtomicU64,
     epoch: Instant,
+    /// Maps public keys to daemon identities and security clearance levels.
+    /// `RwLock` allows key rotation (H-018) and revocation (H-019) at runtime.
+    registry: RwLock<ClearanceRegistry>,
 }
 
 /// The IPC bus server.
@@ -76,6 +83,7 @@ impl BusServer {
                 pending_requests: RwLock::new(HashMap::new()),
                 next_conn_id: AtomicU64::new(1),
                 epoch: Instant::now(),
+                registry: RwLock::new(ClearanceRegistry::new()),
             }),
             keypair: None,
         }
@@ -94,7 +102,7 @@ impl BusServer {
     /// # Errors
     ///
     /// Returns an error if directory creation or socket binding fails.
-    pub fn bind(path: &Path, keypair: snow::Keypair) -> core_types::Result<Self> {
+    pub fn bind(path: &Path, keypair: snow::Keypair, registry: ClearanceRegistry) -> core_types::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 core_types::Error::Ipc(format!(
@@ -156,6 +164,7 @@ impl BusServer {
                 pending_requests: RwLock::new(HashMap::new()),
                 next_conn_id: AtomicU64::new(1),
                 epoch: Instant::now(),
+                registry: RwLock::new(registry),
             }),
             keypair: Some(Arc::new(keypair)),
         })
@@ -242,6 +251,7 @@ impl BusServer {
         let conn_id = self.state.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let state = ConnectionState {
             daemon_id: Some(daemon_id),
+            verified_name: None, // In-process subscribers have no Noise handshake.
             tx,
             security_clearance,
             subscriptions,
@@ -302,6 +312,11 @@ impl BusServer {
         }
     }
 
+    /// Access the clearance registry for mutation (key rotation H-018, revocation H-019).
+    pub async fn registry_mut(&self) -> tokio::sync::RwLockWriteGuard<'_, ClearanceRegistry> {
+        self.state.registry.write().await
+    }
+
     /// Look up and remove the originating connection for a correlated response.
     ///
     /// When a request arrives via `route_frame()`, the server records
@@ -328,12 +343,22 @@ impl Drop for BusServer {
     }
 }
 
+/// Hex-encode a 32-byte key for logging. No `hex` crate dependency needed.
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// Handle a single client connection: perform Noise handshake, then read/write encrypted frames.
 ///
 /// The connection is registered in `state.connections` only AFTER the handshake
 /// succeeds. This prevents the race where broadcast frames arrive on the
 /// outbound channel before the writer task (which needs the `NoiseTransport`)
 /// is spawned.
+#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     state: Arc<ServerState>,
     conn_id: u64,
@@ -349,6 +374,8 @@ async fn handle_connection(
 
     // Perform Noise IK handshake — mandatory for all socket connections.
     let local_creds = local_credentials();
+    let connected_at = Instant::now();
+
     let mut transport = match crate::noise::server_handshake(
         &mut reader,
         &mut writer,
@@ -360,8 +387,51 @@ async fn handle_connection(
     {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!(conn_id, error = %e, "Noise handshake failed, dropping connection");
+            // H-015: structured handshake failure audit.
+            tracing::error!(
+                audit = "connection-lifecycle",
+                event_type = "handshake-failed",
+                conn_id,
+                peer_pid = peer_creds.pid,
+                peer_uid = peer_creds.uid,
+                error = %e,
+                "Noise handshake failed, dropping connection"
+            );
             return;
+        }
+    };
+
+    // Extract client's X25519 static public key from completed Noise IK handshake.
+    let client_pubkey: [u8; 32] = transport
+        .remote_static()
+        .expect("Noise IK pattern guarantees remote static key after handshake")
+        .try_into()
+        .expect("Curve25519 public key is exactly 32 bytes");
+
+    // Registry lookup: cryptographic identity -> (name, clearance).
+    // H-021: capture verified_name for sender identity verification.
+    let (security_clearance, verified_name) = {
+        let reg = state.registry.read().await;
+        if let Some(entry) = reg.lookup(&client_pubkey) {
+            tracing::info!(
+                audit = "connection-lifecycle",
+                event_type = "handshake-success",
+                conn_id,
+                daemon = %entry.name,
+                clearance = ?entry.security_level,
+                pubkey = %hex_encode(&client_pubkey),
+                peer_pid = peer_creds.pid,
+                peer_uid = peer_creds.uid,
+                "daemon authenticated via registry"
+            );
+            (entry.security_level, Some(entry.name.clone()))
+        } else {
+            tracing::warn!(
+                conn_id,
+                pubkey = %hex_encode(&client_pubkey),
+                "unregistered public key — assigning Open clearance"
+            );
+            (SecurityLevel::Open, None)
         }
     };
 
@@ -369,9 +439,10 @@ async fn handle_connection(
     // on `tx` before the writer task is ready to handle them.
     let conn = ConnectionState {
         daemon_id: None,
+        verified_name,
         tx,
         peer: peer_creds,
-        security_clearance: SecurityLevel::Internal,
+        security_clearance,
         subscriptions: vec![],
     };
     state.connections.write().await.insert(conn_id, conn);
@@ -387,17 +458,35 @@ async fn handle_connection(
         tokio::select! {
             result = transport.read_encrypted_frame(&mut reader) => {
                 match result {
-                    Ok(payload) => {
+                    Ok(mut payload) => {
                         route_frame(&state, conn_id, &payload).await;
+                        // Zeroize decrypted postcard buffer — may contain secret values (H-009).
+                        zeroize::Zeroize::zeroize(&mut payload);
                     }
                     Err(e) => {
-                        tracing::info!(conn_id, error = %e, "client disconnected");
+                        let session_ms = connected_at.elapsed().as_millis();
+                        let daemon_name = state.connections.read().await
+                            .get(&conn_id)
+                            .and_then(|c| c.daemon_id)
+                            .map(|id| id.to_string());
+                        tracing::info!(
+                            audit = "connection-lifecycle",
+                            event_type = "disconnect",
+                            conn_id,
+                            daemon = daemon_name.as_deref().unwrap_or("unknown"),
+                            session_duration_ms = %session_ms,
+                            error = %e,
+                            "client disconnected"
+                        );
                         break;
                     }
                 }
             }
-            Some(payload) = outbound_rx.recv() => {
-                if let Err(e) = transport.write_encrypted_frame(&mut writer, &payload).await {
+            Some(mut payload) = outbound_rx.recv() => {
+                let result = transport.write_encrypted_frame(&mut writer, &payload).await;
+                // Zeroize plaintext postcard buffer after encryption (H-009).
+                zeroize::Zeroize::zeroize(&mut payload);
+                if let Err(e) = result {
                     tracing::debug!(conn_id, error = %e, "encrypted write failed, closing");
                     break;
                 }
@@ -408,7 +497,14 @@ async fn handle_connection(
 
     state.connections.write().await.remove(&conn_id);
     state.pending_requests.write().await.retain(|_, cid| *cid != conn_id);
-    tracing::debug!(conn_id, "connection cleaned up");
+    let session_ms = connected_at.elapsed().as_millis();
+    tracing::debug!(
+        audit = "connection-lifecycle",
+        event_type = "cleanup",
+        conn_id,
+        session_duration_ms = %session_ms,
+        "connection cleaned up"
+    );
 }
 
 /// Route a received frame to the appropriate destination(s).
@@ -419,7 +515,7 @@ async fn handle_connection(
 ///   response routing and forward to all other subscribers.
 async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
     // Decode the message header to extract routing information.
-    let msg: Message<EventKind> = match decode_frame(payload) {
+    let mut msg: Message<EventKind> = match decode_frame(payload) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(conn_id = sender_conn_id, error = %e, "malformed frame, dropping");
@@ -427,15 +523,77 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
         }
     };
 
-    // Update the connection's daemon_id if not yet set.
+    // Update daemon_id, enforce sender clearance, and capture verified_name
+    // in a single lock acquisition to prevent TOCTOU.
+    let verified_name: Option<String>;
     {
         let mut conns = state.connections.write().await;
-        if let Some(conn) = conns.get_mut(&sender_conn_id)
-            && conn.daemon_id.is_none()
-        {
-            conn.daemon_id = Some(msg.sender);
+        if let Some(conn) = conns.get_mut(&sender_conn_id) {
+            // H-021: Sender identity verification (NIST IA-9, SC-23).
+            // First message: record the self-declared DaemonId.
+            // Subsequent messages: verify consistency — a connection must not
+            // change its DaemonId mid-session (impersonation attempt).
+            if let Some(known_id) = conn.daemon_id {
+                if known_id != msg.sender {
+                    tracing::warn!(
+                        audit = "security",
+                        event_type = "sender-identity-mismatch",
+                        conn_id = sender_conn_id,
+                        expected_sender = %known_id,
+                        claimed_sender = %msg.sender,
+                        verified_name = conn.verified_name.as_deref().unwrap_or("unregistered"),
+                        "sender DaemonId changed mid-session, dropping frame"
+                    );
+                    return;
+                }
+            } else {
+                conn.daemon_id = Some(msg.sender);
+
+                // Log the binding between verified name and self-declared DaemonId.
+                if let Some(ref name) = conn.verified_name {
+                    tracing::info!(
+                        audit = "identity-binding",
+                        conn_id = sender_conn_id,
+                        daemon_name = %name,
+                        daemon_id = %msg.sender,
+                        "daemon identity bound: registry name <-> self-declared DaemonId"
+                    );
+                }
+            }
+
+            // Sender clearance enforcement (NIST AC-4, AC-6): a daemon may only
+            // emit messages at or below its own clearance level. This prevents a
+            // compromised low-clearance daemon from injecting high-clearance messages.
+            if conn.security_clearance < msg.security_level {
+                tracing::warn!(
+                    conn_id = sender_conn_id,
+                    sender_clearance = ?conn.security_clearance,
+                    msg_level = ?msg.security_level,
+                    "sender clearance below message security level, dropping frame"
+                );
+                return;
+            }
+
+            // R-008: Capture verified_name from Noise IK registry lookup.
+            verified_name = conn.verified_name.clone();
+        } else {
+            verified_name = None;
         }
     }
+
+    // R-008: Stamp server-verified sender identity onto the message.
+    // This prevents daemons from self-declaring any name via capabilities.
+    // Re-encode after stamping so downstream receivers get the verified name.
+    // Note: re-encode adds serialization overhead on every routed frame. For a
+    // local IPC bus with <10 daemons this is negligible (~µs per frame).
+    msg.verified_sender_name = verified_name;
+    let stamped_payload = match encode_frame(&msg) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(conn_id = sender_conn_id, error = %e, "failed to re-encode stamped frame");
+            return;
+        }
+    };
 
     if let Some(corr_id) = msg.correlation_id {
         // This is a response — route to the originating connection.
@@ -443,7 +601,7 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
         if let Some(target_id) = target_conn {
             let conns = state.connections.read().await;
             if let Some(target) = conns.get(&target_id)
-                && target.tx.try_send(payload.to_vec()).is_err()
+                && target.tx.try_send(stamped_payload.clone()).is_err()
             {
                 tracing::warn!(
                     conn_id = target_id,
@@ -467,7 +625,7 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
                 continue; // Don't echo back to sender.
             }
             if conn.security_clearance >= msg.security_level
-                && conn.tx.try_send(payload.to_vec()).is_err()
+                && conn.tx.try_send(stamped_payload.clone()).is_err()
             {
                 tracing::warn!(conn_id = cid, "subscriber channel full, frame dropped");
             }
