@@ -776,7 +776,20 @@ async fn handle_message(
     };
 
     if let Some(event) = response_event {
+        // Broadcast lock state changes so daemon-profile can track them.
+        // The correlated response goes unicast to the CLI; daemon-profile
+        // (in-process subscriber) only sees broadcasts.
+        let broadcast = match &event {
+            EventKind::UnlockResponse { success } => Some(EventKind::UnlockResponse { success: *success }),
+            EventKind::LockResponse { success } => Some(EventKind::LockResponse { success: *success }),
+            _ => None,
+        };
+
         send_response(ctx.client, msg, event, ctx.daemon_id).await?;
+
+        if let Some(notify) = broadcast {
+            ctx.client.publish(notify, SecurityLevel::Internal).await.ok();
+        }
     }
 
     Ok(true)
