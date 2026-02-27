@@ -45,10 +45,45 @@ impl ConfigWatcher {
         let current = Arc::new(RwLock::new(initial_config));
         let current_clone = Arc::clone(&current);
 
+        // Collect watched config file paths so the callback can filter out
+        // unrelated changes in the same parent directory (e.g. audit.jsonl,
+        // vault DBs, salt files). Without this filter, ANY write to
+        // ~/.config/pds/ triggers a config reload cascade that causes 100%
+        // CPU via feedback loop: write → reload → IPC publish → more writes.
+        let watched_files: std::collections::HashSet<PathBuf> = config_paths
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok().or_else(|| Some(p.clone())))
+            .collect();
+        // Also match by filename for drop-in directories where new files may appear.
+        let watched_extensions: Vec<String> = config_paths
+            .iter()
+            .filter_map(|p| p.extension().map(|e| e.to_string_lossy().to_string()))
+            .collect();
+
         let watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             match res {
                 Ok(event) => {
                     if event.kind.is_modify() || event.kind.is_create() {
+                        // Filter: only react to changes in actual config files.
+                        let is_config_file = event.paths.iter().any(|p| {
+                            // Exact match against known config paths.
+                            if let Ok(canon) = std::fs::canonicalize(p)
+                                && watched_files.contains(&canon) {
+                                return true;
+                            }
+                            if watched_files.contains(p) {
+                                return true;
+                            }
+                            // Extension match for drop-in fragments.
+                            if let Some(ext) = p.extension() {
+                                let ext_str = ext.to_string_lossy();
+                                return watched_extensions.iter().any(|we| we == ext_str.as_ref());
+                            }
+                            false
+                        });
+                        if !is_config_file {
+                            return;
+                        }
                         info!(?event, "config file changed, reloading");
                         match crate::loader::load_config(None) {
                             Ok(new_config) => {
