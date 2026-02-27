@@ -109,8 +109,24 @@ pub trait CompositorBackend: Send + Sync {
 /// 4. Error with available protocol listing
 ///
 pub fn detect_compositor() -> core_types::Result<Box<dyn CompositorBackend>> {
+    #[cfg(feature = "cosmic")]
+    {
+        match CosmicBackend::connect() {
+            Ok(backend) => {
+                tracing::info!("compositor backend: cosmic (ext_foreign_toplevel + zcosmic_toplevel)");
+                return Ok(Box::new(backend));
+            }
+            Err(e) => {
+                tracing::info!("cosmic backend unavailable, trying wlr: {e}");
+            }
+        }
+    }
+
     match WlrBackend::connect() {
-        Ok(backend) => Ok(Box::new(backend)),
+        Ok(backend) => {
+            tracing::info!("compositor backend: wlr-foreign-toplevel-management-v1");
+            Ok(Box::new(backend))
+        }
         Err(e) => Err(core_types::Error::Platform(
             format!("no supported compositor backend: {e}"),
         )),
@@ -471,6 +487,519 @@ impl CompositorBackend for WlrBackend {
     fn name(&self) -> &str {
         "wlr"
     }
+}
+
+// ============================================================================
+// COSMIC Backend (ext_foreign_toplevel_list_v1 + zcosmic_toplevel_info/manager)
+// ============================================================================
+
+/// CompositorBackend implementation using COSMIC-native protocols.
+///
+/// Uses three Wayland protocols:
+/// - `ext_foreign_toplevel_list_v1`: window enumeration (toplevel handles)
+/// - `zcosmic_toplevel_info_v1`: get cosmic handles with activation state
+/// - `zcosmic_toplevel_manager_v1`: window activation via `manager.activate(handle, seat)`
+///
+/// Architecture: a dedicated dispatch thread continuously reads Wayland events.
+/// Window enumeration follows a 2-roundtrip pattern (enumerate → get cosmic state).
+/// Activation follows a 3-roundtrip pattern (enumerate → get cosmic handle → activate).
+///
+/// Unlike WlrBackend which maintains a live snapshot, CosmicBackend re-enumerates
+/// on each list_windows() call because the ext_foreign_toplevel_list_v1 protocol
+/// sends `Finished` after the initial burst — there's no continuous event stream.
+/// This matches v1's proven behavior.
+#[cfg(feature = "cosmic")]
+pub struct CosmicBackend {
+    conn: wayland_client::Connection,
+    #[allow(dead_code)]
+    globals: wayland_client::globals::GlobalList,
+}
+
+#[cfg(feature = "cosmic")]
+impl CosmicBackend {
+    fn connect() -> core_types::Result<Self> {
+        use wayland_client::{Connection, globals::registry_queue_init};
+
+        let conn = Connection::connect_to_env().map_err(|e| {
+            core_types::Error::Platform(format!("Wayland connection failed: {e}"))
+        })?;
+
+        // Probe for required protocols by doing a registry init with a dummy state.
+        let (globals, mut event_queue) = registry_queue_init::<CosmicProbeState>(&conn).map_err(|e| {
+            core_types::Error::Platform(format!("Wayland registry init failed: {e}"))
+        })?;
+
+        let qh = event_queue.handle();
+
+        // Verify all three COSMIC protocols are available.
+        use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
+        use cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1;
+        use cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1;
+
+        globals.bind::<ExtForeignToplevelListV1, _, _>(&qh, 1..=1, ()).map_err(|_| {
+            core_types::Error::Platform("ext_foreign_toplevel_list_v1 not available".into())
+        })?;
+        globals.bind::<ZcosmicToplevelInfoV1, _, _>(&qh, 2..=3, ()).map_err(|_| {
+            core_types::Error::Platform("zcosmic_toplevel_info_v1 not available".into())
+        })?;
+        globals.bind::<ZcosmicToplevelManagerV1, _, _>(&qh, 1..=4, ()).map_err(|_| {
+            core_types::Error::Platform("zcosmic_toplevel_manager_v1 not available".into())
+        })?;
+
+        // Drain events from probe roundtrip.
+        let mut probe_state = CosmicProbeState;
+        let _ = event_queue.roundtrip(&mut probe_state);
+
+        Ok(Self { conn, globals })
+    }
+
+    /// Enumerate all windows using the 2-roundtrip COSMIC protocol flow.
+    ///
+    /// Roundtrip 1: receive ext_foreign_toplevel handles (identifier, app_id, title, Done).
+    /// Then request zcosmic_toplevel_handle for each via info.get_cosmic_toplevel().
+    /// Roundtrip 2: receive cosmic state events (activation detection: state_value == 2).
+    fn enumerate(&self) -> core_types::Result<Vec<Window>> {
+        use wayland_client::globals::registry_queue_init;
+        use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
+        use cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1;
+
+        let (globals, mut event_queue) = registry_queue_init::<CosmicEnumState>(&self.conn).map_err(|e| {
+            core_types::Error::Platform(format!("registry init failed: {e}"))
+        })?;
+        let qh = event_queue.handle();
+
+        let _list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
+            core_types::Error::Platform(format!("ext_foreign_toplevel_list bind: {e}"))
+        })?;
+        let info: ZcosmicToplevelInfoV1 = globals.bind(&qh, 2..=3, ()).map_err(|e| {
+            core_types::Error::Platform(format!("zcosmic_toplevel_info bind: {e}"))
+        })?;
+
+        let mut state = CosmicEnumState {
+            pending: std::collections::HashMap::new(),
+            cosmic_pending: std::collections::HashMap::new(),
+            toplevels: Vec::new(),
+        };
+
+        // Roundtrip 1: receive all ext_foreign_toplevel handles.
+        cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
+
+        // Request cosmic handles for state (activation detection).
+        for (handle, _pending) in &state.toplevels {
+            let foreign_id = wayland_client::Proxy::id(handle).protocol_id();
+            let cosmic_handle = info.get_cosmic_toplevel(handle, &qh, ());
+            let cosmic_id = wayland_client::Proxy::id(&cosmic_handle).protocol_id();
+            state.cosmic_pending.insert(cosmic_id, foreign_id);
+        }
+
+        // Roundtrip 2: receive cosmic state events.
+        cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
+
+        // Convert to v2 Window structs.
+        let mut windows: Vec<Window> = state.toplevels.into_iter()
+            .filter_map(|(_handle, pending)| {
+                let app_id = pending.app_id.as_deref().filter(|s| !s.is_empty())?;
+                let identifier = pending.identifier.as_deref().unwrap_or("");
+
+                // Deterministic WindowId from the protocol's string identifier.
+                // UUID v5 with a project-specific namespace ensures same toplevel
+                // always maps to the same WindowId across enumerations.
+                let window_id = WindowId::from_uuid(uuid::Uuid::new_v5(
+                    &COSMIC_WINDOW_NAMESPACE,
+                    identifier.as_bytes(),
+                ));
+
+                Some(Window {
+                    id: window_id,
+                    app_id: core_types::AppId::new(app_id),
+                    title: pending.title.unwrap_or_default(),
+                    workspace_id: WorkspaceId::new(),
+                    monitor_id: core_types::MonitorId::new(),
+                    geometry: core_types::Geometry { x: 0, y: 0, width: 0, height: 0 },
+                    is_focused: pending.is_activated,
+                    is_minimized: false,
+                    is_fullscreen: false,
+                    profile_id: core_types::ProfileId::new(),
+                })
+            })
+            .collect();
+
+        // MRU reorder: focused window to end (index 0 = previous, for Alt+Tab).
+        if let Some(idx) = windows.iter().position(|w| w.is_focused) {
+            let focused = windows.remove(idx);
+            windows.push(focused);
+        }
+
+        Ok(windows)
+    }
+
+    /// Activate a window using the 3-roundtrip COSMIC protocol flow.
+    ///
+    /// Roundtrip 1: enumerate toplevels.
+    /// Find target by WindowId, request cosmic handle.
+    /// Roundtrip 2: receive cosmic handle.
+    /// Call manager.activate(cosmic_handle, seat).
+    /// Roundtrip 3: ensure activation is processed.
+    fn activate(&self, target_id: &WindowId) -> core_types::Result<()> {
+        use wayland_client::globals::registry_queue_init;
+        use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
+        use cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1;
+        use cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1;
+
+        let (globals, mut event_queue) = registry_queue_init::<CosmicEnumState>(&self.conn).map_err(|e| {
+            core_types::Error::Platform(format!("registry init failed: {e}"))
+        })?;
+        let qh = event_queue.handle();
+
+        let _list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
+            core_types::Error::Platform(format!("ext_foreign_toplevel_list bind: {e}"))
+        })?;
+        let info: ZcosmicToplevelInfoV1 = globals.bind(&qh, 2..=3, ()).map_err(|e| {
+            core_types::Error::Platform(format!("zcosmic_toplevel_info bind: {e}"))
+        })?;
+        let manager: ZcosmicToplevelManagerV1 = globals.bind(&qh, 1..=4, ()).map_err(|e| {
+            core_types::Error::Platform(format!("zcosmic_toplevel_manager bind: {e}"))
+        })?;
+        let seat: wayland_client::protocol::wl_seat::WlSeat = globals.bind(&qh, 1..=9, ()).map_err(|e| {
+            core_types::Error::Platform(format!("wl_seat bind: {e}"))
+        })?;
+
+        let mut state = CosmicEnumState {
+            pending: std::collections::HashMap::new(),
+            cosmic_pending: std::collections::HashMap::new(),
+            toplevels: Vec::new(),
+        };
+
+        // Roundtrip 1: enumerate toplevels.
+        cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
+
+        // Find target window by deterministic UUID mapping.
+        let target_handle = state.toplevels.iter()
+            .find(|(_handle, pending)| {
+                let identifier = pending.identifier.as_deref().unwrap_or("");
+                let wid = WindowId::from_uuid(uuid::Uuid::new_v5(
+                    &COSMIC_WINDOW_NAMESPACE,
+                    identifier.as_bytes(),
+                ));
+                wid == *target_id
+            })
+            .map(|(handle, _)| handle.clone());
+
+        let target_handle = target_handle.ok_or_else(|| {
+            core_types::Error::Platform(format!("window {target_id} not found"))
+        })?;
+
+        // Request cosmic handle for the target.
+        let cosmic_handle = info.get_cosmic_toplevel(&target_handle, &qh, ());
+
+        // Roundtrip 2: receive cosmic handle.
+        cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
+
+        // Activate.
+        manager.activate(&cosmic_handle, &seat);
+
+        // Roundtrip 3: ensure activation is processed.
+        cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
+
+        tracing::info!(window_id = %target_id, "cosmic: window activated");
+        Ok(())
+    }
+}
+
+/// UUID v5 namespace for deterministic WindowId derivation from COSMIC protocol identifiers.
+#[cfg(feature = "cosmic")]
+const COSMIC_WINDOW_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x6f, 0x70, 0x65, 0x6e, 0x2d, 0x73, 0x65, 0x73,
+    0x61, 0x6d, 0x65, 0x2d, 0x77, 0x69, 0x6e, 0x64,
+]); // "open-sesame-wind" as bytes
+
+/// Wayland roundtrip with timeout protection (2s default).
+/// Prevents indefinite blocking if the compositor hangs.
+#[cfg(feature = "cosmic")]
+fn cosmic_roundtrip<D: 'static>(
+    conn: &wayland_client::Connection,
+    event_queue: &mut wayland_client::EventQueue<D>,
+    state: &mut D,
+) -> core_types::Result<()> {
+    use std::os::unix::io::{AsFd, AsRawFd};
+
+    let timeout = std::time::Duration::from_secs(2);
+    let start = std::time::Instant::now();
+    let fd = conn.as_fd().as_raw_fd();
+
+    loop {
+        conn.flush().map_err(|e| {
+            core_types::Error::Platform(format!("Wayland flush: {e}"))
+        })?;
+
+        event_queue.dispatch_pending(state).map_err(|e| {
+            core_types::Error::Platform(format!("Wayland dispatch: {e}"))
+        })?;
+
+        if start.elapsed() >= timeout {
+            return Err(core_types::Error::Platform(
+                format!("Wayland roundtrip timed out after {timeout:?}"),
+            ));
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let timeout_ms = remaining.as_millis().min(100) as i32;
+
+        let mut pollfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(core_types::Error::Platform(format!("poll: {err}")));
+        }
+
+        if ret > 0 && (pollfd.revents & libc::POLLIN) != 0 {
+            if let Some(guard) = conn.prepare_read()
+                && let Err(e) = guard.read()
+            {
+                return Err(core_types::Error::Platform(format!("Wayland read: {e}")));
+            }
+            event_queue.dispatch_pending(state).map_err(|e| {
+                core_types::Error::Platform(format!("Wayland dispatch: {e}"))
+            })?;
+
+            // Final blocking roundtrip to ensure all server events are received.
+            event_queue.roundtrip(state).map_err(|e| {
+                core_types::Error::Platform(format!("Wayland roundtrip: {e}"))
+            })?;
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(feature = "cosmic")]
+impl CompositorBackend for CosmicBackend {
+    fn list_windows(&self) -> BoxFuture<'_, core_types::Result<Vec<Window>>> {
+        Box::pin(async move { self.enumerate() })
+    }
+
+    fn list_workspaces(&self) -> BoxFuture<'_, core_types::Result<Vec<Workspace>>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+
+    fn activate_window(&self, id: &WindowId) -> BoxFuture<'_, core_types::Result<()>> {
+        let id = *id;
+        Box::pin(async move { self.activate(&id) })
+    }
+
+    fn set_window_geometry(&self, _id: &WindowId, _geom: &Geometry) -> BoxFuture<'_, core_types::Result<()>> {
+        Box::pin(async {
+            Err(core_types::Error::Platform("set_window_geometry not supported by cosmic protocol".into()))
+        })
+    }
+
+    fn move_to_workspace(&self, _id: &WindowId, _ws: &WorkspaceId) -> BoxFuture<'_, core_types::Result<()>> {
+        Box::pin(async {
+            Err(core_types::Error::Platform("move_to_workspace not yet implemented for cosmic".into()))
+        })
+    }
+
+    fn focus_window(&self, id: &WindowId) -> BoxFuture<'_, core_types::Result<()>> {
+        self.activate_window(id)
+    }
+
+    fn close_window(&self, _id: &WindowId) -> BoxFuture<'_, core_types::Result<()>> {
+        // TODO: implement via zcosmic_toplevel_manager_v1.close()
+        Box::pin(async move {
+            Err(core_types::Error::Platform("close_window not yet implemented for cosmic".into()))
+        })
+    }
+
+    fn name(&self) -> &str {
+        "cosmic"
+    }
+}
+
+// -- Dispatch state types for CosmicBackend --
+
+/// Minimal probe state used during connect() to verify protocol availability.
+#[cfg(feature = "cosmic")]
+struct CosmicProbeState;
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<wayland_client::protocol::wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for CosmicProbeState {
+    fn event(_: &mut Self, _: &wayland_client::protocol::wl_registry::WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &wayland_client::globals::GlobalListContents, _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for CosmicProbeState {
+    fn event(_: &mut Self, _: &wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, _: wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+
+    wayland_client::event_created_child!(CosmicProbeState, wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, [
+        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE =>
+            (wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ())
+    ]);
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> for CosmicProbeState {
+    fn event(_: &mut Self, _: &wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, _: wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, ()> for CosmicProbeState {
+    fn event(_: &mut Self, _: &cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _: cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+
+    wayland_client::event_created_child!(CosmicProbeState, cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, [
+        cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::EVT_TOPLEVEL_OPCODE =>
+            (cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ())
+    ]);
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for CosmicProbeState {
+    fn event(_: &mut Self, _: &cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, _: cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, ()> for CosmicProbeState {
+    fn event(_: &mut Self, _: &cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _: cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<wayland_client::protocol::wl_seat::WlSeat, ()> for CosmicProbeState {
+    fn event(_: &mut Self, _: &wayland_client::protocol::wl_seat::WlSeat, _: wayland_client::protocol::wl_seat::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+}
+
+// -- Enumeration dispatch state --
+
+/// Pending toplevel data collected from ext_foreign_toplevel events.
+#[cfg(feature = "cosmic")]
+#[derive(Debug, Default)]
+struct CosmicPendingToplevel {
+    identifier: Option<String>,
+    app_id: Option<String>,
+    title: Option<String>,
+    is_activated: bool,
+}
+
+/// State for COSMIC window enumeration and activation.
+#[cfg(feature = "cosmic")]
+struct CosmicEnumState {
+    pending: std::collections::HashMap<u32, CosmicPendingToplevel>,
+    cosmic_pending: std::collections::HashMap<u32, u32>, // cosmic handle id -> foreign handle id
+    toplevels: Vec<(wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, CosmicPendingToplevel)>,
+}
+
+// Dispatch impls for CosmicEnumState — mirrors v1's EnumerationState pattern.
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<wayland_client::protocol::wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for CosmicEnumState {
+    fn event(_: &mut Self, _: &wayland_client::protocol::wl_registry::WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &wayland_client::globals::GlobalListContents, _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for CosmicEnumState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
+        event: wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::Event,
+        _: &(),
+        _conn: &wayland_client::Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::Event::Toplevel { toplevel } = event {
+            let id = wayland_client::Proxy::id(&toplevel).protocol_id();
+            state.pending.insert(id, CosmicPendingToplevel::default());
+        }
+    }
+
+    wayland_client::event_created_child!(CosmicEnumState, wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, [
+        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE =>
+            (wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ())
+    ]);
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> for CosmicEnumState {
+    fn event(
+        state: &mut Self,
+        proxy: &wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+        event: wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::Event,
+        _: &(),
+        _conn: &wayland_client::Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+    ) {
+        use wayland_client::Proxy;
+        use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1;
+        let id = proxy.id().protocol_id();
+
+        match event {
+            ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => {
+                if let Some(p) = state.pending.get_mut(&id) { p.identifier = Some(identifier); }
+            }
+            ext_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
+                if let Some(p) = state.pending.get_mut(&id) { p.app_id = Some(app_id); }
+            }
+            ext_foreign_toplevel_handle_v1::Event::Title { title } => {
+                if let Some(p) = state.pending.get_mut(&id) { p.title = Some(title); }
+            }
+            ext_foreign_toplevel_handle_v1::Event::Done => {
+                if let Some(p) = state.pending.remove(&id) {
+                    state.toplevels.push((proxy.clone(), p));
+                }
+            }
+            ext_foreign_toplevel_handle_v1::Event::Closed => {
+                state.pending.remove(&id);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, ()> for CosmicEnumState {
+    fn event(_: &mut Self, _: &cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _: cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+
+    wayland_client::event_created_child!(CosmicEnumState, cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, [
+        cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::EVT_TOPLEVEL_OPCODE =>
+            (cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ())
+    ]);
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for CosmicEnumState {
+    fn event(
+        state: &mut Self,
+        proxy: &cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
+        event: cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::Event,
+        _: &(),
+        _conn: &wayland_client::Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+    ) {
+        use wayland_client::Proxy;
+        let cosmic_id = proxy.id().protocol_id();
+
+        if let Some(&foreign_id) = state.cosmic_pending.get(&cosmic_id)
+            && let cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::Event::State { state: state_bytes } = &event
+        {
+            if state_bytes.len() % 4 != 0 { return; }
+            for chunk in state_bytes.chunks_exact(4) {
+                let val = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if val == 2 { // State::Activated
+                    if let Some((_h, p)) = state.toplevels.iter_mut().find(|(h, _)| h.id().protocol_id() == foreign_id) {
+                        p.is_activated = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, ()> for CosmicEnumState {
+    fn event(_: &mut Self, _: &cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _: cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
+}
+
+#[cfg(feature = "cosmic")]
+impl wayland_client::Dispatch<wayland_client::protocol::wl_seat::WlSeat, ()> for CosmicEnumState {
+    fn event(_: &mut Self, _: &wayland_client::protocol::wl_seat::WlSeat, _: wayland_client::protocol::wl_seat::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
 }
 
 // ============================================================================

@@ -13,6 +13,8 @@
 #[cfg(target_os = "linux")]
 pub mod compositor;
 #[cfg(target_os = "linux")]
+pub mod cosmic_keys;
+#[cfg(target_os = "linux")]
 pub mod cosmic_theme;
 #[cfg(target_os = "linux")]
 pub mod clipboard;

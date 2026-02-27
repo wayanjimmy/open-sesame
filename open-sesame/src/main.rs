@@ -71,6 +71,27 @@ enum Command {
     #[command(subcommand)]
     Snippet(SnippetCmd),
 
+    /// Setup COSMIC keybindings for window switcher and launcher overlay.
+    ///
+    /// Configures Alt+Tab (switch), Alt+Shift+Tab (switch backward),
+    /// and a launcher key (default: alt+space) in COSMIC's shortcuts.ron.
+    ///
+    /// Usage: sesame setup-keybinding [KEY_COMBO]
+    #[cfg(target_os = "linux")]
+    SetupKeybinding {
+        /// Launcher key combo (default: "alt+space"). Examples: "super+space", "alt+space".
+        #[arg(default_value = "alt+space")]
+        launcher_key: String,
+    },
+
+    /// Remove sesame keybindings from COSMIC configuration.
+    #[cfg(target_os = "linux")]
+    RemoveKeybinding,
+
+    /// Show current sesame keybinding status in COSMIC.
+    #[cfg(target_os = "linux")]
+    KeybindingStatus,
+
     /// Run a command with profile-scoped secrets as environment variables.
     ///
     /// Each secret key is transformed to an env var: uppercase, hyphens become
@@ -357,6 +378,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 cmd_snippet_add(&profile, &trigger, &template).await
             }
         },
+        #[cfg(target_os = "linux")]
+        Command::SetupKeybinding { launcher_key } => {
+            platform_linux::cosmic_keys::setup_keybinding(&launcher_key)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        #[cfg(target_os = "linux")]
+        Command::RemoveKeybinding => {
+            platform_linux::cosmic_keys::remove_keybinding()
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        #[cfg(target_os = "linux")]
+        Command::KeybindingStatus => {
+            platform_linux::cosmic_keys::keybinding_status()
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
         Command::Env { profile, prefix, command } => {
             cmd_env(&profile, prefix.as_deref(), &command).await
         }

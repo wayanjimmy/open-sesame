@@ -29,6 +29,7 @@ libc                    = { workspace = true }
 futures-util            = { workspace = true }
 ron                     = { workspace = true }
 dirs                    = { workspace = true }
+uuid                    = { workspace = true }
 
 # GPL-3.0 gated: feature-flagged to isolate license obligation
 cosmic-client-toolkit   = { workspace = true, optional = true }
