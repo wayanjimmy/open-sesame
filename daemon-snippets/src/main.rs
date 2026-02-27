@@ -95,6 +95,11 @@ async fn main() -> anyhow::Result<()> {
                 platform_linux::systemd::notify_watchdog();
             }
             Some(msg) = client.recv() => {
+                // Skip self-published messages to prevent feedback loops.
+                if msg.sender == daemon_id {
+                    continue;
+                }
+
                 let response_event = match &msg.payload {
                     EventKind::KeyRotationPending { daemon_name, new_pubkey, grace_period_s }
                         if daemon_name == "daemon-snippets" =>

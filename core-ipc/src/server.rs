@@ -273,7 +273,18 @@ impl BusServer {
     /// Publish an already-encoded frame to all matching subscribers.
     pub async fn publish(&self, frame: &[u8], security_level: SecurityLevel) {
         let conns = self.state.connections.read().await;
+        // Decode sender from the frame to skip echoing back to the publisher.
+        // This mirrors route_frame()'s `cid == sender_conn_id` skip for socket clients.
+        let sender_id: Option<DaemonId> = decode_frame::<Message<EventKind>>(frame)
+            .ok()
+            .map(|msg| msg.sender);
         for (id, state) in conns.iter() {
+            // Skip the publisher's own connection to prevent feedback loops.
+            if let Some(sid) = sender_id
+                && state.daemon_id == Some(sid)
+            {
+                continue;
+            }
             if state.security_clearance >= security_level
                 && state.tx.try_send(frame.to_vec()).is_err()
             {

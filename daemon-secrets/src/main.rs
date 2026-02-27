@@ -328,6 +328,11 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 };
 
+                // Skip self-published messages to prevent feedback loops.
+                if msg.sender == daemon_id {
+                    continue;
+                }
+
                 let mut ctx = MessageContext {
                     client: &mut client,
                     unlocked_state: &mut unlocked_state,

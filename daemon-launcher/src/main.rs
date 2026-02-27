@@ -131,6 +131,11 @@ async fn main() -> anyhow::Result<()> {
                 platform_linux::systemd::notify_watchdog();
             }
             Some(msg) = client.recv() => {
+                // Skip self-published messages to prevent feedback loops.
+                if msg.sender == daemon_id {
+                    continue;
+                }
+
                 let response_event = match &msg.payload {
                     EventKind::LaunchQuery { query, max_results, profile } => {
                         // Switch frecency context if profile differs.

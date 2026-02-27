@@ -341,6 +341,11 @@ async fn main() -> anyhow::Result<()> {
             }
 
             Some(msg) = client.recv() => {
+                // Skip self-published messages to prevent feedback loops.
+                if msg.sender == daemon_id {
+                    continue;
+                }
+
                 let response_event = match &msg.payload {
                     EventKind::WmListWindows => {
                         let win_list = windows.lock().await.clone();

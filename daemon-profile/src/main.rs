@@ -324,6 +324,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
+                // Skip messages we sent ourselves. bus.publish() delivers to ALL
+                // connections including our own host channel. Without this guard,
+                // activation::activate() broadcasting ProfileActivate creates an
+                // infinite feedback loop (daemon-profile re-processes its own broadcast).
+                if msg.sender == daemon_id {
+                    continue;
+                }
+
                 if let Some(response_event) = handle_bus_message(
                     &msg,
                     &mut active_profiles,
