@@ -691,7 +691,10 @@ impl CosmicBackend {
         })?;
         let qh = event_queue.handle();
 
-        let list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
+        // Binding the list triggers toplevel enumeration; we don't call methods on it
+        // directly (cleanup was removed to avoid crashing cosmic-comp), but the bind
+        // itself is required for the compositor to send toplevel events.
+        let _list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
             core_types::Error::Platform(format!("ext_foreign_toplevel_list bind: {e}"))
         })?;
         let info: ZcosmicToplevelInfoV1 = globals.bind(&qh, 2..=3, ()).map_err(|e| {

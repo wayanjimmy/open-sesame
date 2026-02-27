@@ -514,10 +514,23 @@ async fn cmd_unlock() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut password = dialoguer::Password::new()
-        .with_prompt("Master password")
-        .interact()
-        .context("failed to read password")?;
+    let mut password = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        dialoguer::Password::new()
+            .with_prompt("Master password")
+            .interact()
+            .context("failed to read password")?
+    } else {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .context("failed to read password from stdin")?;
+        if buf.ends_with('\n') {
+            buf.pop();
+            if buf.ends_with('\r') {
+                buf.pop();
+            }
+        }
+        buf
+    };
 
     let mut password_bytes = password.as_bytes().to_vec();
     password.zeroize();
@@ -678,10 +691,24 @@ async fn cmd_secret_set(profile: &str, key: &str) -> anyhow::Result<()> {
     let profile = TrustProfileName::try_from(profile)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut value = dialoguer::Password::new()
-        .with_prompt(format!("Value for '{key}'"))
-        .interact()
-        .context("failed to read secret value")?;
+    let mut value = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        dialoguer::Password::new()
+            .with_prompt(format!("Value for '{key}'"))
+            .interact()
+            .context("failed to read secret value")?
+    } else {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .context("failed to read secret value from stdin")?;
+        // Trim trailing newline from piped input.
+        if buf.ends_with('\n') {
+            buf.pop();
+            if buf.ends_with('\r') {
+                buf.pop();
+            }
+        }
+        buf
+    };
 
     let mut value_bytes = value.as_bytes().to_vec();
     value.zeroize();
