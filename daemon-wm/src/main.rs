@@ -794,6 +794,7 @@ fn apply_sandbox() {
             "rseq".into(), "sched_getaffinity".into(),
             "prlimit64".into(), "prctl".into(),
             "getpid".into(), "gettid".into(), "getuid".into(), "geteuid".into(),
+            "getresuid".into(), "getresgid".into(), "getgid".into(), "getegid".into(),
             "kill".into(),
             // Epoll / event loop (tokio)
             "epoll_wait".into(), "epoll_ctl".into(),
@@ -812,6 +813,15 @@ fn apply_sandbox() {
             "sigaltstack".into(), "rt_sigaction".into(),
             "rt_sigprocmask".into(), "rt_sigreturn".into(),
             "tgkill".into(),
+            // GTK4/GLib runtime
+            "inotify_init1".into(), "inotify_add_watch".into(), "inotify_rm_watch".into(),
+            "statfs".into(), "fstatfs".into(), "memfd_create".into(),
+            "writev".into(), "readv".into(),
+            "readlink".into(), "readlinkat".into(), "uname".into(),
+            "accept4".into(), "bind".into(), "listen".into(),
+            "nanosleep".into(), "clock_nanosleep".into(), "sched_yield".into(),
+            "timerfd_create".into(), "timerfd_settime".into(), "timerfd_gettime".into(),
+            "mlock".into(), "mlock2".into(),
             // Misc
             "exit_group".into(), "exit".into(), "getrandom".into(),
             "restart_syscall".into(),
