@@ -376,7 +376,8 @@ fn wlr_dispatch_loop(
                     Err(wayland_client::backend::WaylandError::Io(ref e))
                         if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
-                        tracing::error!(error = %e, backoff_ms = backoff.as_millis(), "wlr dispatch: Wayland read failed, backing off");
+                        let proto_err = conn.protocol_error();
+                        tracing::error!(error = %e, ?proto_err, backoff_ms = backoff.as_millis(), "wlr dispatch: Wayland read failed, backing off");
                         std::thread::sleep(backoff);
                         backoff = (backoff * 2).min(max_backoff);
                         continue;
@@ -390,7 +391,8 @@ fn wlr_dispatch_loop(
 
         // Dispatch all buffered events.
         if let Err(e) = event_queue.dispatch_pending(&mut state) {
-            tracing::error!(error = %e, backoff_ms = backoff.as_millis(), "wlr dispatch: dispatch_pending failed, backing off");
+            let proto_err = conn.protocol_error();
+            tracing::error!(error = %e, ?proto_err, backoff_ms = backoff.as_millis(), "wlr dispatch: dispatch_pending failed, backing off");
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(max_backoff);
             continue;
@@ -398,7 +400,8 @@ fn wlr_dispatch_loop(
 
         // Flush outgoing requests (e.g. destroy from Closed handling).
         if let Err(e) = conn.flush() {
-            tracing::error!(error = %e, backoff_ms = backoff.as_millis(), "wlr dispatch: flush failed, backing off");
+            let proto_err = conn.protocol_error();
+            tracing::error!(error = %e, ?proto_err, backoff_ms = backoff.as_millis(), "wlr dispatch: flush failed, backing off");
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(max_backoff);
             continue;
@@ -524,31 +527,34 @@ impl CosmicBackend {
             core_types::Error::Platform(format!("Wayland connection failed: {e}"))
         })?;
 
-        // Probe for required protocols by doing a registry init with a dummy state.
-        let (globals, mut event_queue) = registry_queue_init::<CosmicProbeState>(&conn).map_err(|e| {
+        // Probe for required protocols by checking the global list — do NOT bind
+        // protocol objects here. Binding ExtForeignToplevelListV1 causes the compositor
+        // to start sending Toplevel events; if the probe event queue is then dropped,
+        // those objects become zombies and the compositor closes the connection when
+        // the client fails to consume their events.
+        let (globals, _event_queue) = registry_queue_init::<CosmicProbeState>(&conn).map_err(|e| {
             core_types::Error::Platform(format!("Wayland registry init failed: {e}"))
         })?;
 
-        let qh = event_queue.handle();
+        // Verify all three COSMIC protocols are advertised (by interface name).
+        let global_list = globals.contents().clone_list();
+        let has = |iface: &str| global_list.iter().any(|g| g.interface == iface);
 
-        // Verify all three COSMIC protocols are available.
-        use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
-        use cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1;
-        use cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1;
-
-        globals.bind::<ExtForeignToplevelListV1, _, _>(&qh, 1..=1, ()).map_err(|_| {
-            core_types::Error::Platform("ext_foreign_toplevel_list_v1 not available".into())
-        })?;
-        globals.bind::<ZcosmicToplevelInfoV1, _, _>(&qh, 2..=3, ()).map_err(|_| {
-            core_types::Error::Platform("zcosmic_toplevel_info_v1 not available".into())
-        })?;
-        globals.bind::<ZcosmicToplevelManagerV1, _, _>(&qh, 1..=4, ()).map_err(|_| {
-            core_types::Error::Platform("zcosmic_toplevel_manager_v1 not available".into())
-        })?;
-
-        // Drain events from probe roundtrip.
-        let mut probe_state = CosmicProbeState;
-        let _ = event_queue.roundtrip(&mut probe_state);
+        if !has("ext_foreign_toplevel_list_v1") {
+            return Err(core_types::Error::Platform(
+                "ext_foreign_toplevel_list_v1 not available".into(),
+            ));
+        }
+        if !has("zcosmic_toplevel_info_v1") {
+            return Err(core_types::Error::Platform(
+                "zcosmic_toplevel_info_v1 not available".into(),
+            ));
+        }
+        if !has("zcosmic_toplevel_manager_v1") {
+            return Err(core_types::Error::Platform(
+                "zcosmic_toplevel_manager_v1 not available".into(),
+            ));
+        }
 
         Ok(Self { conn, globals })
     }
@@ -564,11 +570,14 @@ impl CosmicBackend {
         use cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1;
 
         let (globals, mut event_queue) = registry_queue_init::<CosmicEnumState>(&self.conn).map_err(|e| {
-            core_types::Error::Platform(format!("registry init failed: {e}"))
+            let proto_err = self.conn.protocol_error();
+            core_types::Error::Platform(format!(
+                "registry init failed: {e} (protocol_error: {proto_err:?})"
+            ))
         })?;
         let qh = event_queue.handle();
 
-        let _list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
+        let list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
             core_types::Error::Platform(format!("ext_foreign_toplevel_list bind: {e}"))
         })?;
         let info: ZcosmicToplevelInfoV1 = globals.bind(&qh, 2..=3, ()).map_err(|e| {
@@ -585,25 +594,25 @@ impl CosmicBackend {
         cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
 
         // Request cosmic handles for state (activation detection).
+        // Collect cosmic handle proxies for cleanup.
+        let mut cosmic_handles = Vec::new();
         for (handle, _pending) in &state.toplevels {
             let foreign_id = wayland_client::Proxy::id(handle).protocol_id();
             let cosmic_handle = info.get_cosmic_toplevel(handle, &qh, ());
             let cosmic_id = wayland_client::Proxy::id(&cosmic_handle).protocol_id();
             state.cosmic_pending.insert(cosmic_id, foreign_id);
+            cosmic_handles.push(cosmic_handle);
         }
 
         // Roundtrip 2: receive cosmic state events.
         cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
 
         // Convert to v2 Window structs.
-        let mut windows: Vec<Window> = state.toplevels.into_iter()
+        let mut windows: Vec<Window> = state.toplevels.iter()
             .filter_map(|(_handle, pending)| {
                 let app_id = pending.app_id.as_deref().filter(|s| !s.is_empty())?;
                 let identifier = pending.identifier.as_deref().unwrap_or("");
 
-                // Deterministic WindowId from the protocol's string identifier.
-                // UUID v5 with a project-specific namespace ensures same toplevel
-                // always maps to the same WindowId across enumerations.
                 let window_id = WindowId::from_uuid(uuid::Uuid::new_v5(
                     &COSMIC_WINDOW_NAMESPACE,
                     identifier.as_bytes(),
@@ -612,7 +621,7 @@ impl CosmicBackend {
                 Some(Window {
                     id: window_id,
                     app_id: core_types::AppId::new(app_id),
-                    title: pending.title.unwrap_or_default(),
+                    title: pending.title.clone().unwrap_or_default(),
                     workspace_id: WorkspaceId::new(),
                     monitor_id: core_types::MonitorId::new(),
                     geometry: core_types::Geometry { x: 0, y: 0, width: 0, height: 0 },
@@ -629,6 +638,22 @@ impl CosmicBackend {
             let focused = windows.remove(idx);
             windows.push(focused);
         }
+
+        // Protocol cleanup: destroy all objects before dropping EventQueue.
+        // Per ext-foreign-toplevel-list-v1.xml: stop → wait finished → destroy handles → destroy list.
+        // Per cosmic-toplevel-info-unstable-v1.xml: destroy cosmic handles.
+        for cosmic_handle in cosmic_handles {
+            cosmic_handle.destroy();
+        }
+        for (handle, _) in state.toplevels.drain(..) {
+            handle.destroy();
+        }
+        list.stop();
+        // Roundtrip to receive the `finished` event before destroying the list.
+        let _ = cosmic_roundtrip(&self.conn, &mut event_queue, &mut state);
+        list.destroy();
+        // Flush destruction requests to the compositor.
+        let _ = self.conn.flush();
 
         Ok(windows)
     }
@@ -647,11 +672,14 @@ impl CosmicBackend {
         use cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1;
 
         let (globals, mut event_queue) = registry_queue_init::<CosmicEnumState>(&self.conn).map_err(|e| {
-            core_types::Error::Platform(format!("registry init failed: {e}"))
+            let proto_err = self.conn.protocol_error();
+            core_types::Error::Platform(format!(
+                "registry init failed: {e} (protocol_error: {proto_err:?})"
+            ))
         })?;
         let qh = event_queue.handle();
 
-        let _list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
+        let list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
             core_types::Error::Platform(format!("ext_foreign_toplevel_list bind: {e}"))
         })?;
         let info: ZcosmicToplevelInfoV1 = globals.bind(&qh, 2..=3, ()).map_err(|e| {
@@ -702,6 +730,21 @@ impl CosmicBackend {
         cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
 
         tracing::info!(window_id = %target_id, "cosmic: window activated");
+
+        // Protocol cleanup: destroy all objects before dropping EventQueue.
+        // Per cosmic-toplevel-info-unstable-v1.xml: destroy cosmic handles.
+        // Per cosmic-toplevel-management-unstable-v1.xml: destroy manager.
+        // Per ext-foreign-toplevel-list-v1.xml: stop → wait finished → destroy handles → destroy list.
+        cosmic_handle.destroy();
+        for (handle, _) in state.toplevels.drain(..) {
+            handle.destroy();
+        }
+        manager.destroy();
+        list.stop();
+        let _ = cosmic_roundtrip(&self.conn, &mut event_queue, &mut state);
+        list.destroy();
+        let _ = self.conn.flush();
+
         Ok(())
     }
 }
@@ -723,18 +766,22 @@ fn cosmic_roundtrip<D: 'static>(
 ) -> core_types::Result<()> {
     use std::os::unix::io::{AsFd, AsRawFd};
 
+    // Helper: format error with protocol_error() context for diagnostics.
+    let fmt_err = |phase: &str, e: &dyn std::fmt::Display| -> core_types::Error {
+        let proto_err = conn.protocol_error();
+        core_types::Error::Platform(format!(
+            "Wayland {phase}: {e} (protocol_error: {proto_err:?})"
+        ))
+    };
+
     let timeout = std::time::Duration::from_secs(2);
     let start = std::time::Instant::now();
     let fd = conn.as_fd().as_raw_fd();
 
     loop {
-        conn.flush().map_err(|e| {
-            core_types::Error::Platform(format!("Wayland flush: {e}"))
-        })?;
+        conn.flush().map_err(|e| fmt_err("flush", &e))?;
 
-        event_queue.dispatch_pending(state).map_err(|e| {
-            core_types::Error::Platform(format!("Wayland dispatch: {e}"))
-        })?;
+        event_queue.dispatch_pending(state).map_err(|e| fmt_err("dispatch_pending", &e))?;
 
         if start.elapsed() >= timeout {
             return Err(core_types::Error::Platform(
@@ -751,23 +798,19 @@ fn cosmic_roundtrip<D: 'static>(
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted { continue; }
-            return Err(core_types::Error::Platform(format!("poll: {err}")));
+            return Err(fmt_err("poll", &err));
         }
 
         if ret > 0 && (pollfd.revents & libc::POLLIN) != 0 {
             if let Some(guard) = conn.prepare_read()
                 && let Err(e) = guard.read()
             {
-                return Err(core_types::Error::Platform(format!("Wayland read: {e}")));
+                return Err(fmt_err("read", &e));
             }
-            event_queue.dispatch_pending(state).map_err(|e| {
-                core_types::Error::Platform(format!("Wayland dispatch: {e}"))
-            })?;
+            event_queue.dispatch_pending(state).map_err(|e| fmt_err("dispatch_pending[2]", &e))?;
 
             // Final blocking roundtrip to ensure all server events are received.
-            event_queue.roundtrip(state).map_err(|e| {
-                core_types::Error::Platform(format!("Wayland roundtrip: {e}"))
-            })?;
+            event_queue.roundtrip(state).map_err(|e| fmt_err("roundtrip", &e))?;
             return Ok(());
         }
     }
@@ -825,46 +868,6 @@ struct CosmicProbeState;
 #[cfg(feature = "cosmic")]
 impl wayland_client::Dispatch<wayland_client::protocol::wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for CosmicProbeState {
     fn event(_: &mut Self, _: &wayland_client::protocol::wl_registry::WlRegistry, _: wayland_client::protocol::wl_registry::Event, _: &wayland_client::globals::GlobalListContents, _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
-}
-
-#[cfg(feature = "cosmic")]
-impl wayland_client::Dispatch<wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for CosmicProbeState {
-    fn event(_: &mut Self, _: &wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, _: wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
-
-    wayland_client::event_created_child!(CosmicProbeState, wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, [
-        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE =>
-            (wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ())
-    ]);
-}
-
-#[cfg(feature = "cosmic")]
-impl wayland_client::Dispatch<wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> for CosmicProbeState {
-    fn event(_: &mut Self, _: &wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, _: wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
-}
-
-#[cfg(feature = "cosmic")]
-impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, ()> for CosmicProbeState {
-    fn event(_: &mut Self, _: &cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _: cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
-
-    wayland_client::event_created_child!(CosmicProbeState, cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, [
-        cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::EVT_TOPLEVEL_OPCODE =>
-            (cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ())
-    ]);
-}
-
-#[cfg(feature = "cosmic")]
-impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for CosmicProbeState {
-    fn event(_: &mut Self, _: &cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, _: cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
-}
-
-#[cfg(feature = "cosmic")]
-impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, ()> for CosmicProbeState {
-    fn event(_: &mut Self, _: &cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _: cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
-}
-
-#[cfg(feature = "cosmic")]
-impl wayland_client::Dispatch<wayland_client::protocol::wl_seat::WlSeat, ()> for CosmicProbeState {
-    fn event(_: &mut Self, _: &wayland_client::protocol::wl_seat::WlSeat, _: wayland_client::protocol::wl_seat::Event, _: &(), _: &wayland_client::Connection, _: &wayland_client::QueueHandle<Self>) {}
 }
 
 // -- Enumeration dispatch state --
@@ -1212,8 +1215,9 @@ async fn focus_monitor_inner(
                 Err(wayland_client::backend::WaylandError::Io(ref e))
                     if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => {
+                    let proto_err = conn.protocol_error();
                     return Err(core_types::Error::Platform(format!(
-                        "Wayland read failed: {e}"
+                        "Wayland read failed: {e} (protocol_error: {proto_err:?})"
                     )));
                 }
             }
@@ -1221,12 +1225,14 @@ async fn focus_monitor_inner(
 
         // Dispatch all pending events to our handlers.
         event_queue.dispatch_pending(&mut state).map_err(|e| {
-            core_types::Error::Platform(format!("Wayland dispatch failed: {e}"))
+            let proto_err = conn.protocol_error();
+            core_types::Error::Platform(format!("Wayland dispatch failed: {e} (protocol_error: {proto_err:?})"))
         })?;
 
         // Flush any outgoing requests (e.g. destroy).
         conn.flush().map_err(|e| {
-            core_types::Error::Platform(format!("Wayland flush failed: {e}"))
+            let proto_err = conn.protocol_error();
+            core_types::Error::Platform(format!("Wayland flush failed: {e} (protocol_error: {proto_err:?})"))
         })?;
 
         // Clear readiness so we wait again.

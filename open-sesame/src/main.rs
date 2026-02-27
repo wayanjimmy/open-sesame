@@ -458,6 +458,9 @@ pub(crate) async fn rpc(
             }
             anyhow::anyhow!("{e}")
         })?;
+    if let EventKind::AccessDenied { reason } = &response.payload {
+        anyhow::bail!("access denied: {reason}");
+    }
     Ok(response.payload)
 }
 

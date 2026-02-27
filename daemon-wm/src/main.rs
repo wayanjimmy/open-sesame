@@ -852,7 +852,8 @@ fn apply_sandbox() {
             "accept4".into(), "bind".into(), "listen".into(),
             "nanosleep".into(), "clock_nanosleep".into(), "sched_yield".into(),
             "timerfd_create".into(), "timerfd_settime".into(), "timerfd_gettime".into(),
-            "mlock".into(), "mlock2".into(),
+            "mlock".into(), "mlock2".into(), "mremap".into(),
+            "unlink".into(), "sched_get_priority_max".into(),
             // Misc
             "exit_group".into(), "exit".into(), "getrandom".into(),
             "restart_syscall".into(), "getcwd".into(),

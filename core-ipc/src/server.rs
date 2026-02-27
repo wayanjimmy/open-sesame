@@ -426,12 +426,12 @@ async fn handle_connection(
             );
             (entry.security_level, Some(entry.name.clone()))
         } else {
-            tracing::warn!(
+            tracing::info!(
                 conn_id,
                 pubkey = %hex_encode(&client_pubkey),
-                "unregistered public key — assigning Open clearance"
+                "unregistered public key — assigning SecretsOnly clearance (Noise-authenticated, same-UID)"
             );
-            (SecurityLevel::Open, None)
+            (SecurityLevel::SecretsOnly, None)
         }
     };
 
@@ -507,12 +507,34 @@ async fn handle_connection(
     );
 }
 
+/// Send an `AccessDenied` error response back to the sender so the client
+/// gets an actionable error instead of a silent timeout.
+fn send_access_denied(
+    conn: &ConnectionState,
+    request_msg_id: Uuid,
+    epoch: Instant,
+    reason: String,
+) {
+    let reply = Message::new(
+        DaemonId::new(),
+        EventKind::AccessDenied { reason },
+        SecurityLevel::Open,
+        epoch,
+    )
+    .with_correlation(request_msg_id);
+
+    if let Ok(reply_bytes) = encode_frame(&reply) {
+        let _ = conn.tx.try_send(reply_bytes);
+    }
+}
+
 /// Route a received frame to the appropriate destination(s).
 ///
 /// - If the message has a `correlation_id`, it's a response — route only to
 ///   the connection that originated the request.
 /// - Otherwise, it's a new request or broadcast — record the `msg_id` for
 ///   response routing and forward to all other subscribers.
+#[allow(clippy::too_many_lines)]
 async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
     // Decode the message header to extract routing information.
     let mut msg: Message<EventKind> = match decode_frame(payload) {
@@ -544,6 +566,12 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
                         verified_name = conn.verified_name.as_deref().unwrap_or("unregistered"),
                         "sender DaemonId changed mid-session, dropping frame"
                     );
+                    send_access_denied(
+                        conn,
+                        msg.msg_id,
+                        state.epoch,
+                        "sender identity changed mid-session".into(),
+                    );
                     return;
                 }
             } else {
@@ -569,7 +597,16 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
                     conn_id = sender_conn_id,
                     sender_clearance = ?conn.security_clearance,
                     msg_level = ?msg.security_level,
-                    "sender clearance below message security level, dropping frame"
+                    "sender clearance below message security level, rejecting"
+                );
+                send_access_denied(
+                    conn,
+                    msg.msg_id,
+                    state.epoch,
+                    format!(
+                        "sender clearance {:?} below message security level {:?}",
+                        conn.security_clearance, msg.security_level,
+                    ),
                 );
                 return;
             }
@@ -624,9 +661,10 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
             if cid == sender_conn_id {
                 continue; // Don't echo back to sender.
             }
-            if conn.security_clearance >= msg.security_level
-                && conn.tx.try_send(stamped_payload.clone()).is_err()
-            {
+            if conn.security_clearance < msg.security_level {
+                continue; // Recipient clearance too low for this message.
+            }
+            if conn.tx.try_send(stamped_payload.clone()).is_err() {
                 tracing::warn!(conn_id = cid, "subscriber channel full, frame dropped");
             }
         }

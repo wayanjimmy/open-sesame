@@ -168,10 +168,11 @@ pub struct SeccompProfile {
 pub fn apply_seccomp(profile: &SeccompProfile) -> core_types::Result<()> {
     use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 
-    // Default action: kill the process on any disallowed syscall.
+    // Default action for disallowed syscalls.
     // TODO(seccomp-audit): temporarily Log instead of KillProcess to collect
-    // all missing syscalls in dmesg/audit. Revert after audit complete.
-    let mut filter = ScmpFilterContext::new(ScmpAction::Log)
+    // all missing syscalls in dmesg/audit. Revert to KillProcess after audit.
+    let default_action = ScmpAction::Log;
+    let mut filter = ScmpFilterContext::new(default_action)
         .map_err(|e| core_types::Error::Platform(format!("seccomp new_filter failed: {e}")))?;
 
     for syscall_name in &profile.allowed_syscalls {
@@ -193,7 +194,8 @@ pub fn apply_seccomp(profile: &SeccompProfile) -> core_types::Result<()> {
     tracing::info!(
         daemon = %profile.daemon_name,
         allowed_count = profile.allowed_syscalls.len(),
-        "seccomp: filter loaded (KillProcess default action)"
+        default_action = %format!("{default_action:?}"),
+        "seccomp: filter loaded"
     );
 
     Ok(())
