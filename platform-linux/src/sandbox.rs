@@ -51,7 +51,11 @@ pub enum EnforcementStatus {
 /// Returns an error if Landlock is not fully enforced — callers MUST treat
 /// non-full enforcement as fatal. There is no graceful degradation.
 pub fn apply_landlock(rules: &[LandlockRule]) -> core_types::Result<EnforcementStatus> {
-    let abi = ABI::V6; // Linux 6.12+: ioctl_dev, scope
+    // Use highest ABI the crate supports (V6) to handle all access types:
+    // V5 IoctlDev, V6 Scope (AbstractUnixSocket, Signal), V4 AccessNet.
+    // Kernel V7 is capped to V6 by landlock 0.4.4. Requesting V6 flags
+    // with V6 kernel avoids PartiallyEnforced from unhandled access types.
+    let abi = ABI::V6;
 
     let mut ruleset = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
