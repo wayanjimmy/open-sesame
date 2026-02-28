@@ -308,10 +308,23 @@ pub fn cmd_wipe() -> anyhow::Result<()> {
     }
     println!();
 
-    let confirmation: String = dialoguer::Input::new()
-        .with_prompt("  Type \"destroy all data\" to confirm")
-        .interact_text()
-        .context("failed to read confirmation")?;
+    let confirmation: String = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        dialoguer::Input::new()
+            .with_prompt("  Type \"destroy all data\" to confirm")
+            .interact_text()
+            .context("failed to read confirmation")?
+    } else {
+        let mut buf = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+            .context("failed to read confirmation from stdin")?;
+        if buf.ends_with('\n') {
+            buf.pop();
+            if buf.ends_with('\r') {
+                buf.pop();
+            }
+        }
+        buf
+    };
 
     if confirmation.trim() != "destroy all data" {
         println!("  Cancelled.");
