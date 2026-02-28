@@ -547,6 +547,9 @@ async fn cmd_unlock() -> anyhow::Result<()> {
         EventKind::UnlockResponse { success: false } => {
             anyhow::bail!("unlock failed — wrong password or keyring error");
         }
+        EventKind::UnlockRejected { reason: core_types::UnlockRejectedReason::AlreadyUnlocked } => {
+            println!("{}", "Already unlocked.".yellow());
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 
@@ -721,11 +724,14 @@ async fn cmd_secret_set(profile: &str, key: &str) -> anyhow::Result<()> {
     value_bytes.zeroize();
 
     match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-        EventKind::SecretSetResponse { success: true } => {
+        EventKind::SecretSetResponse { success: true, .. } => {
             println!("Secret '{key}' stored in profile '{profile}'.");
         }
-        EventKind::SecretSetResponse { success: false } => {
-            anyhow::bail!("failed to store secret — is the vault unlocked?");
+        EventKind::SecretSetResponse { success: false, denial } => {
+            if let Some(reason) = denial {
+                anyhow::bail!("{}", format_denial_reason(&reason, key, &profile));
+            }
+            anyhow::bail!("failed to store secret");
         }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
@@ -744,9 +750,12 @@ async fn cmd_secret_get(profile: &str, key: &str) -> anyhow::Result<()> {
     };
 
     match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-        EventKind::SecretGetResponse { key: k, value } => {
+        EventKind::SecretGetResponse { key: k, value, denial } => {
+            if let Some(reason) = denial {
+                anyhow::bail!("{}", format_denial_reason(&reason, &k, &profile));
+            }
             if value.is_empty() {
-                anyhow::bail!("secret '{k}' not found in profile '{profile}' — vault locked or key missing");
+                anyhow::bail!("secret '{k}' not found in profile '{profile}'");
             }
             // With default config (ipc-field-encryption off), value is
             // plaintext over Noise-encrypted transport. Print as UTF-8
@@ -792,11 +801,14 @@ async fn cmd_secret_delete(profile: &str, key: &str) -> anyhow::Result<()> {
     };
 
     match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-        EventKind::SecretDeleteResponse { success: true } => {
+        EventKind::SecretDeleteResponse { success: true, .. } => {
             println!("Secret '{key}' deleted from profile '{profile}'.");
         }
-        EventKind::SecretDeleteResponse { success: false } => {
-            anyhow::bail!("failed to delete secret — vault locked or key not found");
+        EventKind::SecretDeleteResponse { success: false, denial } => {
+            if let Some(reason) = denial {
+                anyhow::bail!("{}", format_denial_reason(&reason, key, &profile));
+            }
+            anyhow::bail!("failed to delete secret");
         }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
@@ -812,7 +824,10 @@ async fn cmd_secret_list(profile: &str) -> anyhow::Result<()> {
     let event = EventKind::SecretList { profile: profile.clone() };
 
     match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-        EventKind::SecretListResponse { keys } => {
+        EventKind::SecretListResponse { keys, denial } => {
+            if let Some(reason) = denial {
+                anyhow::bail!("{}", format_denial_reason(&reason, "", &profile));
+            }
             if keys.is_empty() {
                 println!("{}", "No secrets in this profile.".dimmed());
             } else {
@@ -1353,6 +1368,22 @@ async fn cmd_snippet_add(profile: &str, trigger: &str, template: &str) -> anyhow
 }
 
 // ============================================================================
+// Secret denial reason formatting (Step 2.10)
+// ============================================================================
+
+fn format_denial_reason(reason: &core_types::SecretDenialReason, key: &str, profile: &TrustProfileName) -> String {
+    use core_types::SecretDenialReason;
+    match reason {
+        SecretDenialReason::Locked => "vault locked -- run `sesame unlock`".into(),
+        SecretDenialReason::ProfileNotActive => format!("profile '{}' is not active -- run `sesame profile activate {}`", profile, profile),
+        SecretDenialReason::AccessDenied => format!("access denied for secret '{}'", key),
+        SecretDenialReason::RateLimited => "rate limited -- try again later".into(),
+        SecretDenialReason::NotFound => format!("secret '{}' not found in profile '{}'", key, profile),
+        SecretDenialReason::VaultError(e) => format!("vault error: {}", e),
+    }
+}
+
+// ============================================================================
 // Env command — run a command with secrets as environment variables
 // ============================================================================
 
@@ -1391,7 +1422,12 @@ async fn cmd_env(profile: &str, prefix: Option<&str>, command: &[String]) -> any
         EventKind::SecretList { profile: profile.clone() },
         SecurityLevel::SecretsOnly,
     ).await? {
-        EventKind::SecretListResponse { keys } => keys,
+        EventKind::SecretListResponse { keys, denial } => {
+            if let Some(reason) = denial {
+                anyhow::bail!("{}", format_denial_reason(&reason, "", &profile));
+            }
+            keys
+        }
         other => anyhow::bail!("unexpected response to SecretList: {other:?}"),
     };
 
@@ -1413,7 +1449,7 @@ async fn cmd_env(profile: &str, prefix: Option<&str>, command: &[String]) -> any
         };
 
         match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-            EventKind::SecretGetResponse { value, .. } if !value.is_empty() => {
+            EventKind::SecretGetResponse { value, denial, .. } if denial.is_none() && !value.is_empty() => {
                 let env_name = secret_key_to_env_var(key, prefix);
                 env_vars.push((env_name, value.as_bytes().to_vec()));
             }

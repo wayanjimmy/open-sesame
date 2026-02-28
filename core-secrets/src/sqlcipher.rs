@@ -161,6 +161,26 @@ impl SqlCipherStore {
         enc_key.decrypt(&nonce, ciphertext)
     }
 
+    /// Clear SQLCipher's internal C-level key buffer via `PRAGMA rekey = '';`.
+    ///
+    /// Defense-in-depth: the Rust-side `entry_key: SecureBytes` already zeroizes
+    /// on drop, but this ensures the SQLCipher C library's internal copy of the
+    /// page encryption key is also scrubbed before the connection is closed.
+    ///
+    /// Called from all vault-closing paths: deactivation, lock, and shutdown.
+    /// Logs a warning on failure but does not panic — zeroization is best-effort
+    /// because the connection may already be in a broken state.
+    pub fn pragma_rekey_clear(&self) {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = conn.execute_batch("PRAGMA rekey = '';") {
+            tracing::warn!(
+                path = %self.db_path.display(),
+                error = %e,
+                "PRAGMA rekey clear failed — C-level key buffer may not be zeroized"
+            );
+        }
+    }
+
     /// Current Unix timestamp in seconds.
     fn now_secs() -> i64 {
         std::time::SystemTime::now()
@@ -270,6 +290,15 @@ impl std::fmt::Debug for SqlCipherStore {
             .field("db_path", &self.db_path)
             .field("vault_key", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl Drop for SqlCipherStore {
+    fn drop(&mut self) {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = conn.execute_batch("PRAGMA rekey = '';") {
+            let _ = e;
+        }
     }
 }
 
@@ -538,5 +567,33 @@ mod tests {
         let store = SqlCipherStore::open(&db, &key).unwrap();
         let val = store.get("persist/key").await.unwrap();
         assert_eq!(val.as_bytes(), b"survives-restart");
+    }
+
+    #[tokio::test]
+    async fn pragma_rekey_clear_does_not_remove_encryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rekey-test.db");
+        let key = test_vault_key();
+
+        // Open, write a secret, call pragma_rekey_clear, close.
+        let store = SqlCipherStore::open(&db, &key).unwrap();
+        store.set("rekey-check", b"secret-payload").await.unwrap();
+        store.pragma_rekey_clear();
+        drop(store);
+
+        // Reopen with the ORIGINAL key -- must succeed if encryption preserved.
+        let store2 = SqlCipherStore::open(&db, &key).unwrap();
+        let val = store2.get("rekey-check").await.unwrap();
+        assert_eq!(val.as_bytes(), b"secret-payload",
+            "database must still be readable with original key after pragma_rekey_clear");
+        drop(store2);
+
+        // Attempt to open with NO key (empty Connection::open, no PRAGMA key).
+        // If PRAGMA rekey='' removed encryption, this would succeed.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let result = conn.execute_batch("SELECT count(*) FROM sqlite_master;");
+        assert!(result.is_err(),
+            "database must NOT be readable without a key after pragma_rekey_clear -- \
+             PRAGMA rekey='' may have removed encryption!");
     }
 }

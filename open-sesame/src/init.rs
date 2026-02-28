@@ -202,11 +202,27 @@ async fn init_unlock() -> anyhow::Result<()> {
         println!("        Choose something strong — you'll need it to unlock after reboot.");
         println!();
 
-        let mut password = dialoguer::Password::new()
-            .with_prompt("        Master password")
-            .with_confirmation("        Confirm", "        Passwords don't match, try again")
-            .interact()
-            .context("failed to read password")?;
+        let mut password = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            dialoguer::Password::new()
+                .with_prompt("        Master password")
+                .with_confirmation("        Confirm", "        Passwords don't match, try again")
+                .interact()
+                .context("failed to read password")?
+        } else {
+            let mut buf = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+                .context("failed to read password from stdin")?;
+            if buf.ends_with('\n') {
+                buf.pop();
+                if buf.ends_with('\r') {
+                    buf.pop();
+                }
+            }
+            if buf.is_empty() {
+                anyhow::bail!("empty password from stdin — refusing to create vault with no password");
+            }
+            buf
+        };
 
         let mut password_bytes = password.as_bytes().to_vec();
         password.zeroize();
@@ -222,6 +238,10 @@ async fn init_unlock() -> anyhow::Result<()> {
             }
             EventKind::UnlockResponse { success: false } => {
                 anyhow::bail!("unlock failed — wrong password or keyring error");
+            }
+            EventKind::UnlockRejected { reason: core_types::UnlockRejectedReason::AlreadyUnlocked } => {
+                // Benign: another client unlocked between our StatusRequest and UnlockRequest.
+                step_skip("Secrets already unlocked");
             }
             other => anyhow::bail!("unexpected response: {other:?}"),
         }

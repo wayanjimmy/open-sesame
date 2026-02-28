@@ -44,9 +44,10 @@ use clap::Parser;
 use core_crypto::SecureBytes;
 use core_ipc::{BusClient, Message};
 use core_secrets::{JitDelivery, SecretsStore, SqlCipherStore};
-use core_types::{DaemonId, EventKind, SecurityLevel, SensitiveBytes, TrustProfileName};
-use std::collections::HashMap;
+use core_types::{DaemonId, EventKind, SecretDenialReason, SecurityLevel, SensitiveBytes, TrustProfileName};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,6 +75,11 @@ struct UnlockedState {
     /// Trust profile name -> JitDelivery wrapping SqlCipherStore.
     /// Multiple vaults may be open concurrently.
     vaults: HashMap<TrustProfileName, JitDelivery<SqlCipherStore>>,
+    /// Profiles explicitly authorized for secret access (SEC-001/SEC-003 fix).
+    /// This is the security boundary — vault_for() refuses profiles not in this set.
+    /// Distinct from `vaults.keys()`: a profile may be authorized before its vault
+    /// is lazily opened, or a vault may be open while deactivation is in progress.
+    active_profiles: HashSet<TrustProfileName>,
     /// JIT TTL from CLI.
     ttl: Duration,
     /// Config directory for vault DB storage.
@@ -82,7 +88,15 @@ struct UnlockedState {
 
 impl UnlockedState {
     /// Get or lazily open a vault for the given trust profile.
+    ///
+    /// Refuses access if the profile is not in the active_profiles authorization set.
+    /// This is the enforcement point for SEC-001/SEC-003.
     fn vault_for(&mut self, profile: &TrustProfileName) -> core_types::Result<&JitDelivery<SqlCipherStore>> {
+        if !self.active_profiles.contains(profile) {
+            return Err(core_types::Error::Secrets(format!(
+                "profile '{}' is not active — access denied", profile
+            )));
+        }
         if !self.vaults.contains_key(profile) {
             let vault_key = core_crypto::derive_vault_key(self.master_key.as_bytes(), profile);
             let db_path = self.config_dir.join("vaults").join(format!("{profile}.db"));
@@ -104,24 +118,34 @@ impl UnlockedState {
         Ok(self.vaults.get(profile).expect("just inserted"))
     }
 
-    /// Deactivate a trust profile: flush its JIT cache and close the vault.
-    async fn deactivate_profile(&mut self, profile: &TrustProfileName) -> core_types::Result<()> {
+    /// Authorize a profile for secret access. Must be called before vault_for().
+    fn activate_profile(&mut self, profile: &TrustProfileName) {
+        self.active_profiles.insert(profile.clone());
+        tracing::info!(profile = %profile, "profile authorized for secret access");
+    }
+
+    /// Deactivate a trust profile: deauthorize, flush JIT cache, close vault.
+    ///
+    /// Idempotent: deactivating an already-inactive profile is not an error.
+    /// Deauthorization (removing from active_profiles) is the security operation
+    /// and happens FIRST — before vault close.
+    async fn deactivate_profile(&mut self, profile: &TrustProfileName) {
+        self.active_profiles.remove(profile);
         if let Some(vault) = self.vaults.remove(profile) {
             vault.flush().await;
-            // SqlCipherStore closes DB connection on drop.
+            vault.store().pragma_rekey_clear();
             drop(vault);
-            tracing::info!(profile = %profile, "vault deactivated");
-            Ok(())
-        } else {
-            Err(core_types::Error::NotFound(format!(
-                "profile '{profile}' is not active"
-            )))
+            tracing::info!(profile = %profile, "vault deactivated and key material zeroized");
         }
     }
 
-    /// Names of all trust profiles with open vaults.
+    /// Names of all profiles authorized for secret access.
+    ///
+    /// Returns the authorization set, NOT the set of open vaults.
+    /// These can diverge: a profile may be authorized before its vault
+    /// is lazily opened.
     fn active_profiles(&self) -> Vec<TrustProfileName> {
-        self.vaults.keys().cloned().collect()
+        self.active_profiles.iter().cloned().collect()
     }
 
     /// Get the per-profile IPC encryption key (ADR-SEC-006, defense-in-depth).
@@ -379,8 +403,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Graceful shutdown: zeroize master key, close all open vaults, clear keyring.
     // SecureBytes zeroizes on drop. SqlCipherStore closes DB connections on drop.
-    if let Some(state) = unlocked_state.take() {
+    if let Some(mut state) = unlocked_state.take() {
         let count = state.vaults.len();
+        state.active_profiles.clear();
+        for (_profile, vault) in state.vaults.drain() {
+            vault.flush().await;
+            vault.store().pragma_rekey_clear();
+            drop(vault);
+        }
         drop(state);
         #[cfg(target_os = "linux")]
         keyring_delete().await;
@@ -447,35 +477,45 @@ async fn handle_message(
 
         // -- Unlock --
         EventKind::UnlockRequest { password } => {
-            let outcome = if ctx.unlocked_state.is_some() {
-                tracing::warn!("unlock requested but already unlocked");
-                "already-unlocked"
-            } else {
-                match unlock(password.as_bytes(), ctx.config_dir, ctx.ttl).await {
-                    Ok(state) => {
-                        tracing::info!("secrets unlocked");
-                        *ctx.unlocked_state = Some(state);
-                        "success"
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "unlock failed");
-                        "failed"
-                    }
+            if ctx.unlocked_state.is_some() {
+                tracing::warn!(audit = "security", "unlock request while already unlocked — rejected");
+                audit_secret_access("unlock", msg.sender, "-", None, "rejected-already-unlocked");
+                return send_response(
+                    ctx.client, msg,
+                    EventKind::UnlockRejected { reason: core_types::UnlockRejectedReason::AlreadyUnlocked },
+                    ctx.daemon_id,
+                ).await;
+            }
+            let outcome = match unlock(password.as_bytes(), ctx.config_dir, ctx.ttl).await {
+                Ok(state) => {
+                    tracing::info!("secrets unlocked");
+                    *ctx.unlocked_state = Some(state);
+                    "success"
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "unlock failed");
+                    "failed"
                 }
             };
             audit_secret_access("unlock", msg.sender, "-", None, outcome);
-            Some(EventKind::UnlockResponse { success: outcome != "failed" })
+            Some(EventKind::UnlockResponse { success: outcome == "success" })
         }
 
         // -- Lock --
         EventKind::LockRequest => {
-            if let Some(state) = ctx.unlocked_state.take() {
-                drop(state); // SecureBytes zeroizes on drop.
-                // ADR-SEC-001: remove master key from platform keyring.
+            if let Some(mut state) = ctx.unlocked_state.take() {
+                state.active_profiles.clear();
+                for (_profile, vault) in state.vaults.drain() {
+                    vault.flush().await;
+                    vault.store().pragma_rekey_clear();
+                    drop(vault);
+                }
+                drop(state); // SecureBytes zeroizes master_key on drop.
                 #[cfg(target_os = "linux")]
                 keyring_delete().await;
                 tracing::info!("secrets locked, master key zeroized");
             }
+            *ctx.rate_limiter = SecretRateLimiter::new();
             audit_secret_access("lock", msg.sender, "-", None, "success");
             Some(EventKind::LockResponse { success: true })
         }
@@ -495,14 +535,33 @@ async fn handle_message(
         }
 
         // -- Secret Get (profile-scoped) --
+        // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
         EventKind::SecretGet { profile, key } => {
-            // R-008/R-009: Use server-verified sender name (NIST IA-9, AC-3).
-            // This is stamped by route_frame from the Noise IK registry — NOT self-declared.
-            let requester_name = msg.verified_sender_name.as_deref();
+            // 1. LOCK CHECK (cheapest, most restrictive — no timing/rate leaks when locked).
+            let Some(state) = ctx.unlocked_state.as_mut() else {
+                audit_secret_access("get", msg.sender, profile, Some(key), "denied-locked");
+                return send_response(ctx.client, msg, EventKind::SecretGetResponse {
+                    key: key.clone(),
+                    value: SensitiveBytes::new(vec![]),
+                    denial: Some(SecretDenialReason::Locked),
+                }, ctx.daemon_id).await;
+            };
 
-            // H-014: anomaly detection using verified identity.
+            // 2. ACTIVE PROFILE CHECK (SEC-001/SEC-003 fix).
+            if !state.active_profiles.contains(profile) {
+                audit_secret_access("get", msg.sender, profile, Some(key), "denied-profile-not-active");
+                return send_response(ctx.client, msg, EventKind::SecretGetResponse {
+                    key: key.clone(),
+                    value: SensitiveBytes::new(vec![]),
+                    denial: Some(SecretDenialReason::ProfileNotActive),
+                }, ctx.daemon_id).await;
+            }
+
+            // 3. IDENTITY CHECK (R-008/R-009: server-verified sender name, NIST IA-9, AC-3).
+            let requester_name = msg.verified_sender_name.as_deref();
             check_secret_requester(msg.sender, requester_name);
-            // H-016: rate limiting.
+
+            // 4. RATE LIMIT CHECK (H-016).
             if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
                 tracing::warn!(
                     audit = "rate-limit",
@@ -515,10 +574,11 @@ async fn handle_message(
                 return send_response(ctx.client, msg, EventKind::SecretGetResponse {
                     key: key.clone(),
                     value: SensitiveBytes::new(vec![]),
+                    denial: Some(SecretDenialReason::RateLimited),
                 }, ctx.daemon_id).await;
             }
 
-            // H-020: Per-secret access control (NIST AC-3, AC-6).
+            // 5. ACL CHECK (H-020: per-secret access control, NIST AC-3, AC-6).
             if !check_secret_access(ctx.config, profile, requester_name, key) {
                 tracing::warn!(
                     audit = "access-denied",
@@ -532,34 +592,30 @@ async fn handle_message(
                 return send_response(ctx.client, msg, EventKind::SecretGetResponse {
                     key: key.clone(),
                     value: SensitiveBytes::new(vec![]),
+                    denial: Some(SecretDenialReason::AccessDenied),
                 }, ctx.daemon_id).await;
             }
 
-            let Some(state) = ctx.unlocked_state.as_mut() else {
-                audit_secret_access("get", msg.sender, profile, Some(key), "denied-locked");
-                return send_response(ctx.client, msg, EventKind::SecretGetResponse {
-                    key: key.clone(),
-                    value: SensitiveBytes::new(vec![]),
-                }, ctx.daemon_id).await;
-            };
+            // 6. VAULT ACCESS.
             match state.vault_for(profile) {
                 Ok(vault) => match vault.resolve(key).await {
                     Ok(secret) => {
                         #[cfg(feature = "ipc-field-encryption")]
-                        let value = match state.encrypt_for_ipc(profile, secret.as_bytes()) {
-                            Ok(v) => SensitiveBytes::new(v),
+                        let (value, denial) = match state.encrypt_for_ipc(profile, secret.as_bytes()) {
+                            Ok(v) => (SensitiveBytes::new(v), None),
                             Err(e) => {
                                 tracing::error!(profile = %profile, key, error = %e, "IPC encryption failed");
-                                SensitiveBytes::new(vec![])
+                                (SensitiveBytes::new(vec![]), Some(SecretDenialReason::VaultError(format!("IPC encryption failed: {e}"))))
                             }
                         };
                         #[cfg(not(feature = "ipc-field-encryption"))]
-                        let value = SensitiveBytes::new(secret.as_bytes().to_vec());
+                        let (value, denial): (SensitiveBytes, Option<SecretDenialReason>) = (SensitiveBytes::new(secret.as_bytes().to_vec()), None);
 
                         audit_secret_access("get", msg.sender, profile, Some(key), "success");
                         Some(EventKind::SecretGetResponse {
                             key: key.clone(),
                             value,
+                            denial,
                         })
                     }
                     Err(e) => {
@@ -568,6 +624,7 @@ async fn handle_message(
                         Some(EventKind::SecretGetResponse {
                             key: key.clone(),
                             value: SensitiveBytes::new(vec![]),
+                            denial: Some(SecretDenialReason::NotFound),
                         })
                     }
                 },
@@ -577,15 +634,32 @@ async fn handle_message(
                     Some(EventKind::SecretGetResponse {
                         key: key.clone(),
                         value: SensitiveBytes::new(vec![]),
+                        denial: Some(SecretDenialReason::VaultError(e.to_string())),
                     })
                 }
             }
         }
 
         // -- Secret Set (profile-scoped) --
+        // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
         EventKind::SecretSet { profile, key, value } => {
+            // 1. LOCK CHECK.
+            let Some(state) = ctx.unlocked_state.as_mut() else {
+                audit_secret_access("set", msg.sender, profile, Some(key), "denied-locked");
+                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false, denial: Some(SecretDenialReason::Locked) }, ctx.daemon_id).await;
+            };
+
+            // 2. ACTIVE PROFILE CHECK.
+            if !state.active_profiles.contains(profile) {
+                audit_secret_access("set", msg.sender, profile, Some(key), "denied-profile-not-active");
+                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false, denial: Some(SecretDenialReason::ProfileNotActive) }, ctx.daemon_id).await;
+            }
+
+            // 3. IDENTITY CHECK.
             let requester_name = msg.verified_sender_name.as_deref();
             check_secret_requester(msg.sender, requester_name);
+
+            // 4. RATE LIMIT CHECK.
             if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
                 tracing::warn!(
                     audit = "rate-limit",
@@ -595,10 +669,10 @@ async fn handle_message(
                     "secret request rate limit exceeded"
                 );
                 audit_secret_access("set", msg.sender, profile, Some(key), "rate-limited");
-                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false }, ctx.daemon_id).await;
+                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false, denial: Some(SecretDenialReason::RateLimited) }, ctx.daemon_id).await;
             }
 
-            // H-020: Per-secret access control (NIST AC-3, AC-6).
+            // 5. ACL CHECK.
             if !check_secret_access(ctx.config, profile, requester_name, key) {
                 tracing::warn!(
                     audit = "access-denied",
@@ -609,58 +683,73 @@ async fn handle_message(
                     "secret access denied by per-profile ACL"
                 );
                 audit_secret_access("set", msg.sender, profile, Some(key), "denied-acl");
-                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false }, ctx.daemon_id).await;
+                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false, denial: Some(SecretDenialReason::AccessDenied) }, ctx.daemon_id).await;
             }
 
-            let Some(state) = ctx.unlocked_state.as_mut() else {
-                audit_secret_access("set", msg.sender, profile, Some(key), "denied-locked");
-                return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false }, ctx.daemon_id).await;
-            };
+            // 6. VAULT ACCESS (IPC field decryption runs here, after all gates pass).
             #[cfg(feature = "ipc-field-encryption")]
-            let store_value = match state.decrypt_from_ipc(profile, value.as_bytes()) {
+            let mut store_value = match state.decrypt_from_ipc(profile, value.as_bytes()) {
                 Ok(pt) => pt,
                 Err(e) => {
                     tracing::error!(profile = %profile, key, error = %e, "IPC decryption of secret value failed");
                     audit_secret_access("set", msg.sender, profile, Some(key), "decrypt-error");
-                    return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false }, ctx.daemon_id).await;
+                    return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false, denial: Some(SecretDenialReason::VaultError(format!("IPC decryption failed: {e}"))) }, ctx.daemon_id).await;
                 }
             };
             #[cfg(not(feature = "ipc-field-encryption"))]
-            let store_value = value.as_bytes().to_vec();
+            let mut store_value = value.as_bytes().to_vec();
 
-            let success = match state.vault_for(profile) {
+            let (success, denial) = match state.vault_for(profile) {
                 Ok(vault) => {
                     match vault.store().set(key, &store_value).await {
                         Ok(()) => {
                             vault.flush().await;
-                            true
+                            (true, None)
                         }
                         Err(e) => {
                             tracing::error!(profile = %profile, key, error = %e, "secret set failed");
-                            false
+                            (false, Some(SecretDenialReason::VaultError(e.to_string())))
                         }
                     }
                 }
                 Err(e) => {
                     tracing::error!(profile = %profile, error = %e, "vault access failed");
-                    false
+                    (false, Some(SecretDenialReason::VaultError(e.to_string())))
                 }
             };
+            // Zeroize the intermediate plaintext copy (NEW-003 fix).
+            store_value.zeroize();
             let outcome = if success { "success" } else { "failed" };
             audit_secret_access("set", msg.sender, profile, Some(key), outcome);
-            Some(EventKind::SecretSetResponse { success })
+            Some(EventKind::SecretSetResponse { success, denial })
         }
 
         // -- Secret Delete (profile-scoped) --
+        // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
         EventKind::SecretDelete { profile, key } => {
-            let requester_name = msg.verified_sender_name.as_deref();
-            check_secret_requester(msg.sender, requester_name);
-            if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
-                audit_secret_access("delete", msg.sender, profile, Some(key), "rate-limited");
-                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false }, ctx.daemon_id).await;
+            // 1. LOCK CHECK.
+            let Some(state) = ctx.unlocked_state.as_mut() else {
+                audit_secret_access("delete", msg.sender, profile, Some(key), "denied-locked");
+                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false, denial: Some(SecretDenialReason::Locked) }, ctx.daemon_id).await;
+            };
+
+            // 2. ACTIVE PROFILE CHECK.
+            if !state.active_profiles.contains(profile) {
+                audit_secret_access("delete", msg.sender, profile, Some(key), "denied-profile-not-active");
+                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false, denial: Some(SecretDenialReason::ProfileNotActive) }, ctx.daemon_id).await;
             }
 
-            // H-020: Per-secret access control (NIST AC-3, AC-6).
+            // 3. IDENTITY CHECK.
+            let requester_name = msg.verified_sender_name.as_deref();
+            check_secret_requester(msg.sender, requester_name);
+
+            // 4. RATE LIMIT CHECK.
+            if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
+                audit_secret_access("delete", msg.sender, profile, Some(key), "rate-limited");
+                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false, denial: Some(SecretDenialReason::RateLimited) }, ctx.daemon_id).await;
+            }
+
+            // 5. ACL CHECK.
             if !check_secret_access(ctx.config, profile, requester_name, key) {
                 tracing::warn!(
                     audit = "access-denied",
@@ -671,48 +760,59 @@ async fn handle_message(
                     "secret access denied by per-profile ACL"
                 );
                 audit_secret_access("delete", msg.sender, profile, Some(key), "denied-acl");
-                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false }, ctx.daemon_id).await;
+                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false, denial: Some(SecretDenialReason::AccessDenied) }, ctx.daemon_id).await;
             }
 
-            let Some(state) = ctx.unlocked_state.as_mut() else {
-                audit_secret_access("delete", msg.sender, profile, Some(key), "denied-locked");
-                return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false }, ctx.daemon_id).await;
-            };
-            let success = match state.vault_for(profile) {
+            // 6. VAULT ACCESS.
+            let (success, denial) = match state.vault_for(profile) {
                 Ok(vault) => {
                     match vault.store().delete(key).await {
                         Ok(()) => {
                             vault.flush().await;
-                            true
+                            (true, None)
                         }
                         Err(e) => {
                             tracing::warn!(profile = %profile, key, error = %e, "secret delete failed");
-                            false
+                            (false, Some(SecretDenialReason::VaultError(e.to_string())))
                         }
                     }
                 }
                 Err(e) => {
                     tracing::error!(profile = %profile, error = %e, "vault access failed");
-                    false
+                    (false, Some(SecretDenialReason::VaultError(e.to_string())))
                 }
             };
             let outcome = if success { "success" } else { "failed" };
             audit_secret_access("delete", msg.sender, profile, Some(key), outcome);
-            Some(EventKind::SecretDeleteResponse { success })
+            Some(EventKind::SecretDeleteResponse { success, denial })
         }
 
         // -- Secret List (profile-scoped) --
+        // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
         EventKind::SecretList { profile } => {
+            // 1. LOCK CHECK.
+            let Some(state) = ctx.unlocked_state.as_mut() else {
+                audit_secret_access("list", msg.sender, profile, None, "denied-locked");
+                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![], denial: Some(SecretDenialReason::Locked) }, ctx.daemon_id).await;
+            };
+
+            // 2. ACTIVE PROFILE CHECK.
+            if !state.active_profiles.contains(profile) {
+                audit_secret_access("list", msg.sender, profile, None, "denied-profile-not-active");
+                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![], denial: Some(SecretDenialReason::ProfileNotActive) }, ctx.daemon_id).await;
+            }
+
+            // 3. IDENTITY CHECK.
             let requester_name = msg.verified_sender_name.as_deref();
             check_secret_requester(msg.sender, requester_name);
 
-            // H-016: rate limiting (re-keyed on verified identity per P1 fix).
+            // 4. RATE LIMIT CHECK.
             if !ctx.rate_limiter.check(msg.verified_sender_name.as_deref()) {
                 audit_secret_access("list", msg.sender, profile, None, "rate-limited");
-                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![] }, ctx.daemon_id).await;
+                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![], denial: Some(SecretDenialReason::RateLimited) }, ctx.daemon_id).await;
             }
 
-            // H-020: ACL check -- deny list if daemon has explicit empty ACL (NIST AC-3, AC-6).
+            // 5. ACL CHECK (deny list if daemon has explicit empty ACL).
             if !check_secret_list_access(ctx.config, profile, requester_name) {
                 tracing::warn!(
                     audit = "access-denied",
@@ -722,37 +822,38 @@ async fn handle_message(
                     "secret list denied by per-profile ACL"
                 );
                 audit_secret_access("list", msg.sender, profile, None, "denied-acl");
-                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![] }, ctx.daemon_id).await;
+                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![], denial: Some(SecretDenialReason::AccessDenied) }, ctx.daemon_id).await;
             }
 
-            let Some(state) = ctx.unlocked_state.as_mut() else {
-                audit_secret_access("list", msg.sender, profile, None, "denied-locked");
-                return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![] }, ctx.daemon_id).await;
-            };
-            let keys = match state.vault_for(profile) {
-                Ok(vault) => vault.store().list_keys().await.unwrap_or_default(),
+            // 6. VAULT ACCESS.
+            let (keys, denial) = match state.vault_for(profile) {
+                Ok(vault) => (vault.store().list_keys().await.unwrap_or_default(), None),
                 Err(e) => {
                     tracing::error!(profile = %profile, error = %e, "vault access failed");
-                    vec![]
+                    (vec![], Some(SecretDenialReason::VaultError(e.to_string())))
                 }
             };
-            let outcome = if keys.is_empty() { "empty" } else { "success" };
+            let outcome = if denial.is_some() { "failed" } else if keys.is_empty() { "empty" } else { "success" };
             audit_secret_access("list", msg.sender, profile, None, outcome);
-            Some(EventKind::SecretListResponse { keys })
+            Some(EventKind::SecretListResponse { keys, denial })
         }
 
-        // -- Profile Activate (open vault, register for concurrent access) --
+        // -- Profile Activate (authorize + open vault) --
         EventKind::ProfileActivate { profile_name, .. } => {
             let Some(state) = ctx.unlocked_state.as_mut() else {
                 tracing::warn!(profile = %profile_name, "profile activate while locked");
                 return send_response(ctx.client, msg, EventKind::ProfileActivateResponse { success: false }, ctx.daemon_id).await;
             };
+            // Authorize first, then open vault (vault_for gates on active_profiles).
+            state.activate_profile(profile_name);
             let success = match state.vault_for(profile_name) {
                 Ok(_) => {
                     tracing::info!(profile = %profile_name, "profile activated");
                     true
                 }
                 Err(e) => {
+                    // Vault open failed — revoke authorization.
+                    state.active_profiles.remove(profile_name);
                     tracing::error!(profile = %profile_name, error = %e, "profile activation failed");
                     false
                 }
@@ -760,20 +861,27 @@ async fn handle_message(
             Some(EventKind::ProfileActivateResponse { success })
         }
 
-        // -- Profile Deactivate (flush JIT, close vault) --
+        // -- Profile Deactivate (deauthorize, flush JIT, close vault) --
         EventKind::ProfileDeactivate { profile_name, .. } => {
             let Some(state) = ctx.unlocked_state.as_mut() else {
                 tracing::warn!(profile = %profile_name, "profile deactivate while locked");
                 return send_response(ctx.client, msg, EventKind::ProfileDeactivateResponse { success: false }, ctx.daemon_id).await;
             };
-            let success = match state.deactivate_profile(profile_name).await {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::error!(profile = %profile_name, error = %e, "profile deactivation failed");
-                    false
-                }
-            };
-            Some(EventKind::ProfileDeactivateResponse { success })
+            // Idempotent: deactivating an already-inactive profile succeeds.
+            state.deactivate_profile(profile_name).await;
+            Some(EventKind::ProfileDeactivateResponse { success: true })
+        }
+
+        // -- State reconciliation: daemon-profile queries authoritative state --
+        EventKind::SecretsStateRequest => {
+            let locked = ctx.unlocked_state.is_none();
+            let active_profiles = ctx.unlocked_state
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.active_profiles());
+            Some(EventKind::SecretsStateResponse {
+                locked,
+                active_profiles,
+            })
         }
 
         // -- Ignore other events --
@@ -781,20 +889,26 @@ async fn handle_message(
     };
 
     if let Some(event) = response_event {
-        // Broadcast lock state changes so daemon-profile can track them.
-        // The correlated response goes unicast to the CLI; daemon-profile
-        // (in-process subscriber) only sees broadcasts.
+        // Broadcast lock state changes BEFORE the correlated unicast response (P1-005 fix).
+        // This ensures daemon-profile sees the state change even if a crash occurs
+        // between the broadcast and the CLI response.
         let broadcast = match &event {
             EventKind::UnlockResponse { success } => Some(EventKind::UnlockResponse { success: *success }),
             EventKind::LockResponse { success } => Some(EventKind::LockResponse { success: *success }),
             _ => None,
         };
 
-        send_response(ctx.client, msg, event, ctx.daemon_id).await?;
-
-        if let Some(notify) = broadcast {
-            ctx.client.publish(notify, SecurityLevel::Internal).await.ok();
+        if let Some(notify) = broadcast
+            && let Err(e) = ctx.client.publish(notify, SecurityLevel::Internal).await
+        {
+            tracing::error!(
+                audit = "security",
+                error = %e,
+                "lock/unlock broadcast failed — daemon-profile may have stale state"
+            );
         }
+
+        send_response(ctx.client, msg, event, ctx.daemon_id).await?;
     }
 
     Ok(true)
@@ -847,6 +961,7 @@ async fn unlock(
             return Ok(UnlockedState {
                 master_key,
                 vaults: HashMap::new(),
+                active_profiles: HashSet::new(),
                 ttl: Duration::from_secs(ttl),
                 config_dir: config_dir.to_path_buf(),
             });
@@ -872,6 +987,7 @@ async fn unlock(
     Ok(UnlockedState {
         master_key,
         vaults: HashMap::new(),
+        active_profiles: HashSet::new(),
         ttl: Duration::from_secs(ttl),
         config_dir: config_dir.to_path_buf(),
     })
@@ -1165,6 +1281,165 @@ async fn keyring_delete() {
     {
         Ok(()) => tracing::info!("wrapped master key deleted from platform keyring"),
         Err(e) => tracing::debug!(error = %e, "keyring: delete failed (may not exist)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_crypto::SecureBytes;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+
+    /// Create a test master key (deterministic, not for production use).
+    fn test_master_key() -> SecureBytes {
+        let mut key = vec![0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(7);
+        }
+        SecureBytes::new(key)
+    }
+
+    /// Create an UnlockedState with a real temp directory for vault storage.
+    fn make_unlocked_state(config_dir: &std::path::Path) -> UnlockedState {
+        UnlockedState {
+            master_key: test_master_key(),
+            vaults: HashMap::new(),
+            active_profiles: HashSet::new(),
+            ttl: Duration::from_secs(60),
+            config_dir: config_dir.to_path_buf(),
+        }
+    }
+
+    fn profile(name: &str) -> TrustProfileName {
+        TrustProfileName::try_from(name).expect("valid profile name")
+    }
+
+    // A-001: vault_for() returns error if profile not in active_profiles
+    #[test]
+    fn test_vault_for_rejects_inactive_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_unlocked_state(dir.path());
+        let p = profile("work");
+        let result = state.vault_for(&p);
+        assert!(result.is_err(), "vault_for must reject inactive profile");
+        let err = result.err().expect("expected error").to_string();
+        assert!(
+            err.contains("not active"),
+            "error must mention 'not active', got: {err}"
+        );
+    }
+
+    // A-001 + vault lazy open: activate then vault_for succeeds
+    #[tokio::test]
+    async fn test_activate_then_vault_for_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_unlocked_state(dir.path());
+        let p = profile("work");
+        state.activate_profile(&p);
+        let result = state.vault_for(&p);
+        assert!(result.is_ok(), "vault_for must succeed after activation: {:?}", result.err());
+    }
+
+    // Deactivate then vault_for rejects
+    #[tokio::test]
+    async fn test_deactivate_then_vault_for_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_unlocked_state(dir.path());
+        let p = profile("work");
+        state.activate_profile(&p);
+        let _ = state.vault_for(&p); // open vault
+        state.deactivate_profile(&p).await;
+        let result = state.vault_for(&p);
+        assert!(result.is_err(), "vault_for must reject after deactivation");
+    }
+
+    // A-019: deactivate on already-inactive profile is idempotent (no panic, no error)
+    #[tokio::test]
+    async fn test_deactivate_inactive_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_unlocked_state(dir.path());
+        let p = profile("never-activated");
+        // Must not panic or error
+        state.deactivate_profile(&p).await;
+    }
+
+    // Full round-trip: activate -> deactivate -> activate -> vault_for succeeds
+    #[tokio::test]
+    async fn test_activate_deactivate_reactivate_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_unlocked_state(dir.path());
+        let p = profile("work");
+
+        state.activate_profile(&p);
+        assert!(state.vault_for(&p).is_ok());
+
+        state.deactivate_profile(&p).await;
+        assert!(state.vault_for(&p).is_err());
+
+        state.activate_profile(&p);
+        assert!(state.vault_for(&p).is_ok(), "vault_for must succeed after reactivation");
+    }
+
+    // A-018: active_profiles() returns the authorization set, not vault keys
+    #[tokio::test]
+    async fn test_active_profiles_returns_authorization_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_unlocked_state(dir.path());
+        let p1 = profile("alpha");
+        let p2 = profile("beta");
+
+        state.activate_profile(&p1);
+        state.activate_profile(&p2);
+
+        let active: HashSet<TrustProfileName> = state.active_profiles().into_iter().collect();
+        assert!(active.contains(&p1));
+        assert!(active.contains(&p2));
+        assert_eq!(active.len(), 2);
+
+        // Deactivate one — only one remains
+        state.deactivate_profile(&p1).await;
+        let active: HashSet<TrustProfileName> = state.active_profiles().into_iter().collect();
+        assert!(!active.contains(&p1));
+        assert!(active.contains(&p2));
+        assert_eq!(active.len(), 1);
+
+        // Verify it returns authorization set not vault keys:
+        // Activate p1 again but do NOT call vault_for (no vault opened).
+        // active_profiles must still include p1 even though no vault is open.
+        state.activate_profile(&p1);
+        let active: HashSet<TrustProfileName> = state.active_profiles().into_iter().collect();
+        assert!(active.contains(&p1), "active_profiles must include authorized profile even without open vault");
+        // But vaults map should NOT contain p1 (we didn't call vault_for)
+        assert!(!state.vaults.contains_key(&p1), "vaults map must not contain profile that was only authorized, not opened");
+    }
+
+    // A-006: lock clears active_profiles
+    #[tokio::test]
+    async fn test_lock_clears_active_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_unlocked_state(dir.path());
+        let p1 = profile("alpha");
+        let p2 = profile("beta");
+
+        state.activate_profile(&p1);
+        state.activate_profile(&p2);
+        assert_eq!(state.active_profiles().len(), 2);
+
+        // Simulate lock: clear active profiles (as the lock handler does)
+        state.active_profiles.clear();
+        assert!(state.active_profiles().is_empty(), "active_profiles must be empty after lock");
+    }
+
+    // Unlock initializes empty active_profiles
+    #[test]
+    fn test_unlock_initializes_empty_active_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_unlocked_state(dir.path());
+        assert!(
+            state.active_profiles().is_empty(),
+            "fresh UnlockedState must have empty active_profiles"
+        );
     }
 }
 

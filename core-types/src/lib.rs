@@ -254,6 +254,28 @@ impl Timestamp {
 }
 
 // ============================================================================
+// Security Protocol Types
+// ============================================================================
+
+/// Why an unlock request was rejected (SEC-007 fix).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnlockRejectedReason {
+    /// System is already unlocked. Distinct from wrong password.
+    AlreadyUnlocked,
+}
+
+/// Why a secret operation was denied (typed denial, replaces ambiguous empty responses).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecretDenialReason {
+    Locked,
+    ProfileNotActive,
+    AccessDenied,
+    RateLimited,
+    NotFound,
+    VaultError(String),
+}
+
+// ============================================================================
 // EventKind
 // ============================================================================
 
@@ -412,6 +434,9 @@ pub enum EventKind {
         /// (default). With `ipc-field-encryption` feature on daemon-secrets,
         /// this is additionally AES-256-GCM encrypted per-field.
         value: SensitiveBytes,
+        /// Typed denial reason (Step 2.9). `None` = success, `Some` = denied.
+        #[serde(default)]
+        denial: Option<SecretDenialReason>,
     },
     SecretSet {
         profile: TrustProfileName,
@@ -423,6 +448,9 @@ pub enum EventKind {
     },
     SecretSetResponse {
         success: bool,
+        /// Typed denial reason (Step 2.9). `None` = success, `Some` = denied.
+        #[serde(default)]
+        denial: Option<SecretDenialReason>,
     },
     SecretDelete {
         profile: TrustProfileName,
@@ -430,12 +458,18 @@ pub enum EventKind {
     },
     SecretDeleteResponse {
         success: bool,
+        /// Typed denial reason (Step 2.9). `None` = success, `Some` = denied.
+        #[serde(default)]
+        denial: Option<SecretDenialReason>,
     },
     SecretList {
         profile: TrustProfileName,
     },
     SecretListResponse {
         keys: Vec<String>,
+        /// Typed denial reason (Step 2.9). `None` = success, `Some` = denied.
+        #[serde(default)]
+        denial: Option<SecretDenialReason>,
     },
 
     // -- RPC: Profile Activation --
@@ -481,9 +515,24 @@ pub enum EventKind {
     UnlockResponse {
         success: bool,
     },
+    /// Typed rejection for unlock when preconditions are not met (SEC-007 fix).
+    /// Distinct from `UnlockResponse` { success: false } to avoid ambiguity
+    /// between "wrong password" and "already unlocked".
+    UnlockRejected {
+        reason: UnlockRejectedReason,
+    },
     LockRequest,
     LockResponse {
         success: bool,
+    },
+
+    // -- RPC: State Reconciliation --
+    /// daemon-profile queries daemon-secrets for authoritative state.
+    SecretsStateRequest,
+    /// daemon-secrets returns authoritative lock + active profiles.
+    SecretsStateResponse {
+        locked: bool,
+        active_profiles: Vec<TrustProfileName>,
     },
 
     // -- RPC: Window Manager --
@@ -649,7 +698,7 @@ macro_rules! impl_event_debug {
 
 impl_event_debug! {
     sensitive {
-        SecretGetResponse { key, value => REDACTED },
+        SecretGetResponse { key, value => REDACTED, denial },
         SecretSet { profile, key, value => REDACTED },
         UnlockRequest { password => REDACTED },
     }
@@ -683,11 +732,11 @@ impl_event_debug! {
         ConfigReloaded { daemon_id, changed_keys },
         PolicyApplied { source, locked_keys },
         SecretGet { profile, key },
-        SecretSetResponse { success },
+        SecretSetResponse { success, denial },
         SecretDelete { profile, key },
-        SecretDeleteResponse { success },
+        SecretDeleteResponse { success, denial },
         SecretList { profile },
-        SecretListResponse { keys },
+        SecretListResponse { keys, denial },
         ProfileActivate { target, profile_name },
         ProfileActivateResponse { success },
         ProfileDeactivate { target, profile_name },
@@ -699,8 +748,11 @@ impl_event_debug! {
         StatusRequest,
         StatusResponse { active_profiles, default_profile, daemon_uptimes_ms, locked },
         UnlockResponse { success },
+        UnlockRejected { reason },
         LockRequest,
         LockResponse { success },
+        SecretsStateRequest,
+        SecretsStateResponse { locked, active_profiles },
         WmListWindows,
         WmListWindowsResponse { windows },
         WmActivateWindow { window_id },
@@ -1312,7 +1364,7 @@ mod tests {
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("hunter2"));
 
-        let get_resp = EventKind::SecretGetResponse { key: "api-key".into(), value: SensitiveBytes::new(b"secret123".to_vec()) };
+        let get_resp = EventKind::SecretGetResponse { key: "api-key".into(), value: SensitiveBytes::new(b"secret123".to_vec()), denial: None };
         let debug = format!("{get_resp:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("secret123"));

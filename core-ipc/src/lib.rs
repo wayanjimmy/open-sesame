@@ -19,5 +19,5 @@ pub use framing::{encode_frame, decode_frame};
 pub use noise::{NoiseTransport, ZeroizingKeypair, generate_keypair};
 pub use registry::ClearanceRegistry;
 pub use transport::{PeerCredentials, extract_ucred, local_credentials, socket_path};
-pub use server::{BusServer, SubscriptionFilter};
+pub use server::{BusServer, ConfirmationGuard, SubscriptionFilter};
 pub use client::BusClient;

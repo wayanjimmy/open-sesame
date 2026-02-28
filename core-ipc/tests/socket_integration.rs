@@ -176,6 +176,7 @@ async fn request_response_correlation() {
         did(2),
         EventKind::SecretListResponse {
             keys: vec!["api-key".into(), "db-pass".into()],
+            denial: None,
         },
         SecurityLevel::Internal,
         client_b.epoch(),
@@ -186,7 +187,7 @@ async fn request_response_correlation() {
 
     let result = response_handle.await.unwrap().unwrap();
     match result.payload {
-        EventKind::SecretListResponse { keys } => {
+        EventKind::SecretListResponse { keys, .. } => {
             assert_eq!(keys, vec!["api-key".to_string(), "db-pass".to_string()]);
         }
         other => panic!("expected SecretListResponse, got {other:?}"),
@@ -343,6 +344,7 @@ async fn secret_response_not_received_by_bystander() {
         did(3),
         EventKind::SecretListResponse {
             keys: vec!["api-key".into()],
+            denial: None,
         },
         SecurityLevel::Internal,
         secrets_daemon.epoch(),
@@ -381,6 +383,7 @@ async fn uncorrelated_response_is_dropped() {
         did(1),
         EventKind::SecretListResponse {
             keys: vec!["should-not-broadcast".into()],
+            denial: None,
         },
         SecurityLevel::Internal,
         client_a.epoch(),

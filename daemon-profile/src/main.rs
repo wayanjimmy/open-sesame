@@ -192,6 +192,10 @@ async fn main() -> anyhow::Result<()> {
     // -- Lock state: tracks daemon-secrets lock/unlock (S-4) --
     let mut locked = true;
 
+    // -- Confirmed RPC channel (D-002) --
+    // Used by activation/deactivation/reconciliation to wait for daemon-secrets responses.
+    let (confirm_tx, mut confirm_rx) = mpsc::channel::<Vec<u8>>(16);
+
     // -- Register daemon-profile as an in-process bus subscriber --
     // This lets daemon-profile receive and process messages (StatusRequest,
     // ProfileActivate, ProfileList, etc.) that clients send to the bus.
@@ -273,6 +277,9 @@ async fn main() -> anyhow::Result<()> {
     // -- Watchdog timer: half the WatchdogSec=30 interval --
     let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(15));
 
+    // -- Reconciliation counter: reconcile every other watchdog tick (30s) --
+    let mut watchdog_tick_count: u64 = 0;
+
     // -- Key rotation timer (H-018, NIST IA-5(1), SC-12) --
     let mut rotation_timer = tokio::time::interval(KEY_ROTATION_INTERVAL);
     rotation_timer.tick().await; // Consume the first immediate tick.
@@ -290,6 +297,19 @@ async fn main() -> anyhow::Result<()> {
             _ = watchdog.tick() => {
                 #[cfg(target_os = "linux")]
                 platform_linux::systemd::notify_watchdog();
+
+                // D-006: Reconcile with daemon-secrets every 30s (every other tick).
+                watchdog_tick_count += 1;
+                if watchdog_tick_count.is_multiple_of(2) {
+                    reconcile_secrets_state(
+                        &bus,
+                        daemon_id,
+                        &mut locked,
+                        &mut active_profiles,
+                        &confirm_tx,
+                        &mut confirm_rx,
+                    ).await;
+                }
             }
             _ = rotation_timer.tick() => {
                 // Phase 1: generate keypairs, write to disk, announce pending.
@@ -345,6 +365,8 @@ async fn main() -> anyhow::Result<()> {
                     &bus,
                     &mut daemon_tracker,
                     &mut locked,
+                    &confirm_tx,
+                    &mut confirm_rx,
                 ).await {
                     let reply = Message::new(
                         daemon_id,
@@ -460,6 +482,8 @@ async fn handle_bus_message<W: std::io::Write>(
     bus: &BusServer,
     daemon_tracker: &mut DaemonTracker,
     locked: &mut bool,
+    confirm_tx: &mpsc::Sender<Vec<u8>>,
+    confirm_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Option<EventKind> {
     match &msg.payload {
         // H-019: Track daemon start/restart for key revocation.
@@ -478,6 +502,17 @@ async fn handle_bus_message<W: std::io::Write>(
                     new_id = %announced_id,
                     "daemon restart detected — revoking old key and generating new keypair"
                 );
+
+                // SEC-006 fix: daemon-secrets restarts locked with no active profiles.
+                if name == "daemon-secrets" {
+                    *locked = true;
+                    active_profiles.clear();
+                    tracing::warn!(
+                        audit = "security",
+                        event_type = "daemon-secrets-restart",
+                        "daemon-secrets restarted — resetting lock state and clearing active profiles"
+                    );
+                }
 
                 // Find the KNOWN_DAEMONS entry for this name.
                 if let Some(&(daemon_name, security_level)) = KNOWN_DAEMONS.iter()
@@ -573,7 +608,7 @@ async fn handle_bus_message<W: std::io::Write>(
         }
 
         EventKind::ProfileActivate { profile_name, target } => {
-            match activation::activate(*target, profile_name, bus, audit, daemon_id).await {
+            match activation::activate(*target, profile_name, bus, audit, daemon_id, confirm_tx, confirm_rx).await {
                 Ok(duration_ms) => {
                     active_profiles.insert(profile_name.clone());  // TrustProfileName: Clone
                     tracing::info!(
@@ -600,7 +635,7 @@ async fn handle_bus_message<W: std::io::Write>(
                 return Some(EventKind::ProfileDeactivateResponse { success: false });
             }
 
-            match activation::deactivate(*target, profile_name, bus, audit, daemon_id).await {
+            match activation::deactivate(*target, profile_name, bus, audit, daemon_id, confirm_tx, confirm_rx).await {
                 Ok(duration_ms) => {
                     active_profiles.remove(profile_name);
                     tracing::info!(
@@ -614,8 +649,16 @@ async fn handle_bus_message<W: std::io::Write>(
                     tracing::error!(
                         profile = %profile_name,
                         error = %e,
-                        "profile deactivation failed"
+                        "profile deactivation failed — triggering immediate reconciliation"
                     );
+                    reconcile_secrets_state(
+                        bus,
+                        daemon_id,
+                        locked,
+                        active_profiles,
+                        confirm_tx,
+                        confirm_rx,
+                    ).await;
                     Some(EventKind::ProfileDeactivateResponse { success: false })
                 }
             }
@@ -634,17 +677,125 @@ async fn handle_bus_message<W: std::io::Write>(
 
         EventKind::UnlockResponse { success: true } => {
             *locked = false;
-            tracing::info!("secrets daemon unlocked, lock state updated");
+            active_profiles.clear(); // Spec Section 3.5 step 3b: fresh unlock = no profiles active.
+            tracing::info!("secrets daemon unlocked, lock state updated, active profiles cleared");
             None
         }
 
         EventKind::LockResponse { success: true } => {
             *locked = true;
-            tracing::info!("secrets daemon locked, lock state updated");
+            active_profiles.clear();
+            tracing::info!(audit = "security", "secrets locked, active profiles cleared");
             None
         }
 
         _ => None,
+    }
+}
+
+/// Reconcile daemon-profile's view of lock/active-profiles with daemon-secrets (D-006).
+///
+/// Sends `SecretsStateRequest` via confirmed RPC and overwrites local state with
+/// the authoritative response. On timeout, fails closed: assume locked, empty active set.
+async fn reconcile_secrets_state(
+    bus: &BusServer,
+    daemon_id: DaemonId,
+    locked: &mut bool,
+    active_profiles: &mut HashSet<TrustProfileName>,
+    confirm_tx: &mpsc::Sender<Vec<u8>>,
+    confirm_rx: &mut mpsc::Receiver<Vec<u8>>,
+) {
+    let msg = Message::new(
+        daemon_id,
+        EventKind::SecretsStateRequest,
+        SecurityLevel::Internal,
+        bus.epoch(),
+    );
+    let msg_id = msg.msg_id;
+
+    let _guard = bus.register_confirmation(msg_id, confirm_tx.clone()).await;
+
+    // Drain stale messages from confirm_rx to prevent consuming a leftover
+    // response from a previous timed-out confirmed RPC (P0-002 fix).
+    while confirm_rx.try_recv().is_ok() {}
+
+    let frame = match core_ipc::encode_frame(&msg) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, "reconciliation: failed to encode SecretsStateRequest");
+            return;
+        }
+    };
+
+    if let Err(e) = bus.send_to_named("daemon-secrets", &frame).await {
+        // daemon-secrets not connected — fail closed.
+        tracing::debug!(error = %e, "reconciliation: daemon-secrets not reachable, assuming locked");
+        *locked = true;
+        active_profiles.clear();
+        return;
+    }
+
+    const RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    match tokio::time::timeout(RECONCILE_TIMEOUT, confirm_rx.recv()).await {
+        Ok(Some(raw_frame)) => {
+            match core_ipc::decode_frame::<Message<EventKind>>(&raw_frame) {
+                Ok(response) => {
+                    // Verify correlation_id matches our request (defense-in-depth).
+                    if response.correlation_id != Some(msg_id) {
+                        tracing::warn!(
+                            expected = %msg_id,
+                            got = ?response.correlation_id,
+                            "reconciliation: correlation_id mismatch, ignoring stale response"
+                        );
+                        return;
+                    }
+                    if let EventKind::SecretsStateResponse {
+                        locked: auth_locked,
+                        active_profiles: auth_profiles,
+                    } = response.payload
+                    {
+                        // Log discrepancies before overwriting.
+                        if *locked != auth_locked {
+                            tracing::warn!(
+                                local_locked = *locked,
+                                authoritative_locked = auth_locked,
+                                "reconciliation: lock state discrepancy corrected"
+                            );
+                        }
+                        let local_set: HashSet<_> = active_profiles.iter().cloned().collect();
+                        let auth_set: HashSet<_> = auth_profiles.iter().cloned().collect();
+                        if local_set != auth_set {
+                            tracing::warn!(
+                                local_profiles = ?local_set,
+                                authoritative_profiles = ?auth_set,
+                                "reconciliation: active profiles discrepancy corrected"
+                            );
+                        }
+
+                        // Overwrite with authoritative state.
+                        *locked = auth_locked;
+                        *active_profiles = auth_set;
+                    } else {
+                        tracing::warn!(
+                            payload = ?response.payload,
+                            "reconciliation: unexpected response type"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "reconciliation: failed to decode response");
+                }
+            }
+        }
+        Ok(None) => {
+            tracing::error!("reconciliation: confirmation channel closed");
+        }
+        Err(_) => {
+            // Timeout — fail closed.
+            tracing::warn!("reconciliation: SecretsStateRequest timed out — assuming locked");
+            *locked = true;
+            active_profiles.clear();
+        }
     }
 }
 

@@ -55,6 +55,41 @@ struct ServerState {
     /// Maps public keys to daemon identities and security clearance levels.
     /// `RwLock` allows key rotation (H-018) and revocation (H-019) at runtime.
     registry: RwLock<ClearanceRegistry>,
+    /// Confirmed RPC routing: maps `correlation_id` -> channel for host-side waiters (D-002).
+    /// When a correlated response matches a registered confirmation, the raw frame is
+    /// sent to the confirmation channel instead of the normal host delivery path.
+    confirmations: RwLock<HashMap<Uuid, mpsc::Sender<Vec<u8>>>>,
+    /// Maps verified daemon name -> connection ID for O(1) unicast (D-006).
+    /// Populated when `route_frame()` processes `DaemonStarted` with a `verified_sender_name`.
+    /// Invalidated on connection disconnect.
+    name_to_conn: RwLock<HashMap<String, u64>>,
+}
+
+/// RAII guard that deregisters a confirmation route on drop.
+///
+/// Returned by [`BusServer::register_confirmation()`]. When dropped (including
+/// on panic/early return), removes the confirmation entry from the routing table.
+/// This prevents stale entries from accumulating if the caller times out or errors.
+pub struct ConfirmationGuard {
+    correlation_id: Uuid,
+    state: Arc<ServerState>,
+}
+
+impl Drop for ConfirmationGuard {
+    fn drop(&mut self) {
+        // Use try_write to avoid blocking in Drop. If the lock is held,
+        // the entry will be cleaned up by the next write operation.
+        if let Ok(mut confirmations) = self.state.confirmations.try_write() {
+            confirmations.remove(&self.correlation_id);
+        } else {
+            // Spawn a task to clean up asynchronously if we can't get the lock.
+            let id = self.correlation_id;
+            let state = Arc::clone(&self.state);
+            tokio::spawn(async move {
+                state.confirmations.write().await.remove(&id);
+            });
+        }
+    }
 }
 
 /// The IPC bus server.
@@ -84,6 +119,8 @@ impl BusServer {
                 next_conn_id: AtomicU64::new(1),
                 epoch: Instant::now(),
                 registry: RwLock::new(ClearanceRegistry::new()),
+                confirmations: RwLock::new(HashMap::new()),
+                name_to_conn: RwLock::new(HashMap::new()),
             }),
             keypair: None,
         }
@@ -165,6 +202,8 @@ impl BusServer {
                 next_conn_id: AtomicU64::new(1),
                 epoch: Instant::now(),
                 registry: RwLock::new(registry),
+                confirmations: RwLock::new(HashMap::new()),
+                name_to_conn: RwLock::new(HashMap::new()),
             }),
             keypair: Some(Arc::new(keypair)),
         })
@@ -337,6 +376,50 @@ impl BusServer {
     pub async fn take_pending_request(&self, correlation_id: &uuid::Uuid) -> Option<u64> {
         self.state.pending_requests.write().await.remove(correlation_id)
     }
+
+    /// Register a confirmation route for confirmed RPC (D-002).
+    ///
+    /// When a response with matching `correlation_id` arrives at `route_frame()`,
+    /// the raw frame is sent to `confirm_tx` instead of the normal host delivery path.
+    /// Returns a [`ConfirmationGuard`] that deregisters the route on drop (RAII cleanup).
+    pub async fn register_confirmation(
+        &self,
+        correlation_id: Uuid,
+        confirm_tx: mpsc::Sender<Vec<u8>>,
+    ) -> ConfirmationGuard {
+        self.state.confirmations.write().await.insert(correlation_id, confirm_tx);
+        ConfirmationGuard {
+            correlation_id,
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Send a frame to a named daemon via O(1) lookup (D-006).
+    ///
+    /// Resolves `daemon_name` to a connection ID via `name_to_conn`, then delegates
+    /// to `send_to()`. Returns `Ok(())` on success, `Err` if the daemon is not
+    /// connected or the channel is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the daemon is not in `name_to_conn` (not connected)
+    /// or if the connection's outbound channel is full/closed.
+    pub async fn send_to_named(&self, daemon_name: &str, frame: &[u8]) -> Result<(), String> {
+        let conn_id = {
+            let map = self.state.name_to_conn.read().await;
+            map.get(daemon_name).copied()
+        };
+        match conn_id {
+            Some(id) => {
+                if self.send_to(id, frame).await {
+                    Ok(())
+                } else {
+                    Err(format!("send_to_named({daemon_name}): connection gone or channel full"))
+                }
+            }
+            None => Err(format!("send_to_named({daemon_name}): daemon not connected")),
+        }
+    }
 }
 
 impl Default for BusServer {
@@ -508,6 +591,8 @@ async fn handle_connection(
 
     state.connections.write().await.remove(&conn_id);
     state.pending_requests.write().await.retain(|_, cid| *cid != conn_id);
+    // D-006: Clean up name_to_conn on disconnect.
+    state.name_to_conn.write().await.retain(|_, cid| *cid != conn_id);
     let session_ms = connected_at.elapsed().as_millis();
     tracing::debug!(
         audit = "connection-lifecycle",
@@ -629,6 +714,43 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
         }
     }
 
+    // D-006: Populate name_to_conn on DaemonStarted for O(1) unicast lookup.
+    // Reject duplicate registrations: if a daemon name is already mapped to a
+    // LIVE connection, log a security audit and keep the existing mapping.
+    // This prevents name squatting via compromised Noise IK keys (P1-004).
+    if let EventKind::DaemonStarted { .. } = &msg.payload
+        && let Some(ref name) = verified_name
+    {
+        let existing = state.name_to_conn.read().await.get(name).copied();
+        if let Some(existing_conn_id) = existing {
+            let still_alive = state.connections.read().await.contains_key(&existing_conn_id);
+            if still_alive && existing_conn_id != sender_conn_id {
+                tracing::warn!(
+                    audit = "security",
+                    event_type = "duplicate-name-registration",
+                    daemon_name = %name,
+                    existing_conn_id = existing_conn_id,
+                    new_conn_id = sender_conn_id,
+                    "rejecting duplicate name_to_conn registration — existing connection still alive"
+                );
+            } else {
+                state.name_to_conn.write().await.insert(name.clone(), sender_conn_id);
+                tracing::debug!(
+                    daemon_name = %name,
+                    conn_id = sender_conn_id,
+                    "name_to_conn mapping updated (previous connection gone)"
+                );
+            }
+        } else {
+            state.name_to_conn.write().await.insert(name.clone(), sender_conn_id);
+            tracing::debug!(
+                daemon_name = %name,
+                conn_id = sender_conn_id,
+                "name_to_conn mapping registered"
+            );
+        }
+    }
+
     // R-008: Stamp server-verified sender identity onto the message.
     // This prevents daemons from self-declaring any name via capabilities.
     // Re-encode after stamping so downstream receivers get the verified name.
@@ -644,6 +766,19 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
     };
 
     if let Some(corr_id) = msg.correlation_id {
+        // D-002: Check confirmed RPC routing table FIRST.
+        // If the host registered a confirmation for this correlation_id,
+        // deliver to the confirmation channel instead of normal routing.
+        let confirm_tx = state.confirmations.read().await.get(&corr_id).cloned();
+        if let Some(ref tx) = confirm_tx {
+            let _ = tx.try_send(stamped_payload.clone()).inspect_err(|_| {
+                tracing::warn!(
+                    correlation_id = %corr_id,
+                    "confirmed RPC response dropped: confirmation channel full"
+                );
+            });
+        }
+
         // This is a response — route to the originating connection.
         let target_conn = state.pending_requests.write().await.remove(&corr_id);
         if let Some(target_id) = target_conn {
@@ -657,7 +792,7 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
                     "response dropped: channel full"
                 );
             }
-        } else {
+        } else if confirm_tx.is_none() {
             tracing::debug!(
                 correlation_id = %corr_id,
                 "response for unknown request, dropping"
