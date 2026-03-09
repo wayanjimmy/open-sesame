@@ -1143,6 +1143,7 @@ async fn cmd_wm_overlay(launcher: bool, backward: bool) -> anyhow::Result<()> {
     };
     client.publish(event, SecurityLevel::Internal).await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    client.shutdown().await;
     Ok(())
 }
 

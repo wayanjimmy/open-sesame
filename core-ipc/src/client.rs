@@ -29,6 +29,9 @@ pub struct BusClient {
     /// Pending request-response waiters, keyed by `msg_id`.
     pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<Message<EventKind>>>>>,
     epoch: Instant,
+    /// Handle to the multiplexed I/O task (encrypted transport).
+    /// `None` for in-process test clients created via `new()`.
+    io_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BusClient {
@@ -46,6 +49,7 @@ impl BusClient {
             inbound_rx,
             pending: Arc::new(Mutex::new(HashMap::new())),
             epoch: Instant::now(),
+            io_handle: None,
         }
     }
 
@@ -101,7 +105,7 @@ impl BusClient {
         // to multiplex avoids the deadlock where a reader holding a Mutex
         // starves the writer.
         let pending_clone = Arc::clone(&pending);
-        tokio::spawn(async move {
+        let io_handle = tokio::spawn(async move {
             let mut transport = transport;
             let mut reader = reader;
             let mut writer = writer;
@@ -136,6 +140,7 @@ impl BusClient {
             inbound_rx,
             pending,
             epoch: Instant::now(),
+            io_handle: Some(io_handle),
         })
     }
 
@@ -241,6 +246,21 @@ impl BusClient {
     /// `InstallationId` in their `origin_installation` field.
     pub fn set_installation(&mut self, installation: core_types::InstallationId) {
         self.msg_ctx.installation = Some(installation);
+    }
+
+    /// Gracefully shut down the client, flushing all pending outbound frames.
+    ///
+    /// Drops the outbound channel (signalling end-of-stream to the I/O task),
+    /// then awaits the I/O task to ensure all queued frames are written to
+    /// the socket before the connection closes.
+    pub async fn shutdown(self) {
+        // Drop the sender half — the I/O task's `outbound_rx.recv()` will
+        // return `None`, causing it to break out of its loop after flushing
+        // any in-flight write.
+        drop(self.outbound_tx);
+        if let Some(handle) = self.io_handle {
+            let _ = handle.await;
+        }
     }
 
     /// Connect to the IPC bus with keypair re-read on each attempt.
