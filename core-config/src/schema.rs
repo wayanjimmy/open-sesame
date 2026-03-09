@@ -3,6 +3,7 @@
 use core_types::SecretRef;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 /// Top-level PDS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +18,12 @@ pub struct Config {
     /// Named profiles (key is profile name).
     pub profiles: BTreeMap<String, ProfileConfig>,
 
+    /// Agent identity and authorization configuration.
+    pub agents: AgentsConfig,
+
+    /// Extension policy configuration.
+    pub extensions: ExtensionsConfig,
+
     /// System policy overrides (read-only at runtime).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy: Vec<PolicyOverride>,
@@ -28,6 +35,8 @@ impl Default for Config {
             config_version: 2,
             global: GlobalConfig::default(),
             profiles: BTreeMap::new(),
+            agents: AgentsConfig::default(),
+            extensions: ExtensionsConfig::default(),
             policy: Vec::new(),
         }
     }
@@ -359,4 +368,136 @@ pub struct PolicyOverride {
     pub value: toml::Value,
     /// Source of the policy (e.g. "enterprise-mdm", "/etc/pds/policy.toml").
     pub source: String,
+}
+
+// ============================================================================
+// Agent Configuration
+// ============================================================================
+
+/// Agent identity and authorization configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Default agent configuration applied when no specific agent matches.
+    pub default: AgentConfig,
+    /// Named agent configurations keyed by agent name.
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentConfig>,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            default: AgentConfig::default(),
+            agents: BTreeMap::new(),
+        }
+    }
+}
+
+/// Configuration for a single agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// Agent type: "human", "ai", "service", "extension".
+    pub agent_type: String,
+    /// Default capabilities granted to this agent.
+    pub default_capabilities: Vec<String>,
+    /// Whether master password verification is required.
+    pub require_master_password: bool,
+    /// Unix UID constraint (process attestation).
+    pub uid: Option<u32>,
+    /// AI model family (for agent_type = "ai").
+    pub model_family: Option<String>,
+    /// Maximum delegation chain depth this agent can create.
+    pub max_delegation_depth: Option<u8>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            agent_type: "human".into(),
+            default_capabilities: vec!["admin".into()],
+            require_master_password: true,
+            uid: None,
+            model_family: None,
+            max_delegation_depth: None,
+        }
+    }
+}
+
+// ============================================================================
+// Installation Configuration
+// ============================================================================
+
+/// Installation identity stored in `installation.toml`.
+///
+/// Generated once at `sesame init` and never modified unless the user
+/// explicitly re-initializes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallationConfig {
+    /// Unique installation identifier (UUID v4).
+    pub id: Uuid,
+    /// Derived namespace for deterministic ID generation.
+    pub namespace: Uuid,
+    /// Optional organizational namespace for enterprise deployments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<OrgConfig>,
+    /// Optional machine binding for hardware attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_binding: Option<MachineBindingConfig>,
+}
+
+/// Organizational namespace configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgConfig {
+    /// Organization domain (e.g., "braincraft.io").
+    pub domain: String,
+    /// Deterministic namespace derived from domain.
+    pub namespace: Uuid,
+}
+
+/// Machine binding configuration (serialized as hex strings in TOML).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineBindingConfig {
+    /// Hex-encoded hash of machine identity material.
+    pub binding_hash: String,
+    /// Binding method: "machine-id" or "tpm-bound".
+    pub binding_type: String,
+}
+
+// ============================================================================
+// Extensions Configuration
+// ============================================================================
+
+/// Extension system configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionsConfig {
+    /// Extension security policy.
+    pub policy: ExtensionsPolicyConfig,
+}
+
+/// Security policy for extension installation and execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionsPolicyConfig {
+    /// Allowed OCI registries for extension installation.
+    pub allowed_registries: Vec<String>,
+    /// Blocked namespaces (deny list).
+    pub blocked_namespaces: Vec<String>,
+    /// Require cryptographic signature on extension manifests.
+    pub require_signature: bool,
+    /// Trusted signer public keys (hex-encoded).
+    pub trusted_signers: Vec<String>,
+}
+
+impl Default for ExtensionsPolicyConfig {
+    fn default() -> Self {
+        Self {
+            allowed_registries: Vec::new(),
+            blocked_namespaces: Vec::new(),
+            require_signature: false,
+            trusted_signers: Vec::new(),
+        }
+    }
 }

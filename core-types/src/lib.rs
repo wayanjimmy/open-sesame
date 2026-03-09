@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Deref;
 use std::time::{Duration, Instant, SystemTime};
@@ -113,6 +114,7 @@ define_id!(MonitorId, "mon");
 define_id!(ClipboardEntryId, "clip");
 define_id!(DaemonId, "dmon");
 define_id!(ExtensionId, "ext");
+define_id!(AgentId, "agent");
 
 // ============================================================================
 // AppId
@@ -208,6 +210,11 @@ pub enum SensitivityClass {
 // SecurityLevel
 // ============================================================================
 
+/// Classifies the sensitivity of message content for bus routing.
+///
+/// NOT an agent trust tier. Agent trust is evaluated via `TrustVector`.
+/// This enum determines which bus subscribers are permitted to receive a
+/// message based on their registered clearance level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
@@ -221,6 +228,636 @@ pub enum SecurityLevel {
     ProfileScoped,
     /// Events visible only to the secrets daemon.
     SecretsOnly,
+}
+
+// ============================================================================
+// Cryptographic Algorithm Configuration
+// ============================================================================
+
+/// Key derivation function algorithm for master password -> master key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum KdfAlgorithm {
+    /// Argon2id with memory-hard parameters. Leading-edge default.
+    #[default]
+    Argon2id,
+    /// PBKDF2-SHA256 with 600K iterations. NIST/FedRAMP-compatible.
+    Pbkdf2Sha256,
+}
+
+/// HKDF algorithm for master key -> vault key derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum HkdfAlgorithm {
+    /// BLAKE3 keyed derivation. Leading-edge default.
+    #[default]
+    Blake3,
+    /// HKDF-SHA256. NIST/FedRAMP-compatible.
+    HkdfSha256,
+}
+
+/// Noise protocol cipher suite selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum NoiseCipher {
+    /// ChaCha20-Poly1305. Leading-edge default.
+    #[default]
+    ChaChaPoly,
+    /// AES-256-GCM. NIST/FedRAMP-compatible.
+    AesGcm,
+}
+
+/// Noise protocol hash function selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum NoiseHash {
+    /// BLAKE2s. Leading-edge default.
+    #[default]
+    Blake2s,
+    /// SHA-256. NIST/FedRAMP-compatible.
+    Sha256,
+}
+
+/// Hash algorithm for audit log chain integrity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum AuditHash {
+    /// BLAKE3. Leading-edge default.
+    #[default]
+    Blake3,
+    /// SHA-256. NIST/FedRAMP-compatible.
+    Sha256,
+}
+
+/// Pre-defined cryptographic algorithm profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum CryptoProfile {
+    /// Modern algorithms: Argon2id, BLAKE3, ChaCha20-Poly1305, BLAKE2s.
+    #[default]
+    LeadingEdge,
+    /// NIST/FedRAMP-compatible: PBKDF2-SHA256, HKDF-SHA256, AES-GCM, SHA-256.
+    GovernanceCompatible,
+    /// Individual algorithm selection via `CryptoConfig` fields.
+    Custom,
+}
+
+/// Complete cryptographic algorithm configuration.
+///
+/// Determines which algorithms are used for key derivation, HKDF, Noise
+/// transport, and audit hashing. `CryptoProfile::LeadingEdge` is the default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CryptoConfig {
+    pub kdf: KdfAlgorithm,
+    pub hkdf: HkdfAlgorithm,
+    pub noise_cipher: NoiseCipher,
+    pub noise_hash: NoiseHash,
+    pub audit_hash: AuditHash,
+    /// Minimum crypto profile accepted from federation peers.
+    pub minimum_peer_profile: CryptoProfile,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        Self {
+            kdf: KdfAlgorithm::default(),
+            hkdf: HkdfAlgorithm::default(),
+            noise_cipher: NoiseCipher::default(),
+            noise_hash: NoiseHash::default(),
+            audit_hash: AuditHash::default(),
+            minimum_peer_profile: CryptoProfile::default(),
+        }
+    }
+}
+
+// ============================================================================
+// Installation Identity
+// ============================================================================
+
+/// Unique identity for this Open Sesame installation.
+///
+/// Installation-scoped: two installations of Open Sesame on different machines
+/// produce different `InstallationId`s, and therefore different `ProfileId`s
+/// for the same profile name. This prevents cross-installation ID collisions
+/// in federation scenarios.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallationId {
+    /// Unique installation identifier (UUID v4, generated once at `sesame init`).
+    pub id: Uuid,
+    /// Optional organizational namespace for enterprise deployments.
+    pub org_ns: Option<OrganizationNamespace>,
+    /// Derived namespace for deterministic ID generation (e.g., profile IDs).
+    /// Computed as `uuid5(org_ns.namespace || PROFILE_NS, "install:{id}")`.
+    pub namespace: Uuid,
+    /// Optional machine binding for hardware attestation.
+    pub machine_binding: Option<MachineBinding>,
+}
+
+/// Organizational namespace for enterprise-managed installations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganizationNamespace {
+    /// Organization domain (e.g., "braincraft.io").
+    pub domain: String,
+    /// Deterministic namespace derived from domain: `uuid5(NAMESPACE_URL, domain)`.
+    pub namespace: Uuid,
+}
+
+/// Cryptographic binding to a specific machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineBinding {
+    /// Hash of machine identity material (e.g., `/etc/machine-id` + installation ID).
+    pub binding_hash: [u8; 32],
+    /// Type of machine binding used.
+    pub binding_type: MachineBindingType,
+}
+
+/// How the machine identity was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineBindingType {
+    /// Derived from `/etc/machine-id` (Linux) or equivalent.
+    MachineId,
+    /// Bound to a TPM-sealed key.
+    TpmBound,
+}
+
+// ============================================================================
+// OCI Reference
+// ============================================================================
+
+/// OCI-style content-addressable reference for extensions and policies.
+///
+/// Format: `registry/principal/scope:revision[@provenance]`
+///
+/// Examples:
+/// - `registry.example.com/org/extension:1.0.0`
+/// - `registry.example.com/org/extension:1.0.0@sha256:abc123`
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OciReference {
+    pub registry: String,
+    pub principal: String,
+    pub scope: String,
+    pub revision: String,
+    pub provenance: Option<String>,
+}
+
+impl OciReference {
+    /// Parse an OCI reference string.
+    ///
+    /// Expected format: `registry/principal/scope:revision[@provenance]`
+    pub fn parse(input: &str) -> Result<Self> {
+        input.parse()
+    }
+}
+
+impl std::str::FromStr for OciReference {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if s.is_empty() {
+            return Err(Error::Validation("OCI reference must not be empty".into()));
+        }
+
+        // Split off provenance (@...)
+        let (main, provenance) = match s.rsplit_once('@') {
+            Some((m, p)) if !p.is_empty() => (m, Some(p.to_owned())),
+            Some((_, _)) => return Err(Error::Validation("OCI reference has empty provenance after '@'".into())),
+            None => (s, None),
+        };
+
+        // Split off revision (:...)
+        let (path, revision) = match main.rsplit_once(':') {
+            Some((p, r)) if !r.is_empty() => (p, r.to_owned()),
+            Some((_, _)) => return Err(Error::Validation("OCI reference has empty revision after ':'".into())),
+            None => return Err(Error::Validation("OCI reference missing ':revision'".into())),
+        };
+
+        // Split path into registry/principal/scope (at least 3 segments)
+        let segments: Vec<&str> = path.splitn(3, '/').collect();
+        if segments.len() < 3 {
+            return Err(Error::Validation(format!(
+                "OCI reference path must have at least 3 segments (registry/principal/scope), got {}",
+                segments.len()
+            )));
+        }
+
+        for (name, val) in [("registry", segments[0]), ("principal", segments[1]), ("scope", segments[2])] {
+            if val.is_empty() {
+                return Err(Error::Validation(format!("OCI reference {name} must not be empty")));
+            }
+        }
+
+        Ok(Self {
+            registry: segments[0].to_owned(),
+            principal: segments[1].to_owned(),
+            scope: segments[2].to_owned(),
+            revision,
+            provenance,
+        })
+    }
+}
+
+impl fmt::Display for OciReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}/{}:{}", self.registry, self.principal, self.scope, self.revision)?;
+        if let Some(ref prov) = self.provenance {
+            write!(f, "@{prov}")?;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Capability Lattice
+// ============================================================================
+
+/// A set of capabilities forming a lattice with union/intersection operations.
+///
+/// Capabilities are the unit of authorization. An agent's `session_scope`
+/// determines what operations it may perform. Delegation narrows scope via
+/// intersection — a delegatee can never exceed its delegator's capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CapabilitySet {
+    pub capabilities: BTreeSet<Capability>,
+}
+
+impl CapabilitySet {
+    /// The empty capability set — no permissions.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { capabilities: BTreeSet::new() }
+    }
+
+    /// A capability set containing all non-parameterized capabilities.
+    #[must_use]
+    pub fn all() -> Self {
+        Self {
+            capabilities: [
+                Capability::Admin,
+                Capability::SecretRead { key_pattern: None },
+                Capability::SecretWrite { key_pattern: None },
+                Capability::SecretDelete { key_pattern: None },
+                Capability::SecretList,
+                Capability::ProfileActivate,
+                Capability::ProfileDeactivate,
+                Capability::ProfileList,
+                Capability::ProfileSetDefault,
+                Capability::StatusRead,
+                Capability::AuditRead,
+                Capability::ConfigReload,
+                Capability::Unlock,
+                Capability::Lock,
+                Capability::ExtensionInstall,
+                Capability::ExtensionManage,
+            ].into_iter().collect(),
+        }
+    }
+
+    /// Set union: all capabilities from both sets.
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            capabilities: self.capabilities.union(&other.capabilities).cloned().collect(),
+        }
+    }
+
+    /// Set intersection: only capabilities present in both sets.
+    #[must_use]
+    pub fn intersection(&self, other: &Self) -> Self {
+        Self {
+            capabilities: self.capabilities.intersection(&other.capabilities).cloned().collect(),
+        }
+    }
+
+    /// True if every capability in `self` is also in `other`.
+    #[must_use]
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.capabilities.is_subset(&other.capabilities)
+    }
+
+    /// True if every capability in `other` is also in `self`.
+    #[must_use]
+    pub fn is_superset(&self, other: &Self) -> bool {
+        self.capabilities.is_superset(&other.capabilities)
+    }
+
+    /// True if the set has no capabilities.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.is_empty()
+    }
+}
+
+/// Individual capability for authorization decisions.
+///
+/// Capabilities are descriptive permissions, not roles. An agent may hold
+/// any combination. `Ord` is derived for `BTreeSet` membership; the ordering
+/// is arbitrary and not meaningful for authorization.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Capability {
+    /// Full administrative access.
+    Admin,
+    /// Read secrets, optionally restricted by key pattern.
+    SecretRead { key_pattern: Option<String> },
+    /// Write secrets, optionally restricted by key pattern.
+    SecretWrite { key_pattern: Option<String> },
+    /// Delete secrets, optionally restricted by key pattern.
+    SecretDelete { key_pattern: Option<String> },
+    /// List secret keys (not values).
+    SecretList,
+    /// Activate trust profiles.
+    ProfileActivate,
+    /// Deactivate trust profiles.
+    ProfileDeactivate,
+    /// List trust profiles.
+    ProfileList,
+    /// Change the default trust profile.
+    ProfileSetDefault,
+    /// Read system status.
+    StatusRead,
+    /// Read audit log.
+    AuditRead,
+    /// Trigger configuration reload.
+    ConfigReload,
+    /// Unlock the secrets vault.
+    Unlock,
+    /// Lock the secrets vault.
+    Lock,
+    /// Delegate capabilities to another agent with scope and time constraints.
+    Delegate {
+        max_depth: u8,
+        scope: Box<CapabilitySet>,
+    },
+    /// Install extensions.
+    ExtensionInstall,
+    /// Manage (enable/disable/remove) extensions.
+    ExtensionManage,
+}
+
+/// A delegation grant from one agent to another.
+///
+/// Delegation narrows scope: the delegatee's effective capabilities are
+/// `delegator_scope.intersection(grant.scope)`. Grants are time-bounded
+/// and require heartbeat renewal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationGrant {
+    /// Agent that issued this delegation.
+    pub delegator: AgentId,
+    /// Maximum capabilities the delegatee may exercise.
+    pub scope: CapabilitySet,
+    /// Time-to-live from grant creation.
+    pub initial_ttl: Duration,
+    /// Required heartbeat interval to maintain the delegation.
+    pub heartbeat_interval: Duration,
+    /// Anti-replay nonce.
+    pub nonce: [u8; 16],
+    /// Optional OCI reference restricting where this delegation can be used.
+    pub point_of_use_filter: Option<OciReference>,
+    /// Ed25519 signature over the grant fields by the delegator (64 bytes).
+    pub signature: Vec<u8>,
+}
+
+/// A link in a delegation chain, recording the grant and its depth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationLink {
+    pub grant: DelegationGrant,
+    /// Depth in the delegation chain (0 = direct from human operator).
+    pub depth: u8,
+}
+
+// ============================================================================
+// Attestation
+// ============================================================================
+
+/// How an agent's identity claim was verified.
+///
+/// Each variant captures the evidence used for a specific attestation method.
+/// Multiple attestations may be composed to strengthen trust (e.g., UCred +
+/// MasterPassword = higher `TrustLevel` than either alone).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Attestation {
+    /// Unix domain socket credentials (pid, uid, gid).
+    UCred {
+        pid: u32,
+        uid: u32,
+        gid: u32,
+    },
+    /// Noise IK static key verified against the clearance registry.
+    NoiseIK {
+        public_key: [u8; 32],
+        registry_generation: u64,
+    },
+    /// Master password verified against the KDF-derived key.
+    MasterPassword {
+        verified_at: u64,
+    },
+    /// Hardware security key (FIDO2/WebAuthn).
+    SecurityKey {
+        credential_id: Vec<u8>,
+        verified_at: u64,
+    },
+    /// Process attestation via `/proc` inspection or equivalent.
+    ProcessAttestation {
+        pid: u32,
+        exe_hash: [u8; 32],
+        uid: u32,
+    },
+    /// Delegated authority from another agent.
+    Delegation {
+        delegator: AgentId,
+        scope: CapabilitySet,
+        chain_depth: u8,
+    },
+    /// Device-level attestation (TPM, Secure Boot, etc.).
+    DeviceAttestation {
+        binding: MachineBinding,
+        verified_at: u64,
+    },
+    /// Remote attestation from a federated peer (v2: defined, not exercised).
+    RemoteAttestation {
+        remote_installation: InstallationId,
+        remote_device_attestation: Box<Attestation>,
+    },
+    /// Heartbeat renewal extending a time-bounded attestation.
+    HeartbeatRenewal {
+        original_attestation_type: AttestationType,
+        renewal_attestation: Box<Attestation>,
+        renewed_at: u64,
+    },
+}
+
+/// Lightweight summary of an attestation method (variant name only, no payloads).
+///
+/// Used in wire protocol and audit log where the full attestation evidence
+/// is not needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttestationType {
+    UCred,
+    NoiseIK,
+    MasterPassword,
+    SecurityKey,
+    ProcessAttestation,
+    Delegation,
+    DeviceAttestation,
+    RemoteAttestation,
+    HeartbeatRenewal,
+}
+
+/// Which attestation methods are available to a given agent type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttestationMethod {
+    /// Password-based (human agents).
+    MasterPassword,
+    /// Hardware security key (human agents with FIDO2).
+    SecurityKey,
+    /// Process identity verification (service/extension agents).
+    ProcessAttestation,
+    /// Delegation chain from another agent (AI/service agents).
+    Delegation,
+    /// Machine-level binding (all agent types on bound installations).
+    DeviceAttestation,
+}
+
+// ============================================================================
+// Agent Identity
+// ============================================================================
+
+/// What kind of entity an agent is.
+///
+/// AgentType is descriptive metadata, NOT a trust tier. An AI agent with
+/// proper attestations and delegation can have higher effective trust than
+/// a human agent without a security key. Trust is evaluated via `TrustVector`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentType {
+    /// Human operator (interactive, keyboard/mouse).
+    Human,
+    /// AI agent (LLM-based, API-driven).
+    AI { model_family: String },
+    /// System service (systemd unit, daemon).
+    Service { unit: String },
+    /// WASM extension (sandboxed, content-addressed).
+    Extension { manifest_hash: [u8; 32] },
+}
+
+/// Process-level identity of an agent on the local machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalAgentId {
+    /// Identified by Unix UID only.
+    UnixUid(u32),
+    /// Identified by UID + process name.
+    ProcessIdentity { uid: u32, process_name: String },
+    /// Identified by systemd unit name.
+    SystemdUnit(String),
+    /// Identified by WASM module content hash.
+    WasmHash([u8; 32]),
+}
+
+/// Metadata describing an agent's type and available attestation methods.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMetadata {
+    pub agent_type: AgentType,
+    pub available_attestation_methods: Vec<AttestationMethod>,
+}
+
+/// Complete identity of an agent operating through the system.
+///
+/// Combines the agent's unique ID, type classification, local process identity,
+/// installation binding, accumulated attestations, authorized capabilities,
+/// and delegation chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIdentity {
+    pub id: AgentId,
+    pub agent_type: AgentType,
+    pub local_id: LocalAgentId,
+    pub installation: InstallationId,
+    /// Attestations accumulated during this session.
+    pub attestations: Vec<Attestation>,
+    /// Effective capability scope for this session.
+    pub session_scope: CapabilitySet,
+    /// Chain of delegations leading to this agent's authority.
+    pub delegation_chain: Vec<DelegationLink>,
+}
+
+// ============================================================================
+// Trust Evaluation
+// ============================================================================
+
+/// Discrete trust levels for individual assessment dimensions.
+///
+/// Ordering: `None < Low < Medium < High < Hardware`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustLevel {
+    None,
+    Low,
+    Medium,
+    High,
+    Hardware,
+}
+
+/// Network exposure classification.
+///
+/// Ordering for trust: `Local` (most trusted) > `Encrypted` > `Onion` > `PublicInternet`.
+/// Ordering for exposure (the enum's `Ord`): `Local < Encrypted < Onion < PublicInternet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkTrust {
+    /// Unix domain socket, same machine.
+    Local,
+    /// Encrypted tunnel (Noise, TLS, WireGuard).
+    Encrypted,
+    /// Onion-routed (Tor, Veilid).
+    Onion,
+    /// Unencrypted or minimally-authenticated public internet.
+    PublicInternet,
+}
+
+/// Multi-dimensional trust assessment of an agent at a point in time.
+///
+/// Used by authorization decisions to determine whether an operation should
+/// be permitted. Each dimension is independently assessed and may change
+/// over the lifetime of a session (e.g., `authz_freshness` degrades).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrustVector {
+    /// Strength of authentication evidence.
+    pub authn_strength: TrustLevel,
+    /// Time since last authorization refresh.
+    pub authz_freshness: Duration,
+    /// Depth in the delegation chain (0 = direct human).
+    pub delegation_depth: u8,
+    /// Composite device security posture score (0.0 = unknown, 1.0 = fully attested).
+    pub device_posture: f64,
+    /// Network exposure of the connection.
+    pub network_exposure: NetworkTrust,
+    /// Type of the agent being assessed.
+    pub agent_type: AgentType,
+}
+
+// ============================================================================
+// ProfileRef
+// ============================================================================
+
+/// Fully-qualified profile reference combining name, ID, and installation.
+///
+/// Used in federation contexts where a profile must be unambiguously identified
+/// across installations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileRef {
+    pub name: TrustProfileName,
+    pub id: ProfileId,
+    pub installation: InstallationId,
 }
 
 // ============================================================================
@@ -1503,5 +2140,416 @@ mod tests {
         let decoded: EventKind = serde_json::from_str(&json).unwrap();
         // Verify it round-trips to the same variant (not Unknown)
         assert!(matches!(decoded, EventKind::DaemonStarted { .. }));
+    }
+
+    // -- AgentId --
+
+    #[test]
+    fn agent_id_display_prefix() {
+        let id = AgentId::from_uuid(Uuid::from_u128(1));
+        let s = format!("{id}");
+        assert!(s.starts_with("agent-"), "AgentId display should have 'agent-' prefix, got: {s}");
+    }
+
+    proptest! {
+        #[test]
+        fn agent_id_roundtrip_postcard(n in any::<u128>()) {
+            let id = AgentId::from_uuid(Uuid::from_u128(n));
+            let bytes = postcard::to_allocvec(&id).unwrap();
+            let decoded: AgentId = postcard::from_bytes(&bytes).unwrap();
+            prop_assert_eq!(id, decoded);
+        }
+
+        #[test]
+        fn agent_id_roundtrip_json(n in any::<u128>()) {
+            let id = AgentId::from_uuid(Uuid::from_u128(n));
+            let json = serde_json::to_string(&id).unwrap();
+            let decoded: AgentId = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(id, decoded);
+        }
+    }
+
+    // -- CryptoConfig enums --
+
+    #[test]
+    fn crypto_config_default_is_leading_edge() {
+        let cfg = CryptoConfig::default();
+        assert_eq!(cfg.kdf, KdfAlgorithm::Argon2id);
+        assert_eq!(cfg.hkdf, HkdfAlgorithm::Blake3);
+        assert_eq!(cfg.noise_cipher, NoiseCipher::ChaChaPoly);
+        assert_eq!(cfg.noise_hash, NoiseHash::Blake2s);
+        assert_eq!(cfg.audit_hash, AuditHash::Blake3);
+        assert_eq!(cfg.minimum_peer_profile, CryptoProfile::LeadingEdge);
+    }
+
+    #[test]
+    fn kdf_algorithm_roundtrip_json() {
+        for alg in [KdfAlgorithm::Argon2id, KdfAlgorithm::Pbkdf2Sha256] {
+            let json = serde_json::to_string(&alg).unwrap();
+            let decoded: KdfAlgorithm = serde_json::from_str(&json).unwrap();
+            assert_eq!(alg, decoded);
+        }
+    }
+
+    #[test]
+    fn hkdf_algorithm_roundtrip_json() {
+        for alg in [HkdfAlgorithm::Blake3, HkdfAlgorithm::HkdfSha256] {
+            let json = serde_json::to_string(&alg).unwrap();
+            let decoded: HkdfAlgorithm = serde_json::from_str(&json).unwrap();
+            assert_eq!(alg, decoded);
+        }
+    }
+
+    #[test]
+    fn noise_cipher_roundtrip_json() {
+        for c in [NoiseCipher::ChaChaPoly, NoiseCipher::AesGcm] {
+            let json = serde_json::to_string(&c).unwrap();
+            let decoded: NoiseCipher = serde_json::from_str(&json).unwrap();
+            assert_eq!(c, decoded);
+        }
+    }
+
+    #[test]
+    fn noise_hash_roundtrip_json() {
+        for h in [NoiseHash::Blake2s, NoiseHash::Sha256] {
+            let json = serde_json::to_string(&h).unwrap();
+            let decoded: NoiseHash = serde_json::from_str(&json).unwrap();
+            assert_eq!(h, decoded);
+        }
+    }
+
+    #[test]
+    fn audit_hash_roundtrip_json() {
+        for h in [AuditHash::Blake3, AuditHash::Sha256] {
+            let json = serde_json::to_string(&h).unwrap();
+            let decoded: AuditHash = serde_json::from_str(&json).unwrap();
+            assert_eq!(h, decoded);
+        }
+    }
+
+    #[test]
+    fn crypto_profile_roundtrip_json() {
+        for p in [CryptoProfile::LeadingEdge, CryptoProfile::GovernanceCompatible, CryptoProfile::Custom] {
+            let json = serde_json::to_string(&p).unwrap();
+            let decoded: CryptoProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(p, decoded);
+        }
+    }
+
+    #[test]
+    fn crypto_config_roundtrip_postcard() {
+        let cfg = CryptoConfig::default();
+        let bytes = postcard::to_allocvec(&cfg).unwrap();
+        let decoded: CryptoConfig = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(cfg, decoded);
+    }
+
+    #[test]
+    fn kdf_algorithm_kebab_case_serialization() {
+        let json = serde_json::to_string(&KdfAlgorithm::Pbkdf2Sha256).unwrap();
+        assert_eq!(json, "\"pbkdf2-sha256\"");
+        let json = serde_json::to_string(&KdfAlgorithm::Argon2id).unwrap();
+        assert_eq!(json, "\"argon2id\"");
+    }
+
+    // -- InstallationId --
+
+    #[test]
+    fn installation_id_roundtrip_json() {
+        let install = InstallationId {
+            id: Uuid::from_u128(42),
+            org_ns: Some(OrganizationNamespace {
+                domain: "braincraft.io".into(),
+                namespace: Uuid::from_u128(99),
+            }),
+            namespace: Uuid::from_u128(123),
+            machine_binding: Some(MachineBinding {
+                binding_hash: [0xAB; 32],
+                binding_type: MachineBindingType::MachineId,
+            }),
+        };
+        let json = serde_json::to_string(&install).unwrap();
+        let decoded: InstallationId = serde_json::from_str(&json).unwrap();
+        assert_eq!(install, decoded);
+    }
+
+    #[test]
+    fn installation_id_roundtrip_postcard() {
+        let install = InstallationId {
+            id: Uuid::from_u128(1),
+            org_ns: None,
+            namespace: Uuid::from_u128(2),
+            machine_binding: None,
+        };
+        let bytes = postcard::to_allocvec(&install).unwrap();
+        let decoded: InstallationId = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(install, decoded);
+    }
+
+    #[test]
+    fn installation_namespace_determinism() {
+        // Same org domain produces same namespace UUID via uuid5.
+        let ns1 = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"braincraft.io");
+        let ns2 = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"braincraft.io");
+        assert_eq!(ns1, ns2);
+
+        // Different domains produce different namespaces.
+        let ns3 = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"example.com");
+        assert_ne!(ns1, ns3);
+    }
+
+    // -- OciReference --
+
+    #[test]
+    fn oci_reference_parse_full() {
+        let r = OciReference::parse("registry.example.com/principal/scope:1.0.0@sha256:abc123").unwrap();
+        assert_eq!(r.registry, "registry.example.com");
+        assert_eq!(r.principal, "principal");
+        assert_eq!(r.scope, "scope");
+        assert_eq!(r.revision, "1.0.0");
+        assert_eq!(r.provenance.as_deref(), Some("sha256:abc123"));
+    }
+
+    #[test]
+    fn oci_reference_parse_without_provenance() {
+        let r = OciReference::parse("registry.example.com/org/ext:2.0").unwrap();
+        assert_eq!(r.registry, "registry.example.com");
+        assert_eq!(r.principal, "org");
+        assert_eq!(r.scope, "ext");
+        assert_eq!(r.revision, "2.0");
+        assert!(r.provenance.is_none());
+    }
+
+    #[test]
+    fn oci_reference_display_roundtrip() {
+        let r = OciReference::parse("reg.io/org/ext:1.0@sha256:def").unwrap();
+        let s = r.to_string();
+        let r2 = OciReference::parse(&s).unwrap();
+        assert_eq!(r, r2);
+    }
+
+    #[test]
+    fn oci_reference_display_roundtrip_no_provenance() {
+        let r = OciReference::parse("reg.io/org/ext:1.0").unwrap();
+        let s = r.to_string();
+        let r2 = OciReference::parse(&s).unwrap();
+        assert_eq!(r, r2);
+    }
+
+    #[test]
+    fn oci_reference_rejects_empty() {
+        assert!(OciReference::parse("").is_err());
+    }
+
+    #[test]
+    fn oci_reference_rejects_missing_revision() {
+        assert!(OciReference::parse("reg.io/org/ext").is_err());
+    }
+
+    #[test]
+    fn oci_reference_rejects_too_few_segments() {
+        assert!(OciReference::parse("reg.io/ext:1.0").is_err());
+    }
+
+    #[test]
+    fn oci_reference_roundtrip_json() {
+        let r = OciReference::parse("reg.io/org/ext:1.0@sha256:abc").unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        let decoded: OciReference = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, decoded);
+    }
+
+    // -- CapabilitySet lattice --
+
+    #[test]
+    fn capability_set_empty_is_subset_of_all() {
+        assert!(CapabilitySet::empty().is_subset(&CapabilitySet::all()));
+    }
+
+    #[test]
+    fn capability_set_all_is_superset_of_empty() {
+        assert!(CapabilitySet::all().is_superset(&CapabilitySet::empty()));
+    }
+
+    #[test]
+    fn capability_set_union_identity() {
+        let a = CapabilitySet::all();
+        let empty = CapabilitySet::empty();
+        assert_eq!(a.union(&empty), a);
+        assert_eq!(empty.union(&a), a);
+    }
+
+    #[test]
+    fn capability_set_intersection_identity() {
+        let a = CapabilitySet::all();
+        let empty = CapabilitySet::empty();
+        assert_eq!(a.intersection(&empty), empty);
+        assert_eq!(empty.intersection(&a), empty);
+    }
+
+    #[test]
+    fn capability_set_intersection_self_is_self() {
+        let a = CapabilitySet::all();
+        assert_eq!(a.intersection(&a), a);
+    }
+
+    #[test]
+    fn capability_set_roundtrip_json() {
+        let cs = CapabilitySet::all();
+        let json = serde_json::to_string(&cs).unwrap();
+        let decoded: CapabilitySet = serde_json::from_str(&json).unwrap();
+        assert_eq!(cs, decoded);
+    }
+
+    #[test]
+    fn capability_delegate_roundtrip_json() {
+        let cap = Capability::Delegate {
+            max_depth: 3,
+            scope: Box::new(CapabilitySet::empty()),
+        };
+        let json = serde_json::to_string(&cap).unwrap();
+        let decoded: Capability = serde_json::from_str(&json).unwrap();
+        assert_eq!(cap, decoded);
+    }
+
+    // -- DelegationGrant --
+
+    #[test]
+    fn delegation_grant_roundtrip_json() {
+        let grant = DelegationGrant {
+            delegator: AgentId::from_uuid(Uuid::from_u128(1)),
+            scope: CapabilitySet::empty(),
+            initial_ttl: Duration::from_secs(3600),
+            heartbeat_interval: Duration::from_secs(60),
+            nonce: [0xAA; 16],
+            point_of_use_filter: None,
+            signature: vec![0xBB; 64],
+        };
+        let json = serde_json::to_string(&grant).unwrap();
+        let decoded: DelegationGrant = serde_json::from_str(&json).unwrap();
+        assert_eq!(grant, decoded);
+    }
+
+    // -- Attestation --
+
+    #[test]
+    fn attestation_ucred_roundtrip_json() {
+        let att = Attestation::UCred { pid: 1234, uid: 1000, gid: 1000 };
+        let json = serde_json::to_string(&att).unwrap();
+        let decoded: Attestation = serde_json::from_str(&json).unwrap();
+        assert_eq!(att, decoded);
+    }
+
+    #[test]
+    fn attestation_delegation_roundtrip_json() {
+        let att = Attestation::Delegation {
+            delegator: AgentId::from_uuid(Uuid::from_u128(5)),
+            scope: CapabilitySet::empty(),
+            chain_depth: 2,
+        };
+        let json = serde_json::to_string(&att).unwrap();
+        let decoded: Attestation = serde_json::from_str(&json).unwrap();
+        assert_eq!(att, decoded);
+    }
+
+    #[test]
+    fn attestation_type_roundtrip_json() {
+        for at in [
+            AttestationType::UCred,
+            AttestationType::NoiseIK,
+            AttestationType::MasterPassword,
+            AttestationType::Delegation,
+            AttestationType::DeviceAttestation,
+        ] {
+            let json = serde_json::to_string(&at).unwrap();
+            let decoded: AttestationType = serde_json::from_str(&json).unwrap();
+            assert_eq!(at, decoded);
+        }
+    }
+
+    // -- AgentType / AgentIdentity --
+
+    #[test]
+    fn agent_type_roundtrip_json() {
+        let at = AgentType::AI { model_family: "claude".into() };
+        let json = serde_json::to_string(&at).unwrap();
+        let decoded: AgentType = serde_json::from_str(&json).unwrap();
+        assert_eq!(at, decoded);
+    }
+
+    #[test]
+    fn agent_identity_roundtrip_json() {
+        let identity = AgentIdentity {
+            id: AgentId::from_uuid(Uuid::from_u128(10)),
+            agent_type: AgentType::Human,
+            local_id: LocalAgentId::UnixUid(1000),
+            installation: InstallationId {
+                id: Uuid::from_u128(1),
+                org_ns: None,
+                namespace: Uuid::from_u128(2),
+                machine_binding: None,
+            },
+            attestations: vec![Attestation::UCred { pid: 100, uid: 1000, gid: 1000 }],
+            session_scope: CapabilitySet::all(),
+            delegation_chain: vec![],
+        };
+        let json = serde_json::to_string(&identity).unwrap();
+        let decoded: AgentIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(identity, decoded);
+    }
+
+    // -- TrustLevel ordering --
+
+    #[test]
+    fn trust_level_ordering() {
+        assert!(TrustLevel::None < TrustLevel::Low);
+        assert!(TrustLevel::Low < TrustLevel::Medium);
+        assert!(TrustLevel::Medium < TrustLevel::High);
+        assert!(TrustLevel::High < TrustLevel::Hardware);
+    }
+
+    // -- NetworkTrust ordering --
+
+    #[test]
+    fn network_trust_ordering() {
+        assert!(NetworkTrust::Local < NetworkTrust::Encrypted);
+        assert!(NetworkTrust::Encrypted < NetworkTrust::Onion);
+        assert!(NetworkTrust::Onion < NetworkTrust::PublicInternet);
+    }
+
+    // -- TrustVector --
+
+    #[test]
+    fn trust_vector_roundtrip_json() {
+        let tv = TrustVector {
+            authn_strength: TrustLevel::High,
+            authz_freshness: Duration::from_secs(30),
+            delegation_depth: 0,
+            device_posture: 0.95,
+            network_exposure: NetworkTrust::Local,
+            agent_type: AgentType::Human,
+        };
+        let json = serde_json::to_string(&tv).unwrap();
+        let decoded: TrustVector = serde_json::from_str(&json).unwrap();
+        assert_eq!(tv, decoded);
+    }
+
+    // -- ProfileRef --
+
+    #[test]
+    fn profile_ref_roundtrip_json() {
+        let pr = ProfileRef {
+            name: TrustProfileName::try_from("work").unwrap(),
+            id: ProfileId::from_uuid(Uuid::from_u128(77)),
+            installation: InstallationId {
+                id: Uuid::from_u128(1),
+                org_ns: None,
+                namespace: Uuid::from_u128(2),
+                machine_binding: None,
+            },
+        };
+        let json = serde_json::to_string(&pr).unwrap();
+        let decoded: ProfileRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(pr, decoded);
     }
 }
