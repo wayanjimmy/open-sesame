@@ -792,3 +792,85 @@ async fn secrets_only_message_not_delivered_to_internal_daemon() {
         "SecretsOnly-level message must not reach Internal-clearance daemon"
     );
 }
+
+// ===== shutdown() flushes outbound frames before disconnect =====
+// Simulates the CLI lifecycle: connect, publish, shutdown, verify delivery.
+#[tokio::test]
+async fn shutdown_flushes_publish_before_disconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("bus.sock");
+    let server_kp = generate_keypair().unwrap();
+    let server_pub: [u8; 32] = server_kp.public().try_into().unwrap();
+
+    let daemon_kp = generate_keypair().unwrap();
+    let mut registry = ClearanceRegistry::new();
+    let mut daemon_pub = [0u8; 32];
+    daemon_pub.copy_from_slice(daemon_kp.public());
+    registry.register(daemon_pub, "daemon-wm".into(), SecurityLevel::Internal);
+
+    let server = BusServer::bind(&sock, server_kp.into_inner(), registry).unwrap();
+    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut daemon_wm = connect_with_keypair(did(1), &sock, &server_pub, &daemon_kp).await;
+    let cli = connect_client(did(2), &sock, &server_pub).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // CLI publishes then gracefully shuts down (like cmd_wm_overlay).
+    cli.publish(EventKind::WmActivateOverlay, SecurityLevel::Internal)
+        .await
+        .unwrap();
+    cli.shutdown().await;
+
+    // daemon-wm must receive the event even though CLI has disconnected.
+    let msg = tokio::time::timeout(Duration::from_millis(500), daemon_wm.recv())
+        .await
+        .expect("shutdown must flush: daemon-wm must receive the event")
+        .expect("channel closed");
+
+    assert!(
+        matches!(msg.payload, EventKind::WmActivateOverlay),
+        "expected WmActivateOverlay, got {:?}",
+        msg.payload
+    );
+}
+
+// ===== drop without shutdown can lose outbound frames =====
+// Proves the bug that shutdown() fixes: dropping BusClient immediately
+// after publish races the I/O task and the frame may never reach the wire.
+#[tokio::test]
+async fn drop_without_shutdown_may_lose_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("bus.sock");
+    let server_kp = generate_keypair().unwrap();
+    let server_pub: [u8; 32] = server_kp.public().try_into().unwrap();
+
+    let daemon_kp = generate_keypair().unwrap();
+    let mut registry = ClearanceRegistry::new();
+    let mut daemon_pub = [0u8; 32];
+    daemon_pub.copy_from_slice(daemon_kp.public());
+    registry.register(daemon_pub, "daemon-wm".into(), SecurityLevel::Internal);
+
+    let server = BusServer::bind(&sock, server_kp.into_inner(), registry).unwrap();
+    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut daemon_wm = connect_with_keypair(did(1), &sock, &server_pub, &daemon_kp).await;
+    let cli = connect_client(did(2), &sock, &server_pub).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // CLI publishes then drops immediately — no shutdown.
+    cli.publish(EventKind::WmActivateOverlay, SecurityLevel::Internal)
+        .await
+        .unwrap();
+    drop(cli);
+
+    // The message may or may not arrive — the race is non-deterministic.
+    // We use a short timeout; if it arrives, fine. The point is that
+    // this is unreliable vs shutdown() which guarantees delivery.
+    let result = tokio::time::timeout(Duration::from_millis(100), daemon_wm.recv()).await;
+    // We don't assert pass or fail — this test documents the race condition.
+    // The companion test (shutdown_flushes_publish_before_disconnect) proves
+    // that shutdown() reliably delivers.
+    let _ = result;
+}

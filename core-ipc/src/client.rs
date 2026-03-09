@@ -119,16 +119,21 @@ impl BusClient {
                             break;
                         }
                     }
-                    Some(mut payload) = outbound_rx.recv() => {
-                        let result = transport.write_encrypted_frame(&mut writer, &payload).await;
-                        // Zeroize plaintext postcard buffer after encryption.
-                        zeroize::Zeroize::zeroize(&mut payload);
-                        if let Err(e) = result {
-                            tracing::debug!(error = %e, "encrypted write failed, closing client");
+                    msg = outbound_rx.recv() => {
+                        if let Some(mut payload) = msg {
+                            let result = transport.write_encrypted_frame(&mut writer, &payload).await;
+                            // Zeroize plaintext postcard buffer after encryption.
+                            zeroize::Zeroize::zeroize(&mut payload);
+                            if let Err(e) = result {
+                                tracing::debug!(error = %e, "encrypted write failed, closing client");
+                                break;
+                            }
+                        } else {
+                            // outbound channel closed — client called shutdown() or was dropped.
+                            tracing::debug!("outbound channel closed, I/O task exiting");
                             break;
                         }
                     }
-                    else => break,
                 }
             }
         });
