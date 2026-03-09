@@ -52,33 +52,19 @@
               default = { };
               example = lib.literalExpression ''
                 {
-                  global = {
-                    default_profile = "default";
+                  key_bindings.g = {
+                    apps = [ "ghostty" "com.mitchellh.ghostty" ];
+                    launch = "ghostty";
                   };
-                  profiles.default = {
-                    name = "default";
-                    wm = {
-                      hint_keys = "asdfghjkl";
-                      overlay_delay_ms = 150;
-                      key_bindings.g = {
-                        apps = [ "ghostty" "com.mitchellh.ghostty" ];
-                        launch = "ghostty";
-                      };
-                      key_bindings.f = {
-                        apps = [ "firefox" "org.mozilla.firefox" ];
-                        launch = "firefox";
-                      };
-                    };
+                  key_bindings.f = {
+                    apps = [ "firefox" "org.mozilla.firefox" ];
+                    launch = "firefox";
                   };
                 }
               '';
               description = ''
-                Configuration for Open Sesame (v2 schema), written to
-                {file}`~/.config/pds/config.toml`.
-
-                The structure must match the application's Config format:
-                top-level keys are `config_version`, `global`, `profiles`,
-                `crypto`, `agents`, and `extensions`.
+                Window manager key bindings and WM settings for the default profile.
+                Keys are placed under `profiles.default.wm` in the generated config.
 
                 See https://scopecreep-zip.github.io/open-sesame/ for documentation.
               '';
@@ -101,20 +87,21 @@
             home.packages = [ cfg.package ];
 
             xdg.configFile."pds/config.toml" = lib.mkIf (cfg.settings != { }) {
-              source = tomlFormat.generate "open-sesame-config" (
-                lib.recursiveUpdate {
-                  config_version = 3;
-                  global = {
-                    default_profile = "default";
-                    ipc = { };
-                    logging = { };
-                  };
-                  profiles = { };
-                  crypto = { };
-                  agents = { };
-                  extensions = { };
-                } cfg.settings
-              );
+              source = tomlFormat.generate "open-sesame-config" {
+                config_version = 3;
+                global = {
+                  default_profile = "default";
+                  ipc = { };
+                  logging = { };
+                };
+                profiles.default = {
+                  name = "default";
+                  wm = cfg.settings;
+                };
+                crypto = { };
+                agents = { };
+                extensions = { };
+              };
             };
 
             # Grouping target — start/stop all daemons together.
