@@ -610,8 +610,9 @@ fn send_access_denied(
     epoch: Instant,
     reason: String,
 ) {
+    let ctx = crate::message::MessageContext::new(DaemonId::new());
     let reply = Message::new(
-        DaemonId::new(),
+        &ctx,
         EventKind::AccessDenied { reason },
         SecurityLevel::Open,
         epoch,

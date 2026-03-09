@@ -1,6 +1,6 @@
 //! IPC message envelope.
 
-use core_types::{DaemonId, SecurityLevel, Timestamp};
+use core_types::{AgentId, DaemonId, InstallationId, SecurityLevel, Timestamp, TrustVector};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Instant;
@@ -16,7 +16,7 @@ use uuid::Uuid;
 /// All v2 binaries must be deployed atomically (single compilation unit).
 /// Adding fields requires incrementing this constant and updating the decode
 /// path to handle both old and new versions during rolling upgrades.
-pub const WIRE_VERSION: u8 = 2;
+pub const WIRE_VERSION: u8 = 3;
 
 /// The IPC bus message envelope wrapping any payload type.
 ///
@@ -46,6 +46,41 @@ pub struct Message<T> {
     /// Note: no `skip_serializing_if` — postcard uses positional encoding, so the
     /// field must always be present in the wire format for decode compatibility.
     pub verified_sender_name: Option<String>,
+
+    // -- v3 fields (appended for positional encoding safety) --
+
+    /// Installation identity of the sender.
+    /// No `skip_serializing_if` — postcard positional encoding requires all fields present.
+    pub origin_installation: Option<InstallationId>,
+    /// Agent identity of the sender.
+    pub agent_id: Option<AgentId>,
+    /// Trust snapshot at time of message creation.
+    pub trust_snapshot: Option<TrustVector>,
+}
+
+/// Context for constructing outbound messages.
+///
+/// Carries the sender's identity information so that `Message::new()` can
+/// populate all v3 fields without callers needing to pass them individually.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageContext {
+    pub sender: DaemonId,
+    pub installation: Option<InstallationId>,
+    pub agent_id: Option<AgentId>,
+    pub trust_snapshot: Option<TrustVector>,
+}
+
+impl MessageContext {
+    /// Create a minimal context with just a daemon ID (no v3 fields).
+    #[must_use]
+    pub fn new(sender: DaemonId) -> Self {
+        Self {
+            sender,
+            installation: None,
+            agent_id: None,
+            trust_snapshot: None,
+        }
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Message<T> {
@@ -55,6 +90,8 @@ impl<T: fmt::Debug> fmt::Debug for Message<T> {
             .field("correlation_id", &self.correlation_id)
             .field("sender", &self.sender)
             .field("security_level", &self.security_level)
+            .field("agent_id", &self.agent_id)
+            .field("origin_installation", &self.origin_installation.as_ref().map(|i| &i.id))
             .field("payload", &self.payload)
             .finish_non_exhaustive()
     }
@@ -63,16 +100,19 @@ impl<T: fmt::Debug> fmt::Debug for Message<T> {
 impl<T: Serialize> Message<T> {
     /// Create a new message with a fresh UUID v7 and current timestamp.
     #[must_use]
-    pub fn new(sender: DaemonId, payload: T, security_level: SecurityLevel, epoch: Instant) -> Self {
+    pub fn new(ctx: &MessageContext, payload: T, security_level: SecurityLevel, epoch: Instant) -> Self {
         Self {
             wire_version: WIRE_VERSION,
             msg_id: Uuid::now_v7(),
             correlation_id: None,
             timestamp: Timestamp::now(epoch),
-            sender,
+            sender: ctx.sender,
             payload,
             security_level,
             verified_sender_name: None,
+            origin_installation: ctx.installation.clone(),
+            agent_id: ctx.agent_id,
+            trust_snapshot: ctx.trust_snapshot.clone(),
         }
     }
 
@@ -89,10 +129,14 @@ mod tests {
     use super::*;
     use core_types::{DaemonId, EventKind, SecurityLevel};
 
+    fn make_test_ctx() -> MessageContext {
+        MessageContext::new(DaemonId::new())
+    }
+
     fn make_test_message() -> Message<EventKind> {
-        let sender = DaemonId::new();
+        let ctx = make_test_ctx();
         let payload = EventKind::StatusRequest;
-        Message::new(sender, payload, SecurityLevel::Internal, Instant::now())
+        Message::new(&ctx, payload, SecurityLevel::Internal, Instant::now())
     }
 
     // SECURITY INVARIANT: Message::new() must always set wire_version to the
@@ -102,7 +146,7 @@ mod tests {
     fn message_new_sets_wire_version() {
         let msg = make_test_message();
         assert_eq!(msg.wire_version, WIRE_VERSION);
-        assert_eq!(msg.wire_version, 2);
+        assert_eq!(msg.wire_version, 3);
     }
 
     // SECURITY INVARIANT: New messages must have no verified_sender_name (server
@@ -113,6 +157,9 @@ mod tests {
         let msg = make_test_message();
         assert!(msg.verified_sender_name.is_none());
         assert!(msg.correlation_id.is_none());
+        assert!(msg.origin_installation.is_none());
+        assert!(msg.agent_id.is_none());
+        assert!(msg.trust_snapshot.is_none());
     }
 
     // SECURITY INVARIANT: wire_version must survive postcard encode/decode

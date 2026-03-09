@@ -246,7 +246,7 @@ mod tests {
         // In a clean tmpdir with no config files, load_config should succeed
         // with defaults (paths won't exist).
         let config = Config::default();
-        assert_eq!(config.config_version, 2);
+        assert_eq!(config.config_version, 3);
         assert_eq!(&*config.global.default_profile, "default");
     }
 

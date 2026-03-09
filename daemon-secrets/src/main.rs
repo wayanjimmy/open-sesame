@@ -1035,8 +1035,9 @@ async fn send_response(
     response_event: EventKind,
     daemon_id: DaemonId,
 ) -> anyhow::Result<bool> {
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
     let response = Message::new(
-        daemon_id,
+        &msg_ctx,
         response_event,
         request.security_level,
         client.epoch(),

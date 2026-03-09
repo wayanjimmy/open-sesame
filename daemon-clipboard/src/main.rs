@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let server_pub = core_ipc::noise::read_bus_public_key().await
         .context("daemon-profile is not running (no bus public key found)")?;
     let daemon_id = DaemonId::new();
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
 
     let (mut client, _client_keypair) = BusClient::connect_with_keypair_retry(
         "daemon-clipboard", daemon_id, &socket_path, &server_pub, 5,
@@ -219,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
 
                 if let Some(event) = response_event {
                     let response = Message::new(
-                        daemon_id, event, msg.security_level, client.epoch(),
+                        &msg_ctx, event, msg.security_level, client.epoch(),
                     ).with_correlation(msg.msg_id);
                     if let Err(e) = client.send(&response).await {
                         tracing::warn!(error = %e, "failed to send response");

@@ -94,8 +94,9 @@ mod tests {
             version: "0.1.0".into(),
             capabilities: vec!["test".into()],
         };
+        let ctx = crate::message::MessageContext::new(DaemonId::from_uuid(Uuid::from_u128(1)));
         let msg = crate::message::Message::new(
-            DaemonId::from_uuid(Uuid::from_u128(1)),
+            &ctx,
             event,
             SecurityLevel::Internal,
             std::time::Instant::now(),

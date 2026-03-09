@@ -14,7 +14,7 @@ mod transport;
 mod server;
 mod client;
 
-pub use message::{Message, WIRE_VERSION};
+pub use message::{Message, MessageContext, WIRE_VERSION};
 pub use framing::{encode_frame, decode_frame};
 pub use noise::{NoiseTransport, ZeroizingKeypair, generate_keypair};
 pub use registry::ClearanceRegistry;

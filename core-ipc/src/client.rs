@@ -5,6 +5,7 @@
 //! `connect_encrypted()`. Plaintext `connect()` is `#[cfg(test)]` only.
 
 use core_types::{DaemonId, EventKind, SecurityLevel};
+use crate::message::MessageContext;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use crate::transport::{extract_ucred, local_credentials};
 /// The IPC bus client used by each daemon to communicate on the bus.
 pub struct BusClient {
     daemon_id: DaemonId,
+    msg_ctx: MessageContext,
     /// Outbound frames to send to the server.
     outbound_tx: mpsc::Sender<Vec<u8>>,
     /// Inbound frames received from the server (broadcast/unsolicited).
@@ -39,6 +41,7 @@ impl BusClient {
     ) -> Self {
         Self {
             daemon_id,
+            msg_ctx: MessageContext::new(daemon_id),
             outbound_tx,
             inbound_rx,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -128,6 +131,7 @@ impl BusClient {
 
         Ok(Self {
             daemon_id,
+            msg_ctx: MessageContext::new(daemon_id),
             outbound_tx,
             inbound_rx,
             pending,
@@ -160,7 +164,7 @@ impl BusClient {
         event: EventKind,
         security_level: SecurityLevel,
     ) -> core_types::Result<()> {
-        let msg = Message::new(self.daemon_id, event, security_level, self.epoch);
+        let msg = Message::new(&self.msg_ctx, event, security_level, self.epoch);
         self.send(&msg).await
     }
 
@@ -178,7 +182,7 @@ impl BusClient {
         security_level: SecurityLevel,
         timeout: Duration,
     ) -> core_types::Result<Message<EventKind>> {
-        let msg = Message::new(self.daemon_id, event, security_level, self.epoch);
+        let msg = Message::new(&self.msg_ctx, event, security_level, self.epoch);
         let msg_id = msg.msg_id;
 
         let (tx, rx) = oneshot::channel();

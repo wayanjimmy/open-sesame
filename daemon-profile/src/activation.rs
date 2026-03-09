@@ -215,7 +215,8 @@ async fn confirmed_rpc(
     confirm_tx: &mpsc::Sender<Vec<u8>>,
     confirm_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<Message<EventKind>, String> {
-    let msg = Message::new(daemon_id, event, SecurityLevel::SecretsOnly, bus.epoch());
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
+    let msg = Message::new(&msg_ctx, event, SecurityLevel::SecretsOnly, bus.epoch());
     let msg_id = msg.msg_id;
 
     // Register confirmation route — guard deregisters on drop.
@@ -255,7 +256,8 @@ async fn broadcast(
     daemon_id: DaemonId,
     event: EventKind,
 ) -> Result<(), String> {
-    let msg = Message::new(daemon_id, event, SecurityLevel::Internal, bus.epoch());
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
+    let msg = Message::new(&msg_ctx, event, SecurityLevel::Internal, bus.epoch());
     let payload = core_ipc::encode_frame(&msg).map_err(|e| e.to_string())?;
     bus.publish(&payload, SecurityLevel::Internal).await;
     Ok(())

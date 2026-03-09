@@ -172,8 +172,9 @@ async fn request_response_correlation() {
 
     assert!(matches!(request_msg.payload, EventKind::SecretList { .. }));
 
+    let msg_ctx = core_ipc::MessageContext::new(did(2));
     let response = Message::new(
-        did(2),
+        &msg_ctx,
         EventKind::SecretListResponse {
             keys: vec!["api-key".into(), "db-pass".into()],
             denial: None,
@@ -340,8 +341,9 @@ async fn secret_response_not_received_by_bystander() {
     assert!(matches!(bystander_request.payload, EventKind::SecretList { .. }));
 
     // Secrets daemon sends correlated response
+    let msg_ctx = core_ipc::MessageContext::new(did(3));
     let response = Message::new(
-        did(3),
+        &msg_ctx,
         EventKind::SecretListResponse {
             keys: vec!["api-key".into()],
             denial: None,
@@ -379,8 +381,9 @@ async fn uncorrelated_response_is_dropped() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Client A sends a response with a fabricated correlation_id (no matching request)
+    let msg_ctx = core_ipc::MessageContext::new(did(1));
     let orphan_response = Message::new(
-        did(1),
+        &msg_ctx,
         EventKind::SecretListResponse {
             keys: vec!["should-not-broadcast".into()],
             denial: None,
@@ -524,8 +527,9 @@ async fn sender_identity_change_blocked() {
     assert!(matches!(msg.payload, EventKind::DaemonStarted { .. }));
 
     // Second message: different DaemonId (identity change attempt).
+    let spoofed_ctx = core_ipc::MessageContext::new(did(99));
     let spoofed = Message::new(
-        did(99), // Different from the bound did(20)
+        &spoofed_ctx, // Different from the bound did(20)
         EventKind::DaemonStarted {
             daemon_id: did(99),
             version: "0.1.0".into(),

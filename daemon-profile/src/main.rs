@@ -214,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
     // This lets daemon-profile receive and process messages (StatusRequest,
     // ProfileActivate, ProfileList, etc.) that clients send to the bus.
     let daemon_id = DaemonId::new();
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
     let (host_tx, mut host_rx) = mpsc::channel::<Vec<u8>>(256);
     let host_peer = core_ipc::PeerCredentials::in_process();
     bus.register(
@@ -384,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
                     &config_profile_names,
                 ).await {
                     let reply = Message::new(
-                        daemon_id,
+                        &msg_ctx,
                         response_event,
                         msg.security_level,
                         bus.epoch(),
@@ -441,7 +442,7 @@ async fn main() -> anyhow::Result<()> {
                         previous,
                         current: new_default,
                     };
-                    let msg = Message::new(daemon_id, event, SecurityLevel::Internal, bus.epoch());
+                    let msg = Message::new(&msg_ctx, event, SecurityLevel::Internal, bus.epoch());
                     if let Ok(payload) = core_ipc::encode_frame(&msg) {
                         bus.publish(&payload, SecurityLevel::Internal).await;
                     }
@@ -508,6 +509,7 @@ async fn handle_bus_message<W: std::io::Write>(
     confirm_rx: &mut mpsc::Receiver<Vec<u8>>,
     config_profile_names: &[TrustProfileName],
 ) -> Option<EventKind> {
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
     match &msg.payload {
         // Track daemon start/restart for key revocation.
         EventKind::DaemonStarted { daemon_id: announced_id, .. } => {
@@ -595,7 +597,7 @@ async fn handle_bus_message<W: std::io::Write>(
                                     grace_period_s: KEY_ROTATION_GRACE,
                                 };
                                 let rotation_msg = Message::new(
-                                    daemon_id, rotation_event,
+                                    &msg_ctx, rotation_event,
                                     SecurityLevel::Internal, bus.epoch(),
                                 );
                                 if let Ok(payload) = core_ipc::encode_frame(&rotation_msg) {
@@ -767,8 +769,9 @@ async fn reconcile_secrets_state(
     confirm_tx: &mpsc::Sender<Vec<u8>>,
     confirm_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) {
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
     let msg = Message::new(
-        daemon_id,
+        &msg_ctx,
         EventKind::SecretsStateRequest,
         SecurityLevel::Internal,
         bus.epoch(),
@@ -875,6 +878,7 @@ async fn rotate_keys_phase1<W: std::io::Write>(
     daemon_id: DaemonId,
     audit: &mut AuditLogger<W>,
 ) -> anyhow::Result<()> {
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
     let noise_params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
         .parse()
         .expect("valid noise params");
@@ -900,7 +904,7 @@ async fn rotate_keys_phase1<W: std::io::Write>(
             new_pubkey,
             grace_period_s: KEY_ROTATION_GRACE,
         };
-        let msg = Message::new(daemon_id, event, SecurityLevel::Internal, bus.epoch());
+        let msg = Message::new(&msg_ctx, event, SecurityLevel::Internal, bus.epoch());
         if let Ok(payload) = core_ipc::encode_frame(&msg) {
             bus.publish(&payload, SecurityLevel::Internal).await;
         }
@@ -936,6 +940,7 @@ async fn rotate_keys_phase2<W: std::io::Write>(
     daemon_id: DaemonId,
     audit: &mut AuditLogger<W>,
 ) -> anyhow::Result<()> {
+    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
     let baseline = ROTATION_BASELINE.lock().await.take()
         .context("phase 2 called without phase 1 baseline")?;
 
@@ -985,7 +990,7 @@ async fn rotate_keys_phase2<W: std::io::Write>(
         let event = EventKind::KeyRotationComplete {
             daemon_name: daemon_name.into(),
         };
-        let msg = Message::new(daemon_id, event, SecurityLevel::Internal, bus.epoch());
+        let msg = Message::new(&msg_ctx, event, SecurityLevel::Internal, bus.epoch());
         if let Ok(payload) = core_ipc::encode_frame(&msg) {
             bus.publish(&payload, SecurityLevel::Internal).await;
         }
