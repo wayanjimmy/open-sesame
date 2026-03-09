@@ -108,7 +108,7 @@ impl SqlCipherStore {
         // Domain-separated via BLAKE3 so it is cryptographically independent
         // from the SQLCipher page encryption key (same vault_key input, different context).
         let mut entry_key_bytes = blake3::derive_key(
-            "pds v1 entry-encryption-key",
+            "pds v2 entry-encryption-key",
             vault_key.as_bytes(),
         );
         let entry_key = SecureBytes::new(entry_key_bytes.to_vec());
@@ -484,7 +484,7 @@ mod tests {
 
         // Derive entry key (same derivation as SqlCipherStore::open internally)
         let entry_key_bytes = blake3::derive_key(
-            "pds v1 entry-encryption-key",
+            "pds v2 entry-encryption-key",
             vault_key.as_bytes(),
         );
 

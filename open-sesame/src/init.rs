@@ -42,9 +42,9 @@ fn step_skip(msg: &str) {
 // sesame init
 // ============================================================================
 
-pub async fn cmd_init(no_keybinding: bool) -> anyhow::Result<()> {
+pub async fn cmd_init(no_keybinding: bool, org: Option<String>) -> anyhow::Result<()> {
     let do_keybinding = keybinding_applicable(no_keybinding);
-    let total_steps: u32 = if do_keybinding { 4 } else { 3 };
+    let total_steps: u32 = if do_keybinding { 5 } else { 4 };
 
     println!("\n  {}", "Open Sesame — First-Time Setup".bold());
 
@@ -52,17 +52,21 @@ pub async fn cmd_init(no_keybinding: bool) -> anyhow::Result<()> {
     step_header(1, total_steps, "Configuration");
     init_config()?;
 
-    // Step 2: Services
-    step_header(2, total_steps, "Services");
+    // Step 2: Installation Identity
+    step_header(2, total_steps, "Installation Identity");
+    init_installation(org.as_deref())?;
+
+    // Step 3: Services
+    step_header(3, total_steps, "Services");
     init_services().await?;
 
-    // Step 3: Master password
-    step_header(3, total_steps, "Master Password");
+    // Step 4: Master password
+    step_header(4, total_steps, "Master Password");
     init_unlock().await?;
 
-    // Step 4: Keybinding (conditional)
+    // Step 5: Keybinding (conditional)
     if do_keybinding {
-        step_header(4, total_steps, "Keybinding (COSMIC desktop detected)");
+        step_header(5, total_steps, "Keybinding (COSMIC desktop detected)");
         init_keybinding()?;
     }
 
@@ -110,7 +114,74 @@ fn init_config() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Step 2: Services ────────────────────────────────────────────────────────
+// ── Step 2: Installation Identity ──────────────────────────────────────────
+
+fn init_installation(org: Option<&str>) -> anyhow::Result<()> {
+    let installation_path = core_config::installation_path();
+
+    if installation_path.exists() {
+        step_skip("Installation identity exists");
+        return Ok(());
+    }
+
+    let id = uuid::Uuid::new_v4();
+
+    // Deterministic namespace for profile IDs — matches daemon-profile.
+    let profile_ns = uuid::Uuid::from_bytes([
+        0x4c, 0x45, 0xa6, 0x4f, 0xab, 0xcd, 0x59, 0x77,
+        0xbc, 0x73, 0x99, 0xd4, 0xc9, 0x3d, 0x66, 0x8b,
+    ]);
+
+    let (install_ns, org_config) = if let Some(domain) = org {
+        let org_ns = uuid::Uuid::new_v5(&profile_ns, format!("org:{domain}").as_bytes());
+        let ns = uuid::Uuid::new_v5(&org_ns, format!("install:{id}").as_bytes());
+        let org_cfg = core_config::OrgConfig {
+            domain: domain.to_string(),
+            namespace: org_ns,
+        };
+        (ns, Some(org_cfg))
+    } else {
+        let ns = uuid::Uuid::new_v5(&profile_ns, format!("install:{id}").as_bytes());
+        (ns, None)
+    };
+
+    // Machine binding: read /etc/machine-id
+    let machine_binding = std::fs::read_to_string("/etc/machine-id")
+        .ok()
+        .map(|mid| {
+            let mid = mid.trim();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(mid.as_bytes());
+            hasher.update(id.as_bytes());
+            let hash = hasher.finalize();
+            core_config::MachineBindingConfig {
+                binding_hash: hash.to_hex().to_string(),
+                binding_type: "machine-id".to_string(),
+            }
+        });
+
+    let install_config = core_config::InstallationConfig {
+        id,
+        namespace: install_ns,
+        org: org_config,
+        machine_binding: machine_binding.clone(),
+    };
+
+    core_config::write_installation(&install_config)
+        .context("failed to write installation.toml")?;
+
+    step_done(&format!("Created {}", installation_path.display()));
+    println!("        Installation ID: {}", id);
+    println!("        Namespace:       {}", install_ns);
+    if let Some(domain) = org {
+        println!("        Organization:    {}", domain);
+    }
+    println!("        Machine binding: {}", if machine_binding.is_some() { "present" } else { "absent" });
+
+    Ok(())
+}
+
+// ── Step 3: Services ────────────────────────────────────────────────────────
 
 async fn init_services() -> anyhow::Result<()> {
     // Check if already running.

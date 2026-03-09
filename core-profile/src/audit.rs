@@ -20,6 +20,7 @@ pub struct AuditLogger<W: Write> {
     writer: W,
     last_hash: String,
     sequence: u64,
+    hash_algorithm: core_types::AuditHash,
 }
 
 impl<W: Write> AuditLogger<W> {
@@ -27,11 +28,12 @@ impl<W: Write> AuditLogger<W> {
     ///
     /// `last_hash` and `sequence` should be loaded from the last entry
     /// in an existing log file, or empty/0 for a fresh log.
-    pub fn new(writer: W, last_hash: String, sequence: u64) -> Self {
+    pub fn new(writer: W, last_hash: String, sequence: u64, hash_algorithm: core_types::AuditHash) -> Self {
         Self {
             writer,
             last_hash,
             sequence,
+            hash_algorithm,
         }
     }
 
@@ -63,8 +65,14 @@ impl<W: Write> AuditLogger<W> {
             .map_err(|e| core_types::Error::Other(format!("audit serialization: {e}")))?;
 
         // Hash the entire JSON line for chain integrity
-        let hash = blake3::hash(json.as_bytes());
-        self.last_hash = hash.to_hex().to_string();
+        let hash_hex = match self.hash_algorithm {
+            core_types::AuditHash::Blake3 => blake3::hash(json.as_bytes()).to_hex().to_string(),
+            core_types::AuditHash::Sha256 => {
+                use sha2::{Sha256, Digest};
+                hex::encode(Sha256::digest(json.as_bytes()))
+            },
+        };
+        self.last_hash = hash_hex;
 
         writeln!(self.writer, "{json}")
             .map_err(core_types::Error::Io)?;
@@ -95,7 +103,7 @@ impl<W: Write> AuditLogger<W> {
 /// # Errors
 ///
 /// Returns an error if any entry fails to parse or if the hash chain is broken.
-pub fn verify_chain(log_contents: &str) -> core_types::Result<u64> {
+pub fn verify_chain(log_contents: &str, algorithm: &core_types::AuditHash) -> core_types::Result<u64> {
     let mut expected_prev_hash = String::new();
     let mut count = 0u64;
 
@@ -115,8 +123,14 @@ pub fn verify_chain(log_contents: &str) -> core_types::Result<u64> {
             )));
         }
 
-        let hash = blake3::hash(line.as_bytes());
-        expected_prev_hash = hash.to_hex().to_string();
+        let hash_hex = match algorithm {
+            core_types::AuditHash::Blake3 => blake3::hash(line.as_bytes()).to_hex().to_string(),
+            core_types::AuditHash::Sha256 => {
+                use sha2::{Sha256, Digest};
+                hex::encode(Sha256::digest(line.as_bytes()))
+            },
+        };
+        expected_prev_hash = hash_hex;
         count += 1;
     }
 
@@ -136,7 +150,7 @@ mod tests {
     #[test]
     fn append_and_verify_chain() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
 
         logger
             .append(AuditAction::ProfileActivated {
@@ -155,14 +169,14 @@ mod tests {
         assert_eq!(logger.sequence(), 2);
 
         let log = String::from_utf8(buf).unwrap();
-        let count = verify_chain(&log).unwrap();
+        let count = verify_chain(&log, &core_types::AuditHash::Blake3).unwrap();
         assert_eq!(count, 2);
     }
 
     #[test]
     fn tampered_entry_detected() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
 
         logger
             .append(AuditAction::ProfileActivated {
@@ -183,7 +197,7 @@ mod tests {
         // Tamper with the first line
         log = log.replacen("10", "99", 1);
 
-        let result = verify_chain(&log);
+        let result = verify_chain(&log, &core_types::AuditHash::Blake3);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("chain broken"));
@@ -191,7 +205,7 @@ mod tests {
 
     #[test]
     fn empty_log_verifies() {
-        let count = verify_chain("").unwrap();
+        let count = verify_chain("", &core_types::AuditHash::Blake3).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -224,7 +238,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), String::new(), 0);
+            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), String::new(), 0, core_types::AuditHash::Blake3);
 
             logger.append(AuditAction::ProfileActivated { target: pid(1), duration_ms: 10 }).unwrap();
             logger.append(AuditAction::SecretAccessed { profile_id: pid(1), secret_ref: "k1".into() }).unwrap();
@@ -243,7 +257,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), last_hash, seq);
+            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), last_hash, seq, core_types::AuditHash::Blake3);
 
             logger.append(AuditAction::ProfileActivated { target: pid(2), duration_ms: 20 }).unwrap();
             logger.append(AuditAction::SecretAccessed { profile_id: pid(2), secret_ref: "k2".into() }).unwrap();
@@ -252,7 +266,7 @@ mod tests {
 
         // Verify the entire 5-entry chain is intact across the restart boundary
         let contents = std::fs::read_to_string(&path).unwrap();
-        let count = verify_chain(&contents).unwrap();
+        let count = verify_chain(&contents, &core_types::AuditHash::Blake3).unwrap();
         assert_eq!(count, 5, "chain must have 5 entries spanning 2 sessions");
 
         // Verify sequences are monotonic 1..=5
@@ -287,7 +301,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), String::new(), 0);
+            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), String::new(), 0, core_types::AuditHash::Blake3);
             logger.append(AuditAction::ProfileActivated { target: pid(1), duration_ms: 1 }).unwrap();
         }
 
@@ -307,7 +321,7 @@ mod tests {
     #[test]
     fn audit_chain_detects_deleted_entry() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
 
         for i in 1..=5 {
             logger
@@ -327,7 +341,7 @@ mod tests {
         tampered_lines.remove(2);
         let tampered_log = tampered_lines.join("\n");
 
-        let result = verify_chain(&tampered_log);
+        let result = verify_chain(&tampered_log, &core_types::AuditHash::Blake3);
         assert!(result.is_err(), "deleted entry must break chain verification");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -339,7 +353,7 @@ mod tests {
     #[test]
     fn audit_chain_detects_reordered_entries() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
 
         for i in 1..=4 {
             logger
@@ -359,7 +373,7 @@ mod tests {
         reordered_lines.swap(1, 2);
         let reordered_log = reordered_lines.join("\n");
 
-        let result = verify_chain(&reordered_log);
+        let result = verify_chain(&reordered_log, &core_types::AuditHash::Blake3);
         assert!(
             result.is_err(),
             "reordered entries must break chain verification"
@@ -374,7 +388,7 @@ mod tests {
     #[test]
     fn single_entry_chain() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
 
         logger
             .append(AuditAction::IsolationViolationAttempt {
@@ -384,6 +398,74 @@ mod tests {
             .unwrap();
 
         let log = String::from_utf8(buf).unwrap();
-        assert_eq!(verify_chain(&log).unwrap(), 1);
+        assert_eq!(verify_chain(&log, &core_types::AuditHash::Blake3).unwrap(), 1);
+    }
+
+    #[test]
+    fn sha256_append_and_verify_chain() {
+        let mut buf = Vec::new();
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Sha256);
+
+        logger
+            .append(AuditAction::ProfileActivated {
+                target: pid(1),
+                duration_ms: 42,
+            })
+            .unwrap();
+
+        logger
+            .append(AuditAction::SecretAccessed {
+                profile_id: pid(2),
+                secret_ref: "api-key".into(),
+            })
+            .unwrap();
+
+        assert_eq!(logger.sequence(), 2);
+
+        let log = String::from_utf8(buf).unwrap();
+        let count = verify_chain(&log, &core_types::AuditHash::Sha256).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn sha256_tampered_entry_detected() {
+        let mut buf = Vec::new();
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Sha256);
+
+        logger
+            .append(AuditAction::ProfileActivated {
+                target: pid(1),
+                duration_ms: 10,
+            })
+            .unwrap();
+
+        logger
+            .append(AuditAction::ProfileActivated {
+                target: pid(2),
+                duration_ms: 20,
+            })
+            .unwrap();
+
+        let mut log = String::from_utf8(buf).unwrap();
+        log = log.replacen("10", "99", 1);
+
+        let result = verify_chain(&log, &core_types::AuditHash::Sha256);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("chain broken"));
+    }
+
+    #[test]
+    fn sha256_and_blake3_produce_different_hashes() {
+        let mut buf_b3 = Vec::new();
+        let mut logger_b3 = AuditLogger::new(&mut buf_b3, String::new(), 0, core_types::AuditHash::Blake3);
+        logger_b3.append(AuditAction::ProfileActivated { target: pid(1), duration_ms: 1 }).unwrap();
+
+        let mut buf_sha = Vec::new();
+        let mut logger_sha = AuditLogger::new(&mut buf_sha, String::new(), 0, core_types::AuditHash::Sha256);
+        logger_sha.append(AuditAction::ProfileActivated { target: pid(1), duration_ms: 1 }).unwrap();
+
+        // The prev_hash in subsequent entries would differ, but since these are first entries
+        // with empty prev_hash, the JSON is the same. The internal last_hash should differ.
+        assert_ne!(logger_b3.last_hash(), logger_sha.last_hash());
     }
 }

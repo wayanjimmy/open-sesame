@@ -235,6 +235,14 @@ impl BusClient {
         self.epoch
     }
 
+    /// Set the installation identity on the message context.
+    ///
+    /// Subsequent messages sent through this client will carry the given
+    /// `InstallationId` in their `origin_installation` field.
+    pub fn set_installation(&mut self, installation: core_types::InstallationId) {
+        self.msg_ctx.installation = Some(installation);
+    }
+
     /// Connect to the IPC bus with keypair re-read on each attempt.
     ///
     /// On crash-restart, daemon-profile may regenerate the daemon's keypair.

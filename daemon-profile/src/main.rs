@@ -176,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
         .open(&audit_path)
         .context("failed to open audit log")?;
     let audit_writer = std::io::BufWriter::new(audit_file);
-    let mut audit = AuditLogger::new(audit_writer, last_hash, sequence);
+    let mut audit = AuditLogger::new(audit_writer, last_hash, sequence, core_types::AuditHash::Blake3);
     tracing::info!(
         path = %audit_path.display(),
         sequence = audit.sequence(),
@@ -214,7 +214,47 @@ async fn main() -> anyhow::Result<()> {
     // This lets daemon-profile receive and process messages (StatusRequest,
     // ProfileActivate, ProfileList, etc.) that clients send to the bus.
     let daemon_id = DaemonId::new();
-    let msg_ctx = core_ipc::MessageContext::new(daemon_id);
+
+    // Build default AgentIdentity representing the human operator.
+    let uid = rustix::process::getuid().as_raw();
+    let default_agent_id = core_types::AgentId::from_uuid(uuid::Uuid::new_v5(
+        &PROFILE_NS, format!("agent:human:uid{uid}").as_bytes()
+    ));
+
+    let installation_id = match core_config::load_installation() {
+        Ok(inst) => core_types::InstallationId {
+            id: inst.id,
+            org_ns: None,
+            namespace: inst.namespace,
+            machine_binding: None,
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load installation config, using default InstallationId");
+            core_types::InstallationId {
+                id: uuid::Uuid::nil(),
+                org_ns: None,
+                namespace: PROFILE_NS,
+                machine_binding: None,
+            }
+        }
+    };
+
+    let _default_agent = core_types::AgentIdentity {
+        id: default_agent_id,
+        agent_type: core_types::AgentType::Human,
+        local_id: core_types::LocalAgentId::UnixUid(uid),
+        installation: installation_id.clone(),
+        attestations: vec![],
+        session_scope: core_types::CapabilitySet::all(),
+        delegation_chain: vec![],
+    };
+
+    let msg_ctx = core_ipc::MessageContext {
+        sender: daemon_id,
+        installation: Some(installation_id),
+        agent_id: Some(default_agent_id),
+        trust_snapshot: None,
+    };
     let (host_tx, mut host_rx) = mpsc::channel::<Vec<u8>>(256);
     let host_peer = core_ipc::PeerCredentials::in_process();
     bus.register(
@@ -1129,7 +1169,7 @@ fn load_audit_state(path: &PathBuf) -> (String, u64) {
 fn verify_audit_chain(path: &PathBuf) -> anyhow::Result<u64> {
     let contents = std::fs::read_to_string(path)
         .context("failed to read audit log")?;
-    core_profile::verify_chain(&contents)
+    core_profile::verify_chain(&contents, &core_types::AuditHash::Blake3)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 

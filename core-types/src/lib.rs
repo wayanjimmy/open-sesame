@@ -1692,7 +1692,7 @@ pub fn validate_secret_key(key: &str) -> Result<()> {
 /// - No whitespace, no path separators, no null bytes
 ///
 /// Maps 1:1 to a `SQLCipher` vault file: `vaults/{name}.db`
-/// Maps 1:1 to a BLAKE3 KDF context: `"pds v1 vault-key {name}"`
+/// Maps 1:1 to a BLAKE3 KDF context: `"pds v2 vault-key {name}"`
 /// Maps 1:1 to a frecency DB: `launcher/{name}.frecency.db`
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]

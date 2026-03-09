@@ -23,6 +23,7 @@ dirs         = { workspace = true }
 snow         = { workspace = true }
 uuid         = { workspace = true }
 zeroize      = { workspace = true }
+rustix       = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux      = { workspace = true }

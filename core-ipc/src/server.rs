@@ -43,6 +43,8 @@ struct ConnectionState {
     peer: crate::transport::PeerCredentials,
     security_clearance: SecurityLevel,
     subscriptions: Vec<SubscriptionFilter>,
+    /// Trust assessment computed at connection time from handshake evidence.
+    trust_vector: Option<core_types::TrustVector>,
 }
 
 /// Shared state for the bus server, accessible from per-connection tasks.
@@ -295,6 +297,7 @@ impl BusServer {
             security_clearance,
             subscriptions,
             peer,
+            trust_vector: None,
         };
         self.state.connections.write().await.insert(conn_id, state);
         tracing::info!(%daemon_id, conn_id, "subscriber registered (in-process)");
@@ -530,6 +533,16 @@ async fn handle_connection(
 
     // Register connection AFTER handshake succeeds — no frames can arrive
     // on `tx` before the writer task is ready to handle them.
+    // Compute initial trust vector from handshake evidence.
+    let trust_vector = core_types::TrustVector {
+        authn_strength: core_types::TrustLevel::Low,
+        authz_freshness: std::time::Duration::ZERO,
+        delegation_depth: 0,
+        device_posture: 0.0,
+        network_exposure: core_types::NetworkTrust::Local,
+        agent_type: core_types::AgentType::Human,
+    };
+
     let conn = ConnectionState {
         daemon_id: None,
         verified_name,
@@ -537,6 +550,7 @@ async fn handle_connection(
         peer: peer_creds,
         security_clearance,
         subscriptions: vec![],
+        trust_vector: Some(trust_vector),
     };
     state.connections.write().await.insert(conn_id, conn);
 
@@ -644,6 +658,7 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
     // Update daemon_id, enforce sender clearance, and capture verified_name
     // in a single lock acquisition to prevent TOCTOU.
     let verified_name: Option<String>;
+    let conn_trust_vector: Option<core_types::TrustVector>;
     {
         let mut conns = state.connections.write().await;
         if let Some(conn) = conns.get_mut(&sender_conn_id) {
@@ -706,10 +721,12 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
                 return;
             }
 
-            // Capture verified_name from Noise IK registry lookup.
+            // Capture verified_name and trust_vector from connection state.
             verified_name = conn.verified_name.clone();
+            conn_trust_vector = conn.trust_vector.clone();
         } else {
             verified_name = None;
+            conn_trust_vector = None;
         }
     }
 
@@ -756,6 +773,9 @@ async fn route_frame(state: &ServerState, sender_conn_id: u64, payload: &[u8]) {
     // Note: re-encode adds serialization overhead on every routed frame. For a
     // local IPC bus with <10 daemons this is negligible (~µs per frame).
     msg.verified_sender_name = verified_name;
+    if msg.trust_snapshot.is_none() {
+        msg.trust_snapshot = conn_trust_vector;
+    }
     let stamped_payload = match encode_frame(&msg) {
         Ok(p) => p,
         Err(e) => {

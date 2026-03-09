@@ -39,7 +39,7 @@ fn derive_32(context: &str, ikm: &[u8]) -> SecureBytes {
 /// Context strings should be globally unique and hardcoded per the BLAKE3
 /// spec. We include the version for forward compatibility with key rotation.
 fn build_context(purpose: &str, profile_id: &str) -> String {
-    format!("pds v1 {purpose} {profile_id}")
+    format!("pds v2 {purpose} {profile_id}")
 }
 
 /// Derive the per-profile vault key for SQLCipher database encryption.
@@ -96,7 +96,7 @@ pub fn derive_kek(password: &[u8], salt: &[u8]) -> SecureBytes {
     let mut ikm = Vec::with_capacity(password.len() + salt.len());
     ikm.extend_from_slice(password);
     ikm.extend_from_slice(salt);
-    let key = derive_32("pds v1 key-encrypting-key", &ikm);
+    let key = derive_32("pds v2 key-encrypting-key", &ikm);
     // Zeroize the concatenated IKM before it goes out of scope.
     ikm.zeroize();
     key

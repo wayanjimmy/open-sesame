@@ -41,6 +41,10 @@ enum Command {
         /// Destroy ALL Open Sesame data and reset to clean state.
         #[arg(long)]
         wipe_reset_destroy_all_data: bool,
+
+        /// Organization domain for namespace scoping (e.g., "braincraft.io").
+        #[arg(long)]
+        org: Option<String>,
     },
 
     /// Show daemon status, active profiles, and lock state.
@@ -346,11 +350,11 @@ async fn main() {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Init { no_keybinding, wipe_reset_destroy_all_data } => {
+        Command::Init { no_keybinding, wipe_reset_destroy_all_data, org } => {
             if wipe_reset_destroy_all_data {
                 init::cmd_wipe()
             } else {
-                init::cmd_init(no_keybinding).await
+                init::cmd_init(no_keybinding, org).await
             }
         }
         Command::Status => cmd_status().await,
@@ -440,9 +444,25 @@ pub(crate) async fn connect() -> anyhow::Result<BusClient> {
     let client_keypair = core_ipc::generate_keypair()
         .context("failed to generate ephemeral keypair")?;
 
-    BusClient::connect_encrypted(daemon_id, &socket_path, &server_pub, client_keypair.as_inner())
+    let mut client = BusClient::connect_encrypted(daemon_id, &socket_path, &server_pub, client_keypair.as_inner())
         .await
-        .context("failed to connect to IPC bus — is daemon-profile running?")
+        .context("failed to connect to IPC bus — is daemon-profile running?")?;
+
+    // Populate origin_installation on outbound messages if installation.toml exists.
+    if let Ok(install_config) = core_config::load_installation() {
+        let install_id = core_types::InstallationId {
+            id: install_config.id,
+            org_ns: install_config.org.map(|o| core_types::OrganizationNamespace {
+                domain: o.domain,
+                namespace: o.namespace,
+            }),
+            namespace: install_config.namespace,
+            machine_binding: None,
+        };
+        client.set_installation(install_id);
+    }
+
+    Ok(client)
 }
 
 /// Send an RPC request and wait for the correlated response.
@@ -873,7 +893,7 @@ fn cmd_audit_verify() -> anyhow::Result<()> {
     let contents = std::fs::read_to_string(&audit_path)
         .context("failed to read audit log")?;
 
-    match core_profile::verify_chain(&contents) {
+    match core_profile::verify_chain(&contents, &core_types::AuditHash::Blake3) {
         Ok(count) => {
             println!(
                 "{} {} entries verified.",
