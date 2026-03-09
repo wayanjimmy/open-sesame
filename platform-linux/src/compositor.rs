@@ -678,13 +678,23 @@ impl CosmicBackend {
             core_types::Error::Platform(format!("op_lock poisoned: {e}"))
         })?;
 
-        use wayland_client::globals::registry_queue_init;
+        use wayland_client::{Connection, globals::registry_queue_init};
         use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
         use cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1;
         use cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1;
 
-        let (globals, mut event_queue) = registry_queue_init::<CosmicEnumState>(&self.conn).map_err(|e| {
-            let proto_err = self.conn.protocol_error();
+        // Use a SEPARATE Wayland connection for activation. cosmic-comp panics
+        // when we destroy protocol objects while activation is in flight, so we
+        // intentionally leak them. When the EventQueue drops with leaked objects,
+        // it causes a broken pipe on its connection. Using a disposable connection
+        // here isolates the shared `self.conn` (used by enumerate/polling) from
+        // this breakage.
+        let activate_conn = Connection::connect_to_env().map_err(|e| {
+            core_types::Error::Platform(format!("Wayland activation connection failed: {e}"))
+        })?;
+
+        let (globals, mut event_queue) = registry_queue_init::<CosmicEnumState>(&activate_conn).map_err(|e| {
+            let proto_err = activate_conn.protocol_error();
             core_types::Error::Platform(format!(
                 "registry init failed: {e} (protocol_error: {proto_err:?})"
             ))
@@ -714,7 +724,7 @@ impl CosmicBackend {
         };
 
         // Roundtrip 1: enumerate toplevels.
-        cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
+        cosmic_roundtrip(&activate_conn, &mut event_queue, &mut state)?;
 
         // Find target window by deterministic UUID mapping.
         let target_handle = state.toplevels.iter()
@@ -736,13 +746,13 @@ impl CosmicBackend {
         let cosmic_handle = info.get_cosmic_toplevel(&target_handle, &qh, ());
 
         // Roundtrip 2: receive cosmic handle.
-        cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
+        cosmic_roundtrip(&activate_conn, &mut event_queue, &mut state)?;
 
         // Activate.
         manager.activate(&cosmic_handle, &seat);
 
         // Roundtrip 3: ensure activation is processed.
-        cosmic_roundtrip(&self.conn, &mut event_queue, &mut state)?;
+        cosmic_roundtrip(&activate_conn, &mut event_queue, &mut state)?;
 
         tracing::info!(window_id = %target_id, "cosmic: window activated");
 
@@ -751,10 +761,10 @@ impl CosmicBackend {
         // cosmic_handle or manager while an activation is in flight. The
         // panic kills the entire COSMIC desktop session.
         //
-        // Letting the EventQueue drop without cleanup may cause a broken
-        // pipe on the shared Connection, but that only kills daemon-wm
-        // (which auto-restarts). A compositor panic kills every application.
-        let _ = self.conn.flush();
+        // The leaked objects cause a broken pipe when EventQueue drops, but
+        // this only affects `activate_conn` (disposable). The shared `self.conn`
+        // used by enumerate/polling remains healthy.
+        let _ = activate_conn.flush();
 
         Ok(())
     }

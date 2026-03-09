@@ -822,6 +822,20 @@ fn apply_sandbox() {
                 .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
             access: FsAccess::ReadOnly,
         },
+        // DRI devices: GPU-accelerated rendering for GTK4/Cairo overlay.
+        // Without this, GTK4 falls back to software rendering (llvmpipe) which
+        // takes ~5 seconds per frame vs <16ms with hardware acceleration.
+        LandlockRule {
+            path: std::path::PathBuf::from("/dev/dri"),
+            access: FsAccess::ReadWrite,
+        },
+        // GTK4 user CSS (theme overrides).
+        LandlockRule {
+            path: dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
+                .join("gtk-4.0"),
+            access: FsAccess::ReadOnly,
+        },
     ];
 
     let seccomp = SeccompProfile {
