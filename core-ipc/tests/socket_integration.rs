@@ -196,6 +196,119 @@ async fn request_response_correlation() {
 }
 
 #[tokio::test]
+async fn launch_execute_response_roundtrip() {
+    let (server, dir, server_pub, kps) = start_server_with_clients(2).await;
+    let sock = dir.path().join("bus.sock");
+
+    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let cli_client = connect_with_keypair(did(1), &sock, &server_pub, &kps[0]).await;
+    let mut launcher = connect_with_keypair(did(2), &sock, &server_pub, &kps[1]).await;
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // CLI sends LaunchExecute request.
+    let response_handle = tokio::spawn(async move {
+        cli_client
+            .request(
+                EventKind::LaunchExecute {
+                    entry_id: "firefox".into(),
+                    profile: Some(TrustProfileName::try_from("default").unwrap()),
+                },
+                SecurityLevel::Internal,
+                Duration::from_secs(2),
+            )
+            .await
+    });
+
+    // Launcher receives the request.
+    let request_msg = tokio::time::timeout(Duration::from_millis(500), launcher.recv())
+        .await
+        .expect("timeout waiting for LaunchExecute")
+        .expect("channel closed");
+
+    assert!(matches!(request_msg.payload, EventKind::LaunchExecute { .. }));
+
+    // Launcher sends success response with pid and no error.
+    let msg_ctx = core_ipc::MessageContext::new(did(2));
+    let response = Message::new(
+        &msg_ctx,
+        EventKind::LaunchExecuteResponse { pid: 12345, error: None },
+        SecurityLevel::Internal,
+        launcher.epoch(),
+    )
+    .with_correlation(request_msg.msg_id);
+
+    launcher.send(&response).await.unwrap();
+
+    let result = response_handle.await.unwrap().unwrap();
+    match result.payload {
+        EventKind::LaunchExecuteResponse { pid, error } => {
+            assert_eq!(pid, 12345);
+            assert!(error.is_none());
+        }
+        other => panic!("expected LaunchExecuteResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn launch_execute_error_roundtrip() {
+    let (server, dir, server_pub, kps) = start_server_with_clients(2).await;
+    let sock = dir.path().join("bus.sock");
+
+    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let cli_client = connect_with_keypair(did(1), &sock, &server_pub, &kps[0]).await;
+    let mut launcher = connect_with_keypair(did(2), &sock, &server_pub, &kps[1]).await;
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let response_handle = tokio::spawn(async move {
+        cli_client
+            .request(
+                EventKind::LaunchExecute {
+                    entry_id: "nonexistent".into(),
+                    profile: None,
+                },
+                SecurityLevel::Internal,
+                Duration::from_secs(2),
+            )
+            .await
+    });
+
+    let request_msg = tokio::time::timeout(Duration::from_millis(500), launcher.recv())
+        .await
+        .expect("timeout waiting for LaunchExecute")
+        .expect("channel closed");
+
+    // Launcher sends failure response with error message.
+    let msg_ctx = core_ipc::MessageContext::new(did(2));
+    let response = Message::new(
+        &msg_ctx,
+        EventKind::LaunchExecuteResponse {
+            pid: 0,
+            error: Some("desktop entry 'nonexistent' not found".into()),
+        },
+        SecurityLevel::Internal,
+        launcher.epoch(),
+    )
+    .with_correlation(request_msg.msg_id);
+
+    launcher.send(&response).await.unwrap();
+
+    let result = response_handle.await.unwrap().unwrap();
+    match result.payload {
+        EventKind::LaunchExecuteResponse { pid, error } => {
+            assert_eq!(pid, 0);
+            assert!(error.as_ref().is_some_and(|e| e.contains("not found")));
+        }
+        other => panic!("expected LaunchExecuteResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn sender_does_not_receive_own_message() {
     let (server, dir, server_pub) = start_server().await;
     let sock = dir.path().join("bus.sock");
