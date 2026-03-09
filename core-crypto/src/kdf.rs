@@ -3,6 +3,10 @@
 //! Argon2id for password-based key derivation (OWASP recommended).
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use core_types::KdfAlgorithm;
+use hmac::Hmac;
+use pbkdf2::pbkdf2;
+use sha2::Sha256;
 use zeroize::Zeroize;
 
 use crate::SecureBytes;
@@ -40,6 +44,30 @@ pub fn derive_key_argon2(password: &[u8], salt: &[u8; 16]) -> core_types::Result
     let result = SecureBytes::new(key.to_vec());
     key.zeroize();
     Ok(result)
+}
+
+/// Derive a 32-byte key from a password using PBKDF2-HMAC-SHA256.
+///
+/// Uses 600,000 iterations per OWASP recommendations for PBKDF2-SHA256.
+/// Returns `SecureBytes` (mlock'd, zeroize-on-drop).
+pub fn derive_key_pbkdf2(password: &[u8], salt: &[u8; 16]) -> core_types::Result<SecureBytes> {
+    let mut key = [0u8; 32];
+    pbkdf2::<Hmac<Sha256>>(password, salt, 600_000, &mut key)
+        .map_err(|e| core_types::Error::Crypto(format!("pbkdf2 derivation failed: {e}")))?;
+
+    let result = SecureBytes::new(key.to_vec());
+    key.zeroize();
+    Ok(result)
+}
+
+/// Dispatch key derivation based on the configured KDF algorithm.
+///
+/// Routes to either Argon2id or PBKDF2-SHA256 depending on the algorithm.
+pub fn derive_key_kdf(algorithm: &KdfAlgorithm, password: &[u8], salt: &[u8; 16]) -> core_types::Result<SecureBytes> {
+    match algorithm {
+        KdfAlgorithm::Argon2id => derive_key_argon2(password, salt),
+        KdfAlgorithm::Pbkdf2Sha256 => derive_key_pbkdf2(password, salt),
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +138,43 @@ mod tests {
             diff_count > 24,
             "Argon2id should exhibit strong avalanche: expected >24 differing bytes, got {diff_count}"
         );
+    }
+
+    #[test]
+    fn pbkdf2_produces_32_byte_key() {
+        let key = derive_key_pbkdf2(b"test-password", &[0xAA; 16]).unwrap();
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn pbkdf2_deterministic() {
+        let k1 = derive_key_pbkdf2(b"deterministic", &[0xBB; 16]).unwrap();
+        let k2 = derive_key_pbkdf2(b"deterministic", &[0xBB; 16]).unwrap();
+        assert_eq!(k1.as_bytes(), k2.as_bytes());
+    }
+
+    #[test]
+    fn pbkdf2_different_passwords_different_keys() {
+        let salt = [0xCC; 16];
+        let k1 = derive_key_pbkdf2(b"password1", &salt).unwrap();
+        let k2 = derive_key_pbkdf2(b"password2", &salt).unwrap();
+        assert_ne!(k1.as_bytes(), k2.as_bytes());
+    }
+
+    #[test]
+    fn dispatch_argon2id() {
+        let salt = [0xDD; 16];
+        let direct = derive_key_argon2(b"test", &salt).unwrap();
+        let dispatched = derive_key_kdf(&KdfAlgorithm::Argon2id, b"test", &salt).unwrap();
+        assert_eq!(direct.as_bytes(), dispatched.as_bytes());
+    }
+
+    #[test]
+    fn dispatch_pbkdf2() {
+        let salt = [0xEE; 16];
+        let direct = derive_key_pbkdf2(b"test", &salt).unwrap();
+        let dispatched = derive_key_kdf(&KdfAlgorithm::Pbkdf2Sha256, b"test", &salt).unwrap();
+        assert_eq!(direct.as_bytes(), dispatched.as_bytes());
     }
 
     #[test]

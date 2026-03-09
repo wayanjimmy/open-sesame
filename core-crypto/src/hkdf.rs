@@ -14,6 +14,9 @@
 //! which is hardcoded per purpose and concatenated with the profile ID.
 
 use crate::SecureBytes;
+use core_types::HkdfAlgorithm;
+use hkdf::Hkdf;
+use sha2::Sha256;
 use zeroize::Zeroize;
 
 /// Derive a 32-byte key using BLAKE3's KDF mode.
@@ -108,6 +111,69 @@ pub fn derive_key(master_key: &[u8], purpose: &str, profile_id: &str) -> SecureB
     derive_32(&ctx, master_key)
 }
 
+// ============================================================================
+// HKDF-SHA256 alternatives
+// ============================================================================
+
+/// Derive a 32-byte key using HKDF-SHA256 (extract-then-expand).
+///
+/// The `context` string is used as the HKDF info parameter for domain separation.
+/// The IKM serves as both the HKDF input keying material and implicit salt.
+fn derive_32_hkdf_sha256(context: &str, ikm: &[u8]) -> SecureBytes {
+    let hk = Hkdf::<Sha256>::new(None, ikm);
+    let mut key = [0u8; 32];
+    hk.expand(context.as_bytes(), &mut key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    let result = SecureBytes::new(key.to_vec());
+    key.zeroize();
+    result
+}
+
+/// Derive the per-profile vault key using the specified HKDF algorithm.
+pub fn derive_vault_key_with_algorithm(algorithm: &HkdfAlgorithm, master_key: &[u8], profile_id: &str) -> SecureBytes {
+    let ctx = build_context("vault-key", profile_id);
+    match algorithm {
+        HkdfAlgorithm::Blake3 => derive_32(&ctx, master_key),
+        HkdfAlgorithm::HkdfSha256 => derive_32_hkdf_sha256(&ctx, master_key),
+    }
+}
+
+/// Derive the per-profile clipboard key using the specified HKDF algorithm.
+pub fn derive_clipboard_key_with_algorithm(algorithm: &HkdfAlgorithm, master_key: &[u8], profile_id: &str) -> SecureBytes {
+    let ctx = build_context("clipboard-key", profile_id);
+    match algorithm {
+        HkdfAlgorithm::Blake3 => derive_32(&ctx, master_key),
+        HkdfAlgorithm::HkdfSha256 => derive_32_hkdf_sha256(&ctx, master_key),
+    }
+}
+
+/// Derive the per-profile IPC auth token using the specified HKDF algorithm.
+pub fn derive_ipc_auth_token_with_algorithm(algorithm: &HkdfAlgorithm, master_key: &[u8], profile_id: &str) -> SecureBytes {
+    let ctx = build_context("ipc-auth-token", profile_id);
+    match algorithm {
+        HkdfAlgorithm::Blake3 => derive_32(&ctx, master_key),
+        HkdfAlgorithm::HkdfSha256 => derive_32_hkdf_sha256(&ctx, master_key),
+    }
+}
+
+/// Derive the per-profile IPC encryption key using the specified HKDF algorithm.
+pub fn derive_ipc_encryption_key_with_algorithm(algorithm: &HkdfAlgorithm, master_key: &[u8], profile_id: &str) -> SecureBytes {
+    let ctx = build_context("ipc-encryption-key", profile_id);
+    match algorithm {
+        HkdfAlgorithm::Blake3 => derive_32(&ctx, master_key),
+        HkdfAlgorithm::HkdfSha256 => derive_32_hkdf_sha256(&ctx, master_key),
+    }
+}
+
+/// Derive an arbitrary per-purpose key using the specified HKDF algorithm.
+pub fn derive_key_with_algorithm(algorithm: &HkdfAlgorithm, master_key: &[u8], purpose: &str, profile_id: &str) -> SecureBytes {
+    let ctx = build_context(purpose, profile_id);
+    match algorithm {
+        HkdfAlgorithm::Blake3 => derive_32(&ctx, master_key),
+        HkdfAlgorithm::HkdfSha256 => derive_32_hkdf_sha256(&ctx, master_key),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +262,42 @@ mod tests {
         let ct = enc_key.encrypt(&nonce, plaintext).unwrap();
         let pt = enc_key.decrypt(&nonce, &ct).unwrap();
         assert_eq!(pt.as_bytes(), plaintext);
+    }
+
+    #[test]
+    fn blake3_and_hkdf_sha256_produce_different_keys() {
+        let mk = test_master_key();
+        let pid = "profile-1";
+        let blake3_key = derive_vault_key_with_algorithm(&HkdfAlgorithm::Blake3, &mk, pid);
+        let sha256_key = derive_vault_key_with_algorithm(&HkdfAlgorithm::HkdfSha256, &mk, pid);
+        assert_ne!(
+            blake3_key.as_bytes(), sha256_key.as_bytes(),
+            "BLAKE3 and HKDF-SHA256 must produce different keys for the same inputs"
+        );
+    }
+
+    #[test]
+    fn hkdf_sha256_deterministic() {
+        let mk = test_master_key();
+        let k1 = derive_vault_key_with_algorithm(&HkdfAlgorithm::HkdfSha256, &mk, "profile-1");
+        let k2 = derive_vault_key_with_algorithm(&HkdfAlgorithm::HkdfSha256, &mk, "profile-1");
+        assert_eq!(k1.as_bytes(), k2.as_bytes());
+    }
+
+    #[test]
+    fn hkdf_sha256_different_profiles_different_keys() {
+        let mk = test_master_key();
+        let k1 = derive_vault_key_with_algorithm(&HkdfAlgorithm::HkdfSha256, &mk, "profile-1");
+        let k2 = derive_vault_key_with_algorithm(&HkdfAlgorithm::HkdfSha256, &mk, "profile-2");
+        assert_ne!(k1.as_bytes(), k2.as_bytes());
+    }
+
+    #[test]
+    fn dispatch_with_algorithm_matches_direct() {
+        let mk = test_master_key();
+        let direct = derive_vault_key(&mk, "profile-1");
+        let dispatched = derive_vault_key_with_algorithm(&HkdfAlgorithm::Blake3, &mk, "profile-1");
+        assert_eq!(direct.as_bytes(), dispatched.as_bytes());
     }
 
     #[test]

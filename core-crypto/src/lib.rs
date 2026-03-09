@@ -16,5 +16,10 @@ pub mod hkdf;
 
 pub use secure_bytes::SecureBytes;
 pub use encryption::EncryptionKey;
-pub use kdf::derive_key_argon2;
-pub use hkdf::{derive_vault_key, derive_clipboard_key, derive_ipc_auth_token, derive_ipc_encryption_key, derive_kek, derive_key};
+pub use kdf::{derive_key_argon2, derive_key_pbkdf2, derive_key_kdf};
+pub use hkdf::{
+    derive_vault_key, derive_clipboard_key, derive_ipc_auth_token, derive_ipc_encryption_key, derive_kek, derive_key,
+    derive_vault_key_with_algorithm, derive_clipboard_key_with_algorithm,
+    derive_ipc_auth_token_with_algorithm, derive_ipc_encryption_key_with_algorithm,
+    derive_key_with_algorithm,
+};

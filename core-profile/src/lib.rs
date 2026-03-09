@@ -7,8 +7,9 @@
 pub mod context;
 pub mod audit;
 
-use core_types::{AppId, ProfileId};
+use core_types::{AgentId, AgentType, AppId, InstallationId, ProfileId, TrustProfileName};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub use context::ContextEngine;
 pub use audit::{AuditLogger, verify_chain};
@@ -101,6 +102,19 @@ pub enum AuditAction {
         requester_name: Option<String>,
         outcome: String,
     },
+    AgentConnected { agent_id: AgentId, agent_type: AgentType },
+    AgentDisconnected { agent_id: AgentId, reason: String },
+    InstallationCreated { id: InstallationId, org: Option<String>, machine_binding_present: bool },
+    ProfileIdMigrated { name: TrustProfileName, old_id: ProfileId, new_id: ProfileId },
+    AuthorizationRequired { request_id: Uuid, operation: String },
+    AuthorizationGranted { request_id: Uuid, delegator: AgentId, scope: String },
+    AuthorizationDenied { request_id: Uuid, reason: String },
+    AuthorizationTimeout { request_id: Uuid },
+    DelegationRevoked { delegation_id: Uuid, revoker: AgentId, reason: String },
+    HeartbeatRenewed { delegation_id: Uuid, renewal_source: AgentId },
+    FederationSessionEstablished { session_id: Uuid, remote_installation: InstallationId },
+    FederationSessionTerminated { session_id: Uuid, reason: String },
+    PostureEvaluated { composite_score: f64 },
 }
 
 #[cfg(test)]

@@ -753,6 +753,21 @@ async fn handle_bus_message<W: std::io::Write>(
             None
         }
 
+        // Agent and federation lifecycle events — no action needed in profile daemon.
+        EventKind::AgentConnected { .. } => None,
+        EventKind::AgentDisconnected { .. } => None,
+        EventKind::InstallationCreated { .. } => None,
+        EventKind::ProfileIdMigrated { .. } => None,
+        EventKind::AuthorizationRequired { .. } => None,
+        EventKind::AuthorizationGrant { .. } => None,
+        EventKind::AuthorizationDenied { .. } => None,
+        EventKind::AuthorizationTimeout { .. } => None,
+        EventKind::DelegationRevoked { .. } => None,
+        EventKind::HeartbeatRenewed { .. } => None,
+        EventKind::FederationSessionEstablished { .. } => None,
+        EventKind::FederationSessionTerminated { .. } => None,
+        EventKind::PostureEvaluated { .. } => None,
+
         _ => None,
     }
 }
