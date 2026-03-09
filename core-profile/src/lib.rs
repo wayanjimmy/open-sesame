@@ -78,6 +78,9 @@ pub struct AuditEntry {
     pub action: AuditAction,
     /// BLAKE3 hash of the previous entry (hex string). Empty for first entry.
     pub prev_hash: String,
+    /// Optional agent identity that triggered this action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<core_types::AgentId>,
 }
 
 /// Auditable profile actions.
@@ -139,6 +142,7 @@ mod tests {
                 duration_ms: 42,
             },
             prev_hash: String::new(),
+            agent_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: AuditEntry = serde_json::from_str(&json).unwrap();

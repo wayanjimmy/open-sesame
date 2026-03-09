@@ -45,8 +45,8 @@ const KEY_ROTATION_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Grace period (seconds) for daemons to reconnect with new keys after rotation.
 const KEY_ROTATION_GRACE: u32 = 30;
 
-/// Deterministic UUID v5 namespace for profile IDs.
-/// Pre-computed: uuid5(NAMESPACE_URL, "https://scopecreep.zip/open-sesame/profiles").
+/// Level 0 namespace seed. Never use directly for ProfileId derivation — use install_ns instead.
+#[allow(dead_code)]
 const PROFILE_NS: uuid::Uuid = uuid::Uuid::from_bytes([
     0x4c, 0x45, 0xa6, 0x4f, 0xab, 0xcd, 0x59, 0x77,
     0xbc, 0x73, 0x99, 0xd4, 0xc9, 0x3d, 0x66, 0x8b,
@@ -106,6 +106,10 @@ async fn main() -> anyhow::Result<()> {
     // -- Config --
     let config = core_config::load_config(None)
         .context("failed to load config")?;
+
+    let install_config = core_config::load_installation()
+        .context("installation.toml not found — run `sesame init` first")?;
+    let install_ns = install_config.namespace;
 
     let mut default_profile_name: TrustProfileName = config.global.default_profile.clone();
     // Collect all configured profile names so ProfileList can report them
@@ -167,6 +171,12 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind IPC bus server")?;
     tracing::info!(path = %socket_path.display(), "IPC bus server bound (Noise IK encrypted)");
 
+    // -- Default agent identity (needed by audit logger) --
+    let uid = rustix::process::getuid().as_raw();
+    let default_agent_id = core_types::AgentId::from_uuid(uuid::Uuid::new_v5(
+        &install_ns, format!("agent:human:uid{uid}").as_bytes()
+    ));
+
     // -- Audit logger --
     let audit_path = core_config::config_dir().join("audit.jsonl");
     let (last_hash, sequence) = load_audit_state(&audit_path);
@@ -176,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
         .open(&audit_path)
         .context("failed to open audit log")?;
     let audit_writer = std::io::BufWriter::new(audit_file);
-    let mut audit = AuditLogger::new(audit_writer, last_hash, sequence, core_types::AuditHash::Blake3);
+    let mut audit = AuditLogger::new(audit_writer, last_hash, sequence, core_types::AuditHash::Blake3, Some(default_agent_id));
     tracing::info!(
         path = %audit_path.display(),
         sequence = audit.sequence(),
@@ -192,8 +202,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // -- Context engine --
-    let default_id = core_types::ProfileId::new();
-    let profiles = build_activation_rules(&config, default_id);
+    let default_id = core_types::ProfileId::from_uuid(
+        uuid::Uuid::new_v5(&install_ns, format!("profile:{}", default_profile_name).as_bytes()),
+    );
+    let profiles = build_activation_rules(&config, default_id, &install_ns);
     let mut context_engine = ContextEngine::new(profiles, default_id);
     tracing::info!(
         profile = %default_id,
@@ -216,27 +228,11 @@ async fn main() -> anyhow::Result<()> {
     let daemon_id = DaemonId::new();
 
     // Build default AgentIdentity representing the human operator.
-    let uid = rustix::process::getuid().as_raw();
-    let default_agent_id = core_types::AgentId::from_uuid(uuid::Uuid::new_v5(
-        &PROFILE_NS, format!("agent:human:uid{uid}").as_bytes()
-    ));
-
-    let installation_id = match core_config::load_installation() {
-        Ok(inst) => core_types::InstallationId {
-            id: inst.id,
-            org_ns: None,
-            namespace: inst.namespace,
-            machine_binding: None,
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load installation config, using default InstallationId");
-            core_types::InstallationId {
-                id: uuid::Uuid::nil(),
-                org_ns: None,
-                namespace: PROFILE_NS,
-                machine_binding: None,
-            }
-        }
+    let installation_id = core_types::InstallationId {
+        id: install_config.id,
+        org_ns: None,
+        namespace: install_ns,
+        machine_binding: None,
     };
 
     let _default_agent = core_types::AgentIdentity {
@@ -423,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
                     &confirm_tx,
                     &mut confirm_rx,
                     &config_profile_names,
+                    &install_ns,
                 ).await {
                     let reply = Message::new(
                         &msg_ctx,
@@ -492,8 +489,10 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("config reload detected, rebuilding context engine rules");
                 if let Ok(guard) = live_config.read() {
                     let new_default_name: TrustProfileName = guard.global.default_profile.clone();
-                    let new_default_id = core_types::ProfileId::new();
-                    let new_rules = build_activation_rules(&guard, new_default_id);
+                    let new_default_id = core_types::ProfileId::from_uuid(
+                        uuid::Uuid::new_v5(&install_ns, format!("profile:{}", new_default_name).as_bytes()),
+                    );
+                    let new_rules = build_activation_rules(&guard, new_default_id, &install_ns);
                     context_engine = ContextEngine::new(new_rules, new_default_id);
                     // Update the default_profile_name used by RPC handlers.
                     default_profile_name = new_default_name;
@@ -548,6 +547,7 @@ async fn handle_bus_message<W: std::io::Write>(
     confirm_tx: &mpsc::Sender<Vec<u8>>,
     confirm_rx: &mut mpsc::Receiver<Vec<u8>>,
     config_profile_names: &[TrustProfileName],
+    install_ns: &uuid::Uuid,
 ) -> Option<EventKind> {
     let msg_ctx = core_ipc::MessageContext::new(daemon_id);
     match &msg.payload {
@@ -671,7 +671,7 @@ async fn handle_bus_message<W: std::io::Write>(
             // calls and restarts, matching the IDs used in build_activation_rules().
             let profiles = config_profile_names.iter().map(|name| {
                 let id = core_types::ProfileId::from_uuid(
-                    uuid::Uuid::new_v5(&PROFILE_NS, name.as_ref().as_bytes()),
+                    uuid::Uuid::new_v5(install_ns, format!("profile:{}", name).as_bytes()),
                 );
                 core_types::ProfileSummary {
                     id,
@@ -1075,6 +1075,7 @@ async fn rotate_keys_phase2<W: std::io::Write>(
 fn build_activation_rules(
     config: &core_config::Config,
     default_id: core_types::ProfileId,
+    install_ns: &uuid::Uuid,
 ) -> Vec<ProfileActivation> {
     use core_profile::context::{ActivationRule, RuleTrigger};
 
@@ -1118,9 +1119,8 @@ fn build_activation_rules(
         let profile_id = if name == &config.global.default_profile.to_string() {
             default_id
         } else {
-            // UUID v5 in a project-specific namespace keyed on profile name — deterministic.
             core_types::ProfileId::from_uuid(
-                uuid::Uuid::new_v5(&PROFILE_NS, name.as_bytes()),
+                uuid::Uuid::new_v5(install_ns, format!("profile:{}", name).as_bytes()),
             )
         };
 

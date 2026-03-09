@@ -170,6 +170,47 @@ fn init_installation(org: Option<&str>) -> anyhow::Result<()> {
     core_config::write_installation(&install_config)
         .context("failed to write installation.toml")?;
 
+    // Write InstallationCreated audit event directly (bus not running yet)
+    {
+        let audit_path = core_config::config_dir().join("audit.jsonl");
+        let audit_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&audit_path)
+            .context("failed to open audit log for installation event")?;
+        let audit_writer = std::io::BufWriter::new(audit_file);
+
+        let (last_hash, sequence) = if audit_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            let contents = std::fs::read_to_string(&audit_path).unwrap_or_default();
+            if let Some(last_line) = contents.lines().rev().find(|l| !l.trim().is_empty()) {
+                if let Ok(entry) = serde_json::from_str::<core_profile::AuditEntry>(last_line) {
+                    let hash = blake3::hash(last_line.as_bytes());
+                    (hash.to_hex().to_string(), entry.sequence)
+                } else {
+                    (String::new(), 0)
+                }
+            } else {
+                (String::new(), 0)
+            }
+        } else {
+            (String::new(), 0)
+        };
+
+        let mut audit = core_profile::AuditLogger::new(
+            audit_writer, last_hash, sequence, core_types::AuditHash::Blake3, None,
+        );
+        audit.append(core_profile::AuditAction::InstallationCreated {
+            id: core_types::InstallationId {
+                id,
+                org_ns: None,
+                namespace: install_ns,
+                machine_binding: None,
+            },
+            org: org.map(|s| s.to_string()),
+            machine_binding_present: machine_binding.is_some(),
+        }).map_err(|e| anyhow::anyhow!("failed to write audit event: {e}"))?;
+    }
+
     step_done(&format!("Created {}", installation_path.display()));
     println!("        Installation ID: {}", id);
     println!("        Namespace:       {}", install_ns);

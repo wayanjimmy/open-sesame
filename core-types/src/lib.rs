@@ -312,7 +312,7 @@ pub enum CryptoProfile {
 ///
 /// Determines which algorithms are used for key derivation, HKDF, Noise
 /// transport, and audit hashing. `CryptoProfile::LeadingEdge` is the default.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CryptoConfig {
     pub kdf: KdfAlgorithm,
     pub hkdf: HkdfAlgorithm,
@@ -321,19 +321,6 @@ pub struct CryptoConfig {
     pub audit_hash: AuditHash,
     /// Minimum crypto profile accepted from federation peers.
     pub minimum_peer_profile: CryptoProfile,
-}
-
-impl Default for CryptoConfig {
-    fn default() -> Self {
-        Self {
-            kdf: KdfAlgorithm::default(),
-            hkdf: HkdfAlgorithm::default(),
-            noise_cipher: NoiseCipher::default(),
-            noise_hash: NoiseHash::default(),
-            audit_hash: AuditHash::default(),
-            minimum_peer_profile: CryptoProfile::default(),
-        }
-    }
 }
 
 // ============================================================================
@@ -411,6 +398,10 @@ impl OciReference {
     /// Parse an OCI reference string.
     ///
     /// Expected format: `registry/principal/scope:revision[@provenance]`
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Validation` if the input is empty or malformed.
     pub fn parse(input: &str) -> Result<Self> {
         input.parse()
     }
@@ -639,8 +630,8 @@ pub struct DelegationLink {
 /// How an agent's identity claim was verified.
 ///
 /// Each variant captures the evidence used for a specific attestation method.
-/// Multiple attestations may be composed to strengthen trust (e.g., UCred +
-/// MasterPassword = higher `TrustLevel` than either alone).
+/// Multiple attestations may be composed to strengthen trust (e.g., `UCred` +
+/// `MasterPassword` = higher `TrustLevel` than either alone).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Attestation {
@@ -734,7 +725,7 @@ pub enum AttestationMethod {
 
 /// What kind of entity an agent is.
 ///
-/// AgentType is descriptive metadata, NOT a trust tier. An AI agent with
+/// `AgentType` is descriptive metadata, NOT a trust tier. An AI agent with
 /// proper attestations and delegation can have higher effective trust than
 /// a human agent without a security key. Trust is evaluated via `TrustVector`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,7 +807,7 @@ pub enum TrustLevel {
 pub enum NetworkTrust {
     /// Unix domain socket, same machine.
     Local,
-    /// Encrypted tunnel (Noise, TLS, WireGuard).
+    /// Encrypted tunnel (Noise, TLS, `WireGuard`).
     Encrypted,
     /// Onion-routed (Tor, Veilid).
     Onion,

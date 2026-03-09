@@ -466,7 +466,7 @@ impl CryptoConfigToml {
 // ============================================================================
 
 /// Agent identity and authorization configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsConfig {
     /// Default agent configuration applied when no specific agent matches.
@@ -474,15 +474,6 @@ pub struct AgentsConfig {
     /// Named agent configurations keyed by agent name.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentConfig>,
-}
-
-impl Default for AgentsConfig {
-    fn default() -> Self {
-        Self {
-            default: AgentConfig::default(),
-            agents: BTreeMap::new(),
-        }
-    }
 }
 
 /// Configuration for a single agent.
@@ -497,7 +488,7 @@ pub struct AgentConfig {
     pub require_master_password: bool,
     /// Unix UID constraint (process attestation).
     pub uid: Option<u32>,
-    /// AI model family (for agent_type = "ai").
+    /// AI model family (for `agent_type` = "ai").
     pub model_family: Option<String>,
     /// Maximum delegation chain depth this agent can create.
     pub max_delegation_depth: Option<u8>,
@@ -569,7 +560,7 @@ pub struct ExtensionsConfig {
 }
 
 /// Security policy for extension installation and execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExtensionsPolicyConfig {
     /// Allowed OCI registries for extension installation.
@@ -580,15 +571,4 @@ pub struct ExtensionsPolicyConfig {
     pub require_signature: bool,
     /// Trusted signer public keys (hex-encoded).
     pub trusted_signers: Vec<String>,
-}
-
-impl Default for ExtensionsPolicyConfig {
-    fn default() -> Self {
-        Self {
-            allowed_registries: Vec::new(),
-            blocked_namespaces: Vec::new(),
-            require_signature: false,
-            trusted_signers: Vec::new(),
-        }
-    }
 }

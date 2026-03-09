@@ -21,6 +21,7 @@ pub struct AuditLogger<W: Write> {
     last_hash: String,
     sequence: u64,
     hash_algorithm: core_types::AuditHash,
+    default_agent_id: Option<core_types::AgentId>,
 }
 
 impl<W: Write> AuditLogger<W> {
@@ -28,12 +29,13 @@ impl<W: Write> AuditLogger<W> {
     ///
     /// `last_hash` and `sequence` should be loaded from the last entry
     /// in an existing log file, or empty/0 for a fresh log.
-    pub fn new(writer: W, last_hash: String, sequence: u64, hash_algorithm: core_types::AuditHash) -> Self {
+    pub fn new(writer: W, last_hash: String, sequence: u64, hash_algorithm: core_types::AuditHash, default_agent_id: Option<core_types::AgentId>) -> Self {
         Self {
             writer,
             last_hash,
             sequence,
             hash_algorithm,
+            default_agent_id,
         }
     }
 
@@ -59,6 +61,7 @@ impl<W: Write> AuditLogger<W> {
             timestamp_ms,
             action,
             prev_hash: self.last_hash.clone(),
+            agent_id: self.default_agent_id,
         };
 
         let json = serde_json::to_string(&entry)
@@ -150,7 +153,7 @@ mod tests {
     #[test]
     fn append_and_verify_chain() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3, None);
 
         logger
             .append(AuditAction::ProfileActivated {
@@ -176,7 +179,7 @@ mod tests {
     #[test]
     fn tampered_entry_detected() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3, None);
 
         logger
             .append(AuditAction::ProfileActivated {
@@ -238,7 +241,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), String::new(), 0, core_types::AuditHash::Blake3);
+            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), String::new(), 0, core_types::AuditHash::Blake3, None);
 
             logger.append(AuditAction::ProfileActivated { target: pid(1), duration_ms: 10 }).unwrap();
             logger.append(AuditAction::SecretAccessed { profile_id: pid(1), secret_ref: "k1".into() }).unwrap();
@@ -257,7 +260,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), last_hash, seq, core_types::AuditHash::Blake3);
+            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), last_hash, seq, core_types::AuditHash::Blake3, None);
 
             logger.append(AuditAction::ProfileActivated { target: pid(2), duration_ms: 20 }).unwrap();
             logger.append(AuditAction::SecretAccessed { profile_id: pid(2), secret_ref: "k2".into() }).unwrap();
@@ -301,7 +304,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), String::new(), 0, core_types::AuditHash::Blake3);
+            let mut logger = AuditLogger::new(std::io::BufWriter::new(file), String::new(), 0, core_types::AuditHash::Blake3, None);
             logger.append(AuditAction::ProfileActivated { target: pid(1), duration_ms: 1 }).unwrap();
         }
 
@@ -321,7 +324,7 @@ mod tests {
     #[test]
     fn audit_chain_detects_deleted_entry() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3, None);
 
         for i in 1..=5 {
             logger
@@ -353,7 +356,7 @@ mod tests {
     #[test]
     fn audit_chain_detects_reordered_entries() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3, None);
 
         for i in 1..=4 {
             logger
@@ -388,7 +391,7 @@ mod tests {
     #[test]
     fn single_entry_chain() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3, None);
 
         logger
             .append(AuditAction::IsolationViolationAttempt {
@@ -404,7 +407,7 @@ mod tests {
     #[test]
     fn sha256_append_and_verify_chain() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Sha256);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Sha256, None);
 
         logger
             .append(AuditAction::ProfileActivated {
@@ -430,7 +433,7 @@ mod tests {
     #[test]
     fn sha256_tampered_entry_detected() {
         let mut buf = Vec::new();
-        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Sha256);
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Sha256, None);
 
         logger
             .append(AuditAction::ProfileActivated {
@@ -457,11 +460,11 @@ mod tests {
     #[test]
     fn sha256_and_blake3_produce_different_hashes() {
         let mut buf_b3 = Vec::new();
-        let mut logger_b3 = AuditLogger::new(&mut buf_b3, String::new(), 0, core_types::AuditHash::Blake3);
+        let mut logger_b3 = AuditLogger::new(&mut buf_b3, String::new(), 0, core_types::AuditHash::Blake3, None);
         logger_b3.append(AuditAction::ProfileActivated { target: pid(1), duration_ms: 1 }).unwrap();
 
         let mut buf_sha = Vec::new();
-        let mut logger_sha = AuditLogger::new(&mut buf_sha, String::new(), 0, core_types::AuditHash::Sha256);
+        let mut logger_sha = AuditLogger::new(&mut buf_sha, String::new(), 0, core_types::AuditHash::Sha256, None);
         logger_sha.append(AuditAction::ProfileActivated { target: pid(1), duration_ms: 1 }).unwrap();
 
         // The prev_hash in subsequent entries would differ, but since these are first entries
