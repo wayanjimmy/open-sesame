@@ -471,4 +471,89 @@ mod tests {
         // with empty prev_hash, the JSON is the same. The internal last_hash should differ.
         assert_ne!(logger_b3.last_hash(), logger_sha.last_hash());
     }
+
+    #[test]
+    fn all_new_audit_action_variants_chain_correctly() {
+        let mut buf = Vec::new();
+        let mut logger = AuditLogger::new(&mut buf, String::new(), 0, core_types::AuditHash::Blake3, None);
+
+        let agent = core_types::AgentId::from_uuid(Uuid::from_u128(100));
+        let installation = core_types::InstallationId {
+            id: Uuid::from_u128(200),
+            org_ns: None,
+            namespace: Uuid::from_u128(300),
+            machine_binding: None,
+        };
+        let profile_name = core_types::TrustProfileName::try_from("work").unwrap();
+        let req_id = Uuid::from_u128(500);
+        let deleg_id = Uuid::from_u128(600);
+        let session_id = Uuid::from_u128(700);
+
+        let actions: Vec<AuditAction> = vec![
+            AuditAction::AgentConnected {
+                agent_id: agent,
+                agent_type: core_types::AgentType::Human,
+            },
+            AuditAction::AgentDisconnected {
+                agent_id: agent,
+                reason: "shutdown".into(),
+            },
+            AuditAction::InstallationCreated {
+                id: installation.clone(),
+                org: Some("acme".into()),
+                machine_binding_present: true,
+            },
+            AuditAction::ProfileIdMigrated {
+                name: profile_name,
+                old_id: pid(1),
+                new_id: pid(2),
+            },
+            AuditAction::AuthorizationRequired {
+                request_id: req_id,
+                operation: "secret.read".into(),
+            },
+            AuditAction::AuthorizationGranted {
+                request_id: req_id,
+                delegator: agent,
+                scope: "SecretRead".into(),
+            },
+            AuditAction::AuthorizationDenied {
+                request_id: req_id,
+                reason: "insufficient attestation".into(),
+            },
+            AuditAction::AuthorizationTimeout {
+                request_id: req_id,
+            },
+            AuditAction::DelegationRevoked {
+                delegation_id: deleg_id,
+                revoker: agent,
+                reason: "expired".into(),
+            },
+            AuditAction::HeartbeatRenewed {
+                delegation_id: deleg_id,
+                renewal_source: agent,
+            },
+            AuditAction::FederationSessionEstablished {
+                session_id,
+                remote_installation: installation,
+            },
+            AuditAction::FederationSessionTerminated {
+                session_id,
+                reason: "peer disconnected".into(),
+            },
+            AuditAction::PostureEvaluated {
+                composite_score: 0.85,
+            },
+        ];
+
+        for action in actions {
+            logger.append(action).unwrap();
+        }
+
+        assert_eq!(logger.sequence(), 13);
+
+        let log = String::from_utf8(buf).unwrap();
+        let count = verify_chain(&log, &core_types::AuditHash::Blake3).unwrap();
+        assert_eq!(count, 13, "all 13 new audit action variants must chain correctly");
+    }
 }

@@ -180,4 +180,146 @@ mod tests {
         let msg = msg.with_correlation(corr_id);
         assert_eq!(msg.correlation_id, Some(corr_id));
     }
+
+    #[test]
+    fn v3_fields_populated_roundtrip() {
+        let ctx = MessageContext {
+            sender: DaemonId::new(),
+            installation: Some(InstallationId {
+                id: Uuid::from_u128(1),
+                org_ns: None,
+                namespace: Uuid::from_u128(2),
+                machine_binding: None,
+            }),
+            agent_id: Some(AgentId::from_uuid(Uuid::from_u128(3))),
+            trust_snapshot: Some(TrustVector {
+                authn_strength: core_types::TrustLevel::High,
+                authz_freshness: std::time::Duration::from_secs(30),
+                delegation_depth: 1,
+                device_posture: 0.9,
+                network_exposure: core_types::NetworkTrust::Local,
+                agent_type: core_types::AgentType::Human,
+            }),
+        };
+        let msg = Message::new(&ctx, EventKind::StatusRequest, SecurityLevel::Internal, Instant::now());
+
+        let bytes = crate::framing::encode_frame(&msg).unwrap();
+        let decoded: Message<EventKind> = crate::framing::decode_frame(&bytes).unwrap();
+
+        assert_eq!(decoded.wire_version, WIRE_VERSION);
+        assert_eq!(decoded.origin_installation.as_ref().unwrap().id, Uuid::from_u128(1));
+        assert_eq!(decoded.agent_id.unwrap(), AgentId::from_uuid(Uuid::from_u128(3)));
+        assert!(decoded.trust_snapshot.is_some());
+        let tv = decoded.trust_snapshot.unwrap();
+        assert_eq!(tv.authn_strength, core_types::TrustLevel::High);
+        assert_eq!(tv.delegation_depth, 1);
+    }
+
+    #[test]
+    fn v3_fields_none_roundtrip() {
+        let ctx = MessageContext::new(DaemonId::new());
+        let msg = Message::new(&ctx, EventKind::StatusRequest, SecurityLevel::Open, Instant::now());
+
+        let bytes = crate::framing::encode_frame(&msg).unwrap();
+        let decoded: Message<EventKind> = crate::framing::decode_frame(&bytes).unwrap();
+
+        assert!(decoded.origin_installation.is_none());
+        assert!(decoded.agent_id.is_none());
+        assert!(decoded.trust_snapshot.is_none());
+    }
+
+    #[test]
+    fn v3_event_variants_roundtrip() {
+        use core_types::*;
+
+        let ctx = MessageContext::new(DaemonId::new());
+        let epoch = Instant::now();
+
+        let agent = AgentId::from_uuid(Uuid::from_u128(10));
+        let installation = InstallationId {
+            id: Uuid::from_u128(20),
+            org_ns: None,
+            namespace: Uuid::from_u128(30),
+            machine_binding: None,
+        };
+        let req_id = Uuid::from_u128(40);
+        let deleg_id = Uuid::from_u128(50);
+        let session_id = Uuid::from_u128(60);
+        let ts = Timestamp::now(epoch);
+
+        let variants: Vec<EventKind> = vec![
+            EventKind::AgentConnected {
+                agent_id: agent,
+                agent_type: AgentType::Human,
+                attestations: vec![AttestationType::UCred],
+            },
+            EventKind::AgentDisconnected {
+                agent_id: agent,
+                reason: "done".into(),
+            },
+            EventKind::InstallationCreated {
+                id: installation.clone(),
+                org: None,
+                machine_binding_present: false,
+            },
+            EventKind::ProfileIdMigrated {
+                name: TrustProfileName::try_from("work").unwrap(),
+                old_id: ProfileId::from_uuid(Uuid::from_u128(1)),
+                new_id: ProfileId::from_uuid(Uuid::from_u128(2)),
+            },
+            EventKind::AuthorizationRequired {
+                request_id: req_id,
+                operation: "secret.read".into(),
+                missing_attestations: vec![],
+                expires_at: ts.clone(),
+            },
+            EventKind::AuthorizationGrant {
+                request_id: req_id,
+                delegator: agent,
+                scope: CapabilitySet::empty(),
+                ttl_seconds: 300,
+                point_of_use_filter: None,
+            },
+            EventKind::AuthorizationDenied {
+                request_id: req_id,
+                reason: "nope".into(),
+            },
+            EventKind::AuthorizationTimeout {
+                request_id: req_id,
+            },
+            EventKind::DelegationRevoked {
+                delegation_id: deleg_id,
+                revoker: agent,
+                reason: "expired".into(),
+            },
+            EventKind::HeartbeatRenewed {
+                delegation_id: deleg_id,
+                renewal_source: agent,
+                next_deadline: ts,
+            },
+            EventKind::FederationSessionEstablished {
+                session_id,
+                remote_installation: installation,
+            },
+            EventKind::FederationSessionTerminated {
+                session_id,
+                reason: "closed".into(),
+            },
+            EventKind::PostureEvaluated {
+                secure_boot: Some(true),
+                disk_encrypted: Some(true),
+                screen_locked: None,
+                composite_score: 0.95,
+            },
+        ];
+
+        for (i, variant) in variants.into_iter().enumerate() {
+            let msg = Message::new(&ctx, variant, SecurityLevel::Internal, epoch);
+            let bytes = crate::framing::encode_frame(&msg)
+                .unwrap_or_else(|e| panic!("encode failed for variant {i}: {e}"));
+            let decoded: Message<EventKind> = crate::framing::decode_frame(&bytes)
+                .unwrap_or_else(|e| panic!("decode failed for variant {i}: {e}"));
+            assert_eq!(decoded.wire_version, WIRE_VERSION, "variant {i} wire version mismatch");
+        }
+    }
 }

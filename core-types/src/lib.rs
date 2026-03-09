@@ -2629,4 +2629,141 @@ mod tests {
         let decoded: ProfileRef = serde_json::from_str(&json).unwrap();
         assert_eq!(pr, decoded);
     }
+
+    // -- CapabilitySet lattice property tests --
+
+    #[test]
+    fn capability_set_lattice_properties() {
+        let caps_a = CapabilitySet {
+            capabilities: [
+                Capability::SecretRead { key_pattern: None },
+                Capability::SecretWrite { key_pattern: None },
+                Capability::ProfileActivate,
+            ].into_iter().collect(),
+        };
+        let caps_b = CapabilitySet {
+            capabilities: [
+                Capability::SecretWrite { key_pattern: None },
+                Capability::Admin,
+                Capability::StatusRead,
+            ].into_iter().collect(),
+        };
+        let caps_c = CapabilitySet {
+            capabilities: [
+                Capability::SecretRead { key_pattern: None },
+                Capability::Admin,
+                Capability::Lock,
+            ].into_iter().collect(),
+        };
+
+        // Commutativity of intersection
+        assert_eq!(caps_a.intersection(&caps_b), caps_b.intersection(&caps_a));
+
+        // Commutativity of union
+        assert_eq!(caps_a.union(&caps_b), caps_b.union(&caps_a));
+
+        // Associativity of intersection
+        assert_eq!(
+            caps_a.intersection(&caps_b).intersection(&caps_c),
+            caps_a.intersection(&caps_b.intersection(&caps_c))
+        );
+
+        // Associativity of union
+        assert_eq!(
+            caps_a.union(&caps_b).union(&caps_c),
+            caps_a.union(&caps_b.union(&caps_c))
+        );
+
+        // Union is superset of both operands
+        let ab = caps_a.union(&caps_b);
+        assert!(ab.is_superset(&caps_a));
+        assert!(ab.is_superset(&caps_b));
+
+        // Intersection is subset of both operands
+        let ab_inter = caps_a.intersection(&caps_b);
+        assert!(caps_a.is_superset(&ab_inter));
+        assert!(caps_b.is_superset(&ab_inter));
+
+        // Empty is subset of everything
+        let empty = CapabilitySet::empty();
+        assert!(caps_a.is_superset(&empty));
+        assert!(caps_b.is_superset(&empty));
+        assert!(caps_c.is_superset(&empty));
+
+        // All is superset of everything
+        let all = CapabilitySet::all();
+        assert!(all.is_superset(&caps_a));
+        assert!(all.is_superset(&caps_b));
+        assert!(all.is_superset(&caps_c));
+
+        // Idempotence: union with self is self
+        assert_eq!(caps_a.union(&caps_a), caps_a);
+
+        // Idempotence: intersection with self is self
+        assert_eq!(caps_a.intersection(&caps_a), caps_a);
+
+        // Absorption: a union (a intersect b) == a
+        assert_eq!(caps_a.union(&caps_a.intersection(&caps_b)), caps_a);
+    }
+
+    // -- Namespace derivation determinism --
+
+    #[test]
+    fn namespace_derivation_determinism() {
+        let ns1 = uuid::Uuid::from_bytes([
+            0x4c, 0x45, 0xa6, 0x4f, 0xab, 0xcd, 0x59, 0x77,
+            0xbc, 0x73, 0x99, 0xd4, 0xc9, 0x3d, 0x66, 0x8b,
+        ]);
+        let ns2 = uuid::Uuid::from_bytes([0xaa; 16]);
+
+        // Same namespace + same name = same ID across 100 iterations
+        let expected = uuid::Uuid::new_v5(&ns1, b"profile:work");
+        for _ in 0..100 {
+            assert_eq!(uuid::Uuid::new_v5(&ns1, b"profile:work"), expected);
+        }
+
+        // Different namespace + same name = different ID
+        assert_ne!(
+            uuid::Uuid::new_v5(&ns1, b"profile:work"),
+            uuid::Uuid::new_v5(&ns2, b"profile:work"),
+        );
+
+        // Same namespace + different name = different ID
+        assert_ne!(
+            uuid::Uuid::new_v5(&ns1, b"profile:work"),
+            uuid::Uuid::new_v5(&ns1, b"profile:personal"),
+        );
+    }
+
+    // -- OciReference fuzz / adversarial input tests --
+
+    #[test]
+    fn oci_reference_never_panics_on_adversarial_input() {
+        let long_input = "a".repeat(65536);
+        let inputs: Vec<&str> = vec![
+            "",
+            " ",
+            "/",
+            "//",
+            ":",
+            "@",
+            "a@",
+            "@a",
+            "a:b@c",
+            "registry/principal/scope:rev@prov",
+            "\0",
+            "\0\0\0",
+            &long_input,
+            "emoji/\u{1f525}/scope:rev",
+            "registry/principal/scope:",
+            "registry//scope:rev",
+            "///:",
+            ":@",
+            "a/b/c:d@",
+            "a/b/c:d@e@f",
+        ];
+        for input in &inputs {
+            let _ = input.parse::<OciReference>(); // must not panic
+        }
+    }
 }
