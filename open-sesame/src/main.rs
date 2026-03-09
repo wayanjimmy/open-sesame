@@ -238,6 +238,17 @@ enum WmCmd {
         /// Window ID or app ID string.
         window_id: String,
     },
+
+    /// Activate the window switcher overlay.
+    ///
+    /// Shows a visual overlay with hint keys for quick window selection.
+    /// Use --launcher to skip the border-only phase and show the full
+    /// overlay immediately.
+    Overlay {
+        /// Start in launcher mode (full overlay immediately, no border-only phase).
+        #[arg(long)]
+        launcher: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -381,6 +392,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             WmCmd::List => cmd_wm_list().await,
             WmCmd::Switch { backward } => cmd_wm_switch(backward).await,
             WmCmd::Focus { window_id } => cmd_wm_focus(&window_id).await,
+            WmCmd::Overlay { launcher } => cmd_wm_overlay(launcher).await,
         },
         Command::Launch(sub) => match sub {
             LaunchCmd::Search { query, max_results, profile } => {
@@ -1113,6 +1125,18 @@ async fn cmd_wm_focus(window_id: &str) -> anyhow::Result<()> {
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 
+    Ok(())
+}
+
+async fn cmd_wm_overlay(launcher: bool) -> anyhow::Result<()> {
+    let client = connect().await?;
+    let event = if launcher {
+        EventKind::WmActivateOverlayLauncher
+    } else {
+        EventKind::WmActivateOverlay
+    };
+    client.publish(event, SecurityLevel::Internal).await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 

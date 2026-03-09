@@ -147,8 +147,8 @@ fn add_binding(content: &str, binding: &str) -> String {
 pub fn setup_keybinding(launcher_key_combo: &str) -> core_types::Result<()> {
     let (launcher_mods, launcher_key) = parse_key_combo(launcher_key_combo)?;
 
-    let launcher_binding = format_keybinding(&launcher_mods, &launcher_key, "sesame");
-    let switcher_forward = format_keybinding(&["Alt".to_string()], "tab", "sesame wm switch");
+    let launcher_binding = format_keybinding(&launcher_mods, &launcher_key, "sesame wm overlay --launcher");
+    let switcher_forward = format_keybinding(&["Alt".to_string()], "tab", "sesame wm overlay");
     let switcher_backward = format_keybinding(
         &["Alt".to_string(), "Shift".to_string()],
         "tab",
@@ -171,9 +171,9 @@ pub fn setup_keybinding(launcher_key_combo: &str) -> core_types::Result<()> {
         "configured COSMIC keybindings: alt+tab, alt+shift+tab, {launcher_key_combo}"
     );
     println!("Keybindings configured:");
-    println!("    alt+tab       -> sesame wm switch");
+    println!("    alt+tab       -> sesame wm overlay");
     println!("    alt+shift+tab -> sesame wm switch --backward");
-    println!("    {launcher_key_combo:<14}-> sesame (overlay)");
+    println!("    {launcher_key_combo:<14}-> sesame wm overlay --launcher");
     println!("  Config: {}", cosmic_shortcuts_path()?.display());
 
     Ok(())
