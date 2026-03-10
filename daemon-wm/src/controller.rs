@@ -133,9 +133,10 @@ impl Snapshot {
         mru::reorder(&mut win_list, |w| w.id.to_string());
         win_list.truncate(config.max_visible_windows as usize);
 
-        // Find the origin window index after reorder (typically last).
-        let origin_index = mru_state.current.as_ref().and_then(|current_id| {
-            win_list.iter().position(|w| w.id.to_string() == *current_id)
+        // Find the origin window index after reorder (typically first in
+        // MRU-sorted order since current() is position 0 in the stack).
+        let origin_index = mru_state.current().and_then(|current_id| {
+            win_list.iter().position(|w| w.id.to_string() == current_id)
         });
 
         let app_ids: Vec<&str> = win_list.iter().map(|w| w.app_id.as_str()).collect();
@@ -152,7 +153,7 @@ impl Snapshot {
             ?origin_index,
             hints = ?hint_strings,
             apps = ?app_ids,
-            mru_origin = mru_state.current.as_deref().unwrap_or("<none>"),
+            mru_origin = mru_state.current().unwrap_or("<none>"),
             quick_target = win_list.first().map(|w| w.id.to_string()).as_deref().unwrap_or("<none>"),
             "snapshot: pre-computed overlay data"
         );
@@ -161,7 +162,7 @@ impl Snapshot {
             windows: win_list,
             hints: hint_strings,
             overlay_windows,
-            mru_origin: mru_state.current,
+            mru_origin: mru_state.current().map(|s| s.to_string()),
             origin_index,
             key_bindings: config.key_bindings.clone(),
         }
