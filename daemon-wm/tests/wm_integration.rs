@@ -242,11 +242,10 @@ fn controller_fast_release_quick_switches() {
 }
 
 #[test]
-fn controller_fast_release_no_windows_dismisses() {
+fn controller_activate_no_windows_is_noop() {
     let mut ctrl = OverlayController::new();
-    ctrl.handle(Event::Activate, &[], &test_config());
-    let cmds = ctrl.handle(Event::ModifierReleased, &[], &test_config());
-    assert!(cmds.iter().any(|c| matches!(c, Command::Hide)));
+    let cmds = ctrl.handle(Event::Activate, &[], &test_config());
+    assert!(cmds.is_empty(), "no targets = no activation");
     assert!(ctrl.is_idle());
 }
 
