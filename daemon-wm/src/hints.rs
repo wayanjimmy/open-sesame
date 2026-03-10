@@ -152,26 +152,28 @@ pub fn launch_for_key(key: char, key_bindings: &BTreeMap<String, WmKeyBinding>) 
 
 /// Assign hints to windows grouped by app, using configured key mappings.
 ///
-/// Windows sharing the same app get consecutive repetitions of the same base key.
+/// Hint key priority:
+/// 1. Explicit config (`key_bindings` maps app to a specific key)
+/// 2. First letter of the app name (reverse-DNS last segment)
+///
+/// Windows sharing the same key get consecutive repetitions: v, vv, vvv
+/// (with numeric shorthand v1, v2, v3).
 /// Returns `(hint_string, original_index)` pairs in original window order.
 #[must_use]
 pub fn assign_app_hints(
     app_ids: &[&str],
-    hint_keys: &str,
+    _hint_keys: &str,
     key_bindings: &BTreeMap<String, WmKeyBinding>,
 ) -> Vec<(String, usize)> {
-    if app_ids.is_empty() || hint_keys.is_empty() {
+    if app_ids.is_empty() {
         return Vec::new();
     }
 
     // Group indices by app base key.
     let mut by_key: HashMap<char, Vec<usize>> = HashMap::new();
-    let keys: Vec<char> = hint_keys.chars().collect();
 
     for (i, app_id) in app_ids.iter().enumerate() {
-        let key = key_for_app(app_id, key_bindings)
-            .filter(|k| keys.contains(k))
-            .unwrap_or(keys[0]);
+        let key = key_for_app(app_id, key_bindings).unwrap_or('a');
         by_key.entry(key).or_default().push(i);
     }
 
@@ -258,12 +260,22 @@ mod tests {
     #[test]
     fn assign_app_hints_groups() {
         let apps = vec!["firefox", "firefox", "ghostty"];
-        let result = assign_app_hints(&apps, "fgasdjkl", &empty_bindings());
+        let result = assign_app_hints(&apps, "", &empty_bindings());
         // Two firefox windows: "f", "ff"; one ghostty: "g"
         let hint_strs: Vec<&str> = result.iter().map(|(h, _)| h.as_str()).collect();
         assert!(hint_strs.contains(&"f"));
         assert!(hint_strs.contains(&"ff"));
         assert!(hint_strs.contains(&"g"));
         assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn assign_app_hints_uses_first_letter() {
+        let apps = vec!["vivaldi", "com.mitchellh.ghostty", "microsoft-edge"];
+        let result = assign_app_hints(&apps, "", &empty_bindings());
+        let hint_strs: Vec<&str> = result.iter().map(|(h, _)| h.as_str()).collect();
+        assert!(hint_strs.contains(&"v"), "vivaldi should get 'v'");
+        assert!(hint_strs.contains(&"g"), "ghostty should get 'g'");
+        assert!(hint_strs.contains(&"m"), "microsoft-edge should get 'm'");
     }
 }
