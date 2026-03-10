@@ -300,14 +300,14 @@ async fn main() -> anyhow::Result<()> {
                             true
                         }
                     };
-                    send_overlay(OverlayCmd::ShowBorder);
+                    // Border already shown at activation time. Send only the
+                    // full window picker now that the dwell threshold elapsed.
                     if !send_overlay(OverlayCmd::ShowFull {
                         windows: overlay_windows,
                         hints: hint_strings,
                     }) {
                         wm_state = WmState::Idle;
                     }
-                    client.publish(EventKind::WmOverlayShown, SecurityLevel::Internal).await.ok();
                 }
             }
 
@@ -659,9 +659,19 @@ async fn handle_action(
                 title: w.title.clone(),
             }).collect();
 
-            // Defer visual display until after quick_switch_threshold.
+            // Show border IMMEDIATELY to acquire KeyboardMode::Exclusive.
+            // This ensures Alt release is captured even during the deferral
+            // window. The border outline is the minimal visual hint — the
+            // full window picker is deferred below.
+            if !send_overlay(OverlayCmd::ShowBorder) {
+                *wm_state = WmState::Idle;
+                return;
+            }
+            client.publish(EventKind::WmOverlayShown, SecurityLevel::Internal).await.ok();
+
+            // Defer ONLY the full window picker until after quick_switch_threshold.
             // If the user releases Alt before this fires, QuickSwitch
-            // handles it without any GUI flash.
+            // handles it without the picker ever appearing.
             let threshold = cfg.quick_switch_threshold_ms;
             *pending_display = Some((overlay_windows, hint_strings));
             *display_tick = Some(Box::pin(
@@ -783,15 +793,14 @@ async fn handle_action(
         }
 
         Action::Redraw => {
-            // User interacted — if overlay display was deferred, show it now.
+            // User interacted — if picker display was deferred, show it now.
+            // Border is already visible (sent at activation time).
             if let Some((overlay_windows, hint_strings)) = pending_display.take() {
                 *display_tick = None;
-                send_overlay(OverlayCmd::ShowBorder);
                 send_overlay(OverlayCmd::ShowFull {
                     windows: overlay_windows,
                     hints: hint_strings,
                 });
-                client.publish(EventKind::WmOverlayShown, SecurityLevel::Internal).await.ok();
             }
 
             // Send updated input/selection to overlay for redraw.
