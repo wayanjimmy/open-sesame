@@ -578,3 +578,103 @@ fn wm_config_warns_on_extreme_delay() {
         "expected warning for extreme delay: {diagnostics:?}"
     );
 }
+
+// ============================================================================
+// Keyboard navigation failure mode scenarios
+// ============================================================================
+
+/// Alt+Space repeated should cycle through windows (re-activation while visible).
+#[test]
+fn scenario_alt_space_repeat_cycles() {
+    let mut state = WmState::new();
+    // First activation: Idle → FullOverlay (launcher mode)
+    let action = state.on_activate_launcher();
+    assert_eq!(action, Action::ShowOverlay);
+    state.set_window_count(4);
+    assert_eq!(state.selection(), Some(0));
+
+    // Second press while overlay visible: cycles selection
+    let action = state.on_activate_launcher();
+    assert_eq!(action, Action::Redraw);
+    assert_eq!(state.selection(), Some(1));
+
+    // Third press
+    let action = state.on_activate_launcher();
+    assert_eq!(action, Action::Redraw);
+    assert_eq!(state.selection(), Some(2));
+
+    // Wraps around
+    state.on_activate_launcher();
+    state.on_activate_launcher();
+    assert_eq!(state.selection(), Some(0));
+}
+
+/// Alt+Tab repeated should cycle (re-activation from BorderOnly and FullOverlay).
+#[test]
+fn scenario_alt_tab_repeat_cycles() {
+    let mut state = WmState::new();
+    // First: Idle → BorderOnly
+    assert_eq!(state.on_activate(), Action::ShowBorder);
+
+    // Second: BorderOnly → FullOverlay with selection=1
+    let action = state.on_activate();
+    assert_eq!(action, Action::ShowOverlay);
+    state.set_window_count(3);
+    assert_eq!(state.selection(), Some(1));
+
+    // Third: FullOverlay → cycles to 2
+    let action = state.on_activate();
+    assert_eq!(action, Action::Redraw);
+    assert_eq!(state.selection(), Some(2));
+
+    // Fourth: wraps to 0
+    let action = state.on_activate();
+    assert_eq!(action, Action::Redraw);
+    assert_eq!(state.selection(), Some(0));
+}
+
+/// Quick alt+tab with empty MRU should still produce QuickSwitch action.
+/// The caller is responsible for falling back to first non-focused window.
+#[test]
+fn scenario_quick_alt_tab_empty_mru() {
+    let mut state = WmState::new();
+    state.on_activate();
+    // Fast release within threshold
+    let action = state.on_modifier_release(250, 500);
+    assert_eq!(action, Action::QuickSwitch);
+    assert!(state.is_idle());
+    // MRU validation is caller's responsibility — state machine just says QuickSwitch
+}
+
+/// Tab key repeats in FullOverlay should wrap correctly.
+#[test]
+fn scenario_tab_repeat_wraps() {
+    let mut state = WmState::FullOverlay {
+        input_buffer: String::new(),
+        selection: 0,
+        window_count: 3,
+    };
+    // Simulate rapid Tab presses
+    state.on_selection_down(); // 1
+    state.on_selection_down(); // 2
+    state.on_selection_down(); // 0 (wrapped)
+    assert_eq!(state.selection(), Some(0));
+    state.on_selection_down(); // 1
+    assert_eq!(state.selection(), Some(1));
+}
+
+/// Alt release in PendingActivation should still activate target.
+#[test]
+fn scenario_alt_release_during_pending() {
+    let mut state = WmState::new();
+    state.on_activate_launcher();
+    state.set_window_count(3);
+    state.on_char('g');
+    let action = state.on_hint_match(1);
+    assert_eq!(action, Action::ActivateWindow(1));
+    assert!(matches!(state, WmState::PendingActivation { target: 1, .. }));
+    // Alt release should finalize
+    let action = state.on_modifier_release(250, 500);
+    assert_eq!(action, Action::ActivateWindow(1));
+    assert!(state.is_idle());
+}

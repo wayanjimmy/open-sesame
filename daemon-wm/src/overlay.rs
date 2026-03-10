@@ -288,8 +288,11 @@ fn run_gtk4_overlay(
 
     window.add_controller(key_controller);
 
-    // Start hidden.
-    window.set_visible(false);
+    // Show the window immediately so the layer surface is created once and
+    // never destroyed. "Hiding" is done by drawing fully transparent and
+    // setting KeyboardMode::None — this avoids the layer surface
+    // destroy/recreate cycle that causes cosmic-comp to kill our connection.
+    window.set_visible(true);
 
     // Poll the command channel from the GLib main loop via a timeout source.
     // 4ms interval (~250Hz) balances latency and CPU. Commands are non-blocking
@@ -312,7 +315,6 @@ fn run_gtk4_overlay(
                         st.selection = 0;
                     }
                     window_cmd.set_keyboard_mode(KeyboardMode::Exclusive);
-                    window_cmd.set_visible(true);
                     da_cmd.queue_draw();
                 }
                 OverlayCmd::ShowFull { windows, hints } => {
@@ -323,7 +325,6 @@ fn run_gtk4_overlay(
                         st.hints = hints;
                     }
                     window_cmd.set_keyboard_mode(KeyboardMode::Exclusive);
-                    window_cmd.set_visible(true);
                     da_cmd.queue_draw();
                 }
                 OverlayCmd::UpdateInput { input, selection } => {
@@ -343,8 +344,10 @@ fn run_gtk4_overlay(
                         st.windows.clear();
                         st.hints.clear();
                     }
+                    // Release keyboard grab and redraw transparent.
+                    // Surface stays mapped to avoid layer surface destroy.
                     window_cmd.set_keyboard_mode(KeyboardMode::None);
-                    window_cmd.set_visible(false);
+                    da_cmd.queue_draw();
                 }
                 OverlayCmd::HideAndSync => {
                     {
@@ -355,10 +358,11 @@ fn run_gtk4_overlay(
                         st.windows.clear();
                         st.hints.clear();
                     }
+                    // Release keyboard grab and redraw transparent.
                     window_cmd.set_keyboard_mode(KeyboardMode::None);
-                    window_cmd.set_visible(false);
-                    // Flush the unmap to the compositor and wait for
-                    // confirmation so the exclusive layer surface is gone
+                    da_cmd.queue_draw();
+                    // Flush the keyboard interactivity change to the
+                    // compositor so it no longer holds exclusive focus
                     // before the caller activates a different window.
                     if let Some(display) = gdk::Display::default() {
                         display.sync();
