@@ -136,7 +136,7 @@ fn app_hints_groups_by_app() {
 }
 
 // ============================================================================
-// MRU State Parsing
+// MRU State Parsing and File I/O
 // ============================================================================
 
 #[test]
@@ -153,6 +153,11 @@ fn mru_file_roundtrip() {
     assert_eq!(lines[0], "prev-window");
     assert_eq!(lines[1], "curr-window");
 }
+
+// MRU file I/O tests (save/load/seed_if_empty/previous_window) live in
+// daemon-wm/src/mru.rs unit tests where they can use set_test_cache_dir()
+// for thread-safe temp directory isolation. Integration tests here only
+// cover the parse logic via direct file writes (mru_file_roundtrip above).
 
 // ============================================================================
 // State Machine

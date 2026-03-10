@@ -275,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Overlay keyboard events.
             Some(event) = overlay_event_rx.recv() => {
+                tracing::debug!(?event, "overlay event received");
                 let action = {
                     let cfg = wm_config.lock().await;
                     match event {
@@ -560,6 +561,8 @@ async fn handle_action(
         }
     };
 
+    tracing::debug!(?action, "handle_action dispatching");
+
     match action {
         Action::ShowBorder => {
             if !send_overlay(OverlayCmd::ShowBorder) {
@@ -593,6 +596,13 @@ async fn handle_action(
 
             // Update state machine with window count.
             wm_state.set_window_count(win_list.len());
+
+            tracing::info!(
+                window_count = win_list.len(),
+                hints = ?hint_strings,
+                apps = ?app_ids,
+                "overlay showing full window list"
+            );
 
             // Store for hint matching.
             *current_hints = hint_strings.clone();
@@ -630,9 +640,11 @@ async fn handle_action(
             }
 
             if let Some(window) = current_windows.get(*idx) {
-                let origin = current_windows.iter()
-                    .find(|w| w.is_focused)
-                    .map(|w| w.id.to_string());
+                // Use MRU current as origin — the is_focused field in
+                // current_windows is stale because our overlay surface holds
+                // exclusive keyboard focus, so the compositor may report no
+                // toplevel as focused.
+                let origin = mru::load().current;
                 let target_id = window.id.to_string();
                 mru::save(origin.as_deref(), &target_id);
 
@@ -670,9 +682,23 @@ async fn handle_action(
                 let win_list = windows.lock().await;
                 let prev_id = mru::previous_window();
 
+                tracing::info!(
+                    mru_previous = prev_id.as_deref().unwrap_or("<none>"),
+                    window_count = win_list.len(),
+                    focused = ?win_list.iter().find(|w| w.is_focused).map(|w| w.app_id.to_string()),
+                    "quick-switch: resolving target"
+                );
+
                 // Find the target: MRU previous if it still exists, else first non-focused.
-                let target = prev_id.as_ref()
-                    .and_then(|pid| win_list.iter().find(|w| w.id.to_string() == *pid))
+                let mru_found = prev_id.as_ref()
+                    .and_then(|pid| win_list.iter().find(|w| w.id.to_string() == *pid));
+                if prev_id.is_some() && mru_found.is_none() {
+                    tracing::warn!(
+                        stale_id = prev_id.as_deref().unwrap_or(""),
+                        "quick-switch: MRU previous not found in window list, falling back"
+                    );
+                }
+                let target = mru_found
                     .or_else(|| win_list.iter().find(|w| !w.is_focused));
 
                 if let Some(w) = target {

@@ -294,6 +294,13 @@ fn run_gtk4_overlay(
     // destroy/recreate cycle that causes cosmic-comp to kill our connection.
     window.set_visible(true);
 
+    // Start with an empty input region so the transparent surface doesn't
+    // steal pointer events. On show we restore to None (full surface).
+    if let Some(surface) = window.surface() {
+        let empty = gtk4::cairo::Region::create();
+        surface.set_input_region(&empty);
+    }
+
     // Poll the command channel from the GLib main loop via a timeout source.
     // 4ms interval (~250Hz) balances latency and CPU. Commands are non-blocking
     // try_recv so the GLib loop stays responsive.
@@ -314,6 +321,12 @@ fn run_gtk4_overlay(
                         st.input_buffer.clear();
                         st.selection = 0;
                     }
+                    // Restore full input region so overlay captures input.
+                    if let Some(surface) = window_cmd.surface() {
+                        surface.set_input_region(&gtk4::cairo::Region::create_rectangle(
+                            &gtk4::cairo::RectangleInt::new(0, 0, i32::MAX, i32::MAX),
+                        ));
+                    }
                     window_cmd.set_keyboard_mode(KeyboardMode::Exclusive);
                     da_cmd.queue_draw();
                 }
@@ -323,6 +336,12 @@ fn run_gtk4_overlay(
                         st.phase = OverlayPhase::Full;
                         st.windows = windows;
                         st.hints = hints;
+                    }
+                    // Restore full input region so overlay captures input.
+                    if let Some(surface) = window_cmd.surface() {
+                        surface.set_input_region(&gtk4::cairo::Region::create_rectangle(
+                            &gtk4::cairo::RectangleInt::new(0, 0, i32::MAX, i32::MAX),
+                        ));
                     }
                     window_cmd.set_keyboard_mode(KeyboardMode::Exclusive);
                     da_cmd.queue_draw();
@@ -344,10 +363,20 @@ fn run_gtk4_overlay(
                         st.windows.clear();
                         st.hints.clear();
                     }
-                    // Release keyboard grab and redraw transparent.
+                    // Release keyboard grab and commit transparent frame.
                     // Surface stays mapped to avoid layer surface destroy.
                     window_cmd.set_keyboard_mode(KeyboardMode::None);
+                    // Empty input region so pointer events pass through.
+                    if let Some(surface) = window_cmd.surface() {
+                        surface.set_input_region(&gtk4::cairo::Region::create());
+                    }
                     da_cmd.queue_draw();
+                    // Pump GLib to flush the transparent frame to the
+                    // compositor before returning. Without this, the last
+                    // visible frame stays on screen indefinitely because the
+                    // compositor stops sending frame callbacks to unfocused
+                    // surfaces.
+                    while glib::MainContext::default().iteration(false) {}
                 }
                 OverlayCmd::HideAndSync => {
                     {
@@ -358,12 +387,19 @@ fn run_gtk4_overlay(
                         st.windows.clear();
                         st.hints.clear();
                     }
-                    // Release keyboard grab and redraw transparent.
+                    // Release keyboard grab and commit transparent frame.
                     window_cmd.set_keyboard_mode(KeyboardMode::None);
+                    // Empty input region so pointer events pass through.
+                    if let Some(surface) = window_cmd.surface() {
+                        surface.set_input_region(&gtk4::cairo::Region::create());
+                    }
                     da_cmd.queue_draw();
-                    // Flush the keyboard interactivity change to the
-                    // compositor so it no longer holds exclusive focus
-                    // before the caller activates a different window.
+                    // Pump GLib to flush the transparent frame before the
+                    // display sync — ensures the compositor receives the
+                    // new buffer, not the stale window-list frame.
+                    while glib::MainContext::default().iteration(false) {}
+                    // Flush keyboard interactivity change + transparent
+                    // buffer to compositor before caller activates window.
                     if let Some(display) = gdk::Display::default() {
                         display.sync();
                         display.flush();

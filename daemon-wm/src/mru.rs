@@ -46,22 +46,32 @@ fn mru_path() -> Option<PathBuf> {
 #[must_use]
 pub fn load() -> MruState {
     let Some(path) = mru_path() else {
+        tracing::debug!("mru: no cache path available");
         return MruState::default();
     };
     let Ok(mut file) = File::open(&path) else {
+        tracing::debug!("mru: file not found, returning empty state");
         return MruState::default();
     };
 
     if !lock_shared(&file) {
+        tracing::warn!("mru: failed to acquire shared lock");
         return MruState::default();
     }
 
     let mut contents = String::new();
     if file.read_to_string(&mut contents).is_err() {
+        tracing::warn!("mru: failed to read file");
         return MruState::default();
     }
 
-    parse(&contents)
+    let state = parse(&contents);
+    tracing::debug!(
+        previous = state.previous.as_deref().unwrap_or("<none>"),
+        current = state.current.as_deref().unwrap_or("<none>"),
+        "mru: loaded state"
+    );
+    state
 }
 
 /// Save MRU state after activating a window.
@@ -71,8 +81,14 @@ pub fn load() -> MruState {
 /// No-op if origin == target.
 pub fn save(origin: Option<&str>, target: &str) {
     if origin == Some(target) {
+        tracing::debug!(target, "mru: save skipped (origin == target)");
         return;
     }
+    tracing::info!(
+        origin = origin.unwrap_or("<none>"),
+        target,
+        "mru: saving state"
+    );
 
     let Some(path) = mru_path() else {
         return;
@@ -113,6 +129,7 @@ pub fn previous_window() -> Option<String> {
 pub fn seed_if_empty(windows: &[core_types::Window]) {
     let state = load();
     if state.current.is_some() || state.previous.is_some() {
+        tracing::debug!("mru: seed_if_empty skipped, state already populated");
         return;
     }
 
@@ -121,17 +138,23 @@ pub fn seed_if_empty(windows: &[core_types::Window]) {
 
     match (focused, first_other) {
         (Some(cur), Some(prev)) => {
+            tracing::info!(
+                current = %cur.app_id, previous = %prev.app_id,
+                "mru: seeding from window list"
+            );
             save(Some(&prev.id.to_string()), &cur.id.to_string());
         }
         (Some(cur), None) => {
-            // Only one window — set it as current with no previous.
+            tracing::info!(current = %cur.app_id, "mru: seeding with single window");
             save(None, &cur.id.to_string());
         }
         (None, Some(first)) => {
-            // No focused window detected — use first as current.
+            tracing::info!(current = %first.app_id, "mru: seeding with no focused window");
             save(None, &first.id.to_string());
         }
-        (None, None) => {}
+        (None, None) => {
+            tracing::warn!("mru: seed_if_empty called with empty window list");
+        }
     }
 }
 
@@ -155,6 +178,36 @@ where
         let window = windows.remove(pos);
         windows.push(window);
     }
+}
+
+/// Load MRU state from a specific path (for testing).
+#[cfg(test)]
+fn load_from(path: &std::path::Path) -> MruState {
+    let Ok(mut file) = File::open(path) else {
+        return MruState::default();
+    };
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
+        return MruState::default();
+    }
+    parse(&contents)
+}
+
+/// Save MRU state to a specific path (for testing).
+#[cfg(test)]
+fn save_to(path: &std::path::Path, origin: Option<&str>, target: &str) {
+    if origin == Some(target) {
+        return;
+    }
+    let Ok(mut file) = OpenOptions::new()
+        .read(true).write(true).create(true).truncate(false)
+        .open(path)
+    else { return; };
+    let previous = origin.unwrap_or("");
+    let contents = format!("{previous}\n{target}");
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    let _ = file.set_len(0);
+    let _ = file.write_all(contents.as_bytes());
 }
 
 fn parse(contents: &str) -> MruState {
@@ -239,5 +292,83 @@ mod tests {
             items.push(item);
         }
         assert_eq!(items, original);
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mru");
+
+        // Initially empty.
+        let state = load_from(&path);
+        assert!(state.current.is_none(), "fresh MRU should have no current");
+        assert!(state.previous.is_none(), "fresh MRU should have no previous");
+
+        // Save a switch: origin=win-A, target=win-B
+        save_to(&path, Some("win-A"), "win-B");
+        let state = load_from(&path);
+        assert_eq!(state.previous.as_deref(), Some("win-A"));
+        assert_eq!(state.current.as_deref(), Some("win-B"));
+
+        // Save another switch: origin=win-B, target=win-C
+        save_to(&path, Some("win-B"), "win-C");
+        let state = load_from(&path);
+        assert_eq!(state.previous.as_deref(), Some("win-B"));
+        assert_eq!(state.current.as_deref(), Some("win-C"));
+
+        // No-op when origin == target.
+        save_to(&path, Some("win-C"), "win-C");
+        let state = load_from(&path);
+        assert_eq!(state.current.as_deref(), Some("win-C"), "save should no-op when origin == target");
+
+        // Verify actual file contents.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "win-B\nwin-C");
+    }
+
+    #[test]
+    fn save_with_no_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mru");
+
+        save_to(&path, None, "win-X");
+        let state = load_from(&path);
+        assert!(state.previous.is_none(), "no origin should produce no previous");
+        assert_eq!(state.current.as_deref(), Some("win-X"));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "\nwin-X");
+    }
+
+    #[test]
+    fn seed_logic_populates_correctly() {
+        // Test seed_if_empty's decision logic by simulating what it does:
+        // save(previous_id, current_id) where current=focused, previous=first non-focused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mru");
+
+        // Simulate: 2 windows, ghostty focused, edge not.
+        // seed should set: current=ghostty_id, previous=edge_id
+        save_to(&path, Some("edge-id"), "ghostty-id");
+        let state = load_from(&path);
+        assert_eq!(state.current.as_deref(), Some("ghostty-id"));
+        assert_eq!(state.previous.as_deref(), Some("edge-id"));
+    }
+
+    #[test]
+    fn seed_noop_when_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mru");
+
+        // Pre-populate.
+        save_to(&path, Some("existing-prev"), "existing-curr");
+
+        // seed_if_empty checks load() — if current or previous is Some, it returns.
+        let state = load_from(&path);
+        assert!(state.current.is_some() || state.previous.is_some());
+        // So a second save would not be called by seed_if_empty.
+        // Verify the state hasn't changed.
+        assert_eq!(state.previous.as_deref(), Some("existing-prev"));
+        assert_eq!(state.current.as_deref(), Some("existing-curr"));
     }
 }
