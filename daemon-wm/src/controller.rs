@@ -1217,4 +1217,59 @@ mod tests {
         assert!(visited.contains(&2), "cycling must visit origin at index 2");
         assert_eq!(visited.len(), windows.len(), "must visit all indices");
     }
+
+    // === Origin rotation in Snapshot::build layout ===
+
+    #[test]
+    fn origin_at_last_display_order() {
+        // Simulates what build() does: origin rotated to end.
+        // Given 3 windows [A=origin, B, C] after MRU reorder,
+        // rotation produces [B, C, A] with origin_index = 2.
+        let windows = test_windows(); // ghostty, vivaldi, edge
+        let snap = Snapshot::with_origin(&windows, &test_config(), Some(2));
+        // Origin is at the end.
+        assert_eq!(snap.origin_index, Some(2));
+        // Forward selection starts at 0 (top of picker, not origin).
+        assert_eq!(snap.initial_forward(), 0);
+        // Backward selection starts at 1 (last non-origin).
+        assert_eq!(snap.initial_backward(), 1);
+    }
+
+    #[test]
+    fn origin_rotation_preserves_mru_order() {
+        // After rotation: [MRU previous, ..., origin]
+        // The non-origin windows maintain their relative MRU order.
+        let windows = test_windows(); // ghostty(0), firefox(1), edge(2)
+        // If ghostty is origin (index 0 pre-rotation), rotation produces:
+        // [firefox, edge, ghostty] with origin_index = 2
+        let mut rotated = windows.clone();
+        let origin = rotated.remove(0);
+        rotated.push(origin);
+        let snap = Snapshot::with_origin(&rotated, &test_config(), Some(2));
+
+        assert_eq!(snap.windows[0].app_id.as_str(), "firefox");
+        assert_eq!(snap.windows[1].app_id.as_str(), "microsoft-edge");
+        assert_eq!(snap.windows[2].app_id.as_str(), "com.mitchellh.ghostty");
+        assert_eq!(snap.origin_index, Some(2));
+    }
+
+    #[test]
+    fn origin_at_last_picker_top_is_switch_target() {
+        // The top of the picker (index 0) should be the quick-switch
+        // target, not the origin.
+        let windows = test_windows();
+        let snap = Snapshot::with_origin(&windows, &test_config(), Some(2));
+        let mut ctrl = OverlayController::new();
+        ctrl.arm_with_snapshot(snap, 5000);
+
+        // Quick-switch (fast release) should activate index 0.
+        let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
+        let activated = cmds.iter().find_map(|c| match c {
+            Command::ActivateWindow { window, .. } => Some(window),
+            _ => None,
+        });
+        assert!(activated.is_some());
+        assert_eq!(activated.unwrap().id, windows[0].id,
+            "quick-switch should activate top of picker (index 0), not origin");
+    }
 }
