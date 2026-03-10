@@ -3108,6 +3108,7 @@ dependencies = [
  "core-profile",
  "core-types",
  "dialoguer",
+ "libc",
  "notify",
  "owo-colors",
  "platform-linux",

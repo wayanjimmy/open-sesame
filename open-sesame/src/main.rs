@@ -253,6 +253,14 @@ enum WmCmd {
         #[arg(long)]
         backward: bool,
     },
+
+    /// Run as resident fast-path process for overlay activation.
+    ///
+    /// Holds an active IPC connection and listens on a Unix datagram socket
+    /// so subsequent overlay invocations can skip the Noise IK handshake.
+    /// Not intended for direct user invocation.
+    #[command(hide = true)]
+    OverlayResident,
 }
 
 #[derive(Subcommand)]
@@ -397,6 +405,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             WmCmd::Switch { backward } => cmd_wm_switch(backward).await,
             WmCmd::Focus { window_id } => cmd_wm_focus(&window_id).await,
             WmCmd::Overlay { launcher, backward } => cmd_wm_overlay(launcher, backward).await,
+            WmCmd::OverlayResident => cmd_wm_overlay_resident().await,
         },
         Command::Launch(sub) => match sub {
             LaunchCmd::Search { query, max_results, profile } => {
@@ -1133,16 +1142,141 @@ async fn cmd_wm_focus(window_id: &str) -> anyhow::Result<()> {
 }
 
 async fn cmd_wm_overlay(launcher: bool, backward: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
-    let event = if launcher {
-        EventKind::WmActivateOverlayLauncher
+    let variant = if launcher {
+        "overlay-launcher"
     } else if backward {
-        EventKind::WmActivateOverlayBackward
+        "overlay-backward"
     } else {
-        EventKind::WmActivateOverlay
+        "overlay"
+    };
+
+    // Fast path: send datagram to resident process (~2ms).
+    if try_send_fast_path(variant) {
+        return Ok(());
+    }
+
+    // Slow path: full Noise IK connect + publish.
+    let client = connect().await?;
+    let event = match variant {
+        "overlay-launcher" => EventKind::WmActivateOverlayLauncher,
+        "overlay-backward" => EventKind::WmActivateOverlayBackward,
+        _ => EventKind::WmActivateOverlay,
     };
     client.publish(event, SecurityLevel::Internal).await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Spawn resident in background for next invocation.
+    spawn_resident();
+
+    client.shutdown().await;
+    Ok(())
+}
+
+/// Send an overlay command to the resident fast-path process via Unix datagram.
+///
+/// Returns `true` if the datagram was sent (resident is alive).
+fn try_send_fast_path(variant: &str) -> bool {
+    let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    let pid_path = format!("{runtime_dir}/pds/wm-fast.pid");
+    let sock_path = format!("{runtime_dir}/pds/wm-fast.sock");
+
+    // Check PID file for liveness.
+    let Ok(pid_content) = std::fs::read_to_string(&pid_path) else {
+        return false;
+    };
+    let Ok(pid) = pid_content.trim().parse::<i32>() else {
+        return false;
+    };
+
+    // Verify process is alive via kill(pid, 0).
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&sock_path);
+        return false;
+    }
+
+    // Send datagram (blocking — this is a ~0.1ms operation).
+    let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else {
+        return false;
+    };
+    sock.send_to(variant.as_bytes(), &sock_path).is_ok()
+}
+
+/// Fork a resident fast-path process in the background.
+fn spawn_resident() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .args(["wm", "overlay-resident"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Resident fast-path daemon: holds an IPC connection, listens for datagrams.
+///
+/// Exits on IPC disconnect, datagram error, or 5-minute idle timeout.
+async fn cmd_wm_overlay_resident() -> anyhow::Result<()> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .context("XDG_RUNTIME_DIR not set")?;
+    let pds_dir = format!("{runtime_dir}/pds");
+    let pid_path = format!("{pds_dir}/wm-fast.pid");
+    let sock_path = format!("{pds_dir}/wm-fast.sock");
+
+    // Check if another resident is already running.
+    if let Ok(existing_pid) = std::fs::read_to_string(&pid_path)
+        && let Ok(pid) = existing_pid.trim().parse::<i32>()
+        && unsafe { libc::kill(pid, 0) } == 0
+    {
+        return Ok(());
+    }
+
+    // Write PID file.
+    std::fs::write(&pid_path, std::process::id().to_string())?;
+
+    // Bind datagram socket with 0600 permissions.
+    let _ = std::fs::remove_file(&sock_path);
+    let dgram = tokio::net::UnixDatagram::bind(&sock_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Establish IPC connection (full Noise IK handshake — done once).
+    let client = connect().await?;
+
+    // Event loop: receive datagrams, publish to IPC bus.
+    let idle_timeout = Duration::from_secs(300);
+    let mut buf = [0u8; 64];
+
+    loop {
+        match tokio::time::timeout(idle_timeout, dgram.recv(&mut buf)).await {
+            Ok(Ok(n)) => {
+                let variant = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                let event = match variant {
+                    "overlay" => EventKind::WmActivateOverlay,
+                    "overlay-backward" => EventKind::WmActivateOverlayBackward,
+                    "overlay-launcher" => EventKind::WmActivateOverlayLauncher,
+                    _ => continue,
+                };
+                if client.publish(event, SecurityLevel::Internal).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Err(_)) => break,
+            Err(_) => break, // Idle timeout.
+        }
+    }
+
+    // Cleanup.
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
     client.shutdown().await;
     Ok(())
 }
