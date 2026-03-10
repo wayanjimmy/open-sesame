@@ -402,15 +402,31 @@ impl OverlayController {
                 }
             }
             Phase::Armed { selection, snap, .. } => {
-                // Re-activation cycles forward through all windows including origin.
+                // Re-activation cycles in the requested direction.
                 if !snap.windows.is_empty() {
-                    *selection = (*selection + 1) % snap.windows.len();
+                    let len = snap.windows.len();
+                    match mode {
+                        ActivationMode::Backward => {
+                            *selection = (*selection + len - 1) % len;
+                        }
+                        _ => {
+                            *selection = (*selection + 1) % len;
+                        }
+                    }
                 }
                 Vec::new()
             }
             Phase::Picking { selection, snap, input, .. } => {
                 if !snap.windows.is_empty() {
-                    *selection = (*selection + 1) % snap.windows.len();
+                    let len = snap.windows.len();
+                    match mode {
+                        ActivationMode::Backward => {
+                            *selection = (*selection + len - 1) % len;
+                        }
+                        _ => {
+                            *selection = (*selection + 1) % len;
+                        }
+                    }
                 }
                 vec![Command::UpdatePicker {
                     input: input.clone(),
@@ -1271,5 +1287,63 @@ mod tests {
         assert!(activated.is_some());
         assert_eq!(activated.unwrap().id, windows[0].id,
             "quick-switch should activate top of picker (index 0), not origin");
+    }
+
+    // === In-flight direction change (Alt+Tab then Alt+Shift+Tab) ===
+
+    #[test]
+    fn armed_forward_then_backward_reverses() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows(); // 3 windows, origin at 2
+        let snap = Snapshot::with_origin(&windows, &test_config(), Some(2));
+        ctrl.arm_with_snapshot(snap, 5000);
+
+        // Initial forward selection is 0.
+        if let Phase::Armed { selection, .. } = &ctrl.phase {
+            assert_eq!(*selection, 0);
+        }
+
+        // Forward re-activation: selection moves to 1.
+        ctrl.handle(Event::Activate, &windows, &test_config());
+        if let Phase::Armed { selection, .. } = &ctrl.phase {
+            assert_eq!(*selection, 1);
+        }
+
+        // Backward re-activation: selection moves back to 0.
+        ctrl.handle(Event::ActivateBackward, &windows, &test_config());
+        if let Phase::Armed { selection, .. } = &ctrl.phase {
+            assert_eq!(*selection, 0);
+        }
+    }
+
+    #[test]
+    fn picking_forward_then_backward_reverses() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let snap = Snapshot::with_origin(&windows, &test_config(), Some(2));
+        ctrl.pick_with_snapshot(snap);
+
+        // Initial forward selection is 0.
+        if let Phase::Picking { selection, .. } = &ctrl.phase {
+            assert_eq!(*selection, 0);
+        }
+
+        // Forward re-activation: 0 → 1.
+        ctrl.handle(Event::Activate, &windows, &test_config());
+        if let Phase::Picking { selection, .. } = &ctrl.phase {
+            assert_eq!(*selection, 1);
+        }
+
+        // Backward re-activation: 1 → 0.
+        ctrl.handle(Event::ActivateBackward, &windows, &test_config());
+        if let Phase::Picking { selection, .. } = &ctrl.phase {
+            assert_eq!(*selection, 0);
+        }
+
+        // Backward again: 0 → 2 (wraps).
+        ctrl.handle(Event::ActivateBackward, &windows, &test_config());
+        if let Phase::Picking { selection, .. } = &ctrl.phase {
+            assert_eq!(*selection, 2);
+        }
     }
 }
