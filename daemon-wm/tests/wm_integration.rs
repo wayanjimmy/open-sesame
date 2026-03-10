@@ -164,18 +164,21 @@ fn mru_file_roundtrip() {
 // ============================================================================
 
 #[test]
-fn state_idle_to_border() {
+fn state_idle_to_full_overlay() {
     let mut state = WmState::new();
     assert!(state.is_idle());
     let action = state.on_activate();
-    assert_eq!(action, Action::ShowBorder);
+    assert_eq!(action, Action::ShowOverlay);
     assert!(state.is_overlay_visible());
+    assert!(matches!(state, WmState::FullOverlay { selection: 0, .. }));
 }
 
 #[test]
 fn state_border_to_overlay_requires_frames_and_delay() {
-    let mut state = WmState::new();
-    state.on_activate();
+    let mut state = WmState::BorderOnly {
+        entered_at: Instant::now(),
+        frame_count: 0,
+    };
 
     // Frame 1 with 0ms delay — not enough frames.
     let action = state.on_frame(0);
@@ -187,12 +190,13 @@ fn state_border_to_overlay_requires_frames_and_delay() {
 }
 
 #[test]
-fn state_quick_switch_on_fast_release() {
+fn state_fast_release_from_overlay_activates() {
     let mut state = WmState::new();
     state.on_activate();
-    // Release within 500ms window.
+    state.set_window_count(3);
+    // Release activates selection 0.
     let action = state.on_modifier_release(250, 500);
-    assert_eq!(action, Action::QuickSwitch);
+    assert_eq!(action, Action::ActivateWindow(0));
     assert!(state.is_idle());
 }
 
@@ -360,8 +364,10 @@ fn state_alt_release_pending_activates() {
 
 #[test]
 fn state_char_in_border_transitions_to_overlay() {
-    let mut state = WmState::new();
-    state.on_activate();
+    let mut state = WmState::BorderOnly {
+        entered_at: Instant::now(),
+        frame_count: 0,
+    };
     let action = state.on_char('g');
     assert_eq!(action, Action::ShowOverlay);
     assert_eq!(state.input_buffer(), Some("g"));
@@ -373,8 +379,10 @@ fn state_char_in_border_transitions_to_overlay() {
 
 #[test]
 fn state_tab_in_border_transitions_to_overlay() {
-    let mut state = WmState::new();
-    state.on_activate();
+    let mut state = WmState::BorderOnly {
+        entered_at: Instant::now(),
+        frame_count: 0,
+    };
     let action = state.on_selection_down();
     assert_eq!(action, Action::ShowOverlay);
     assert_eq!(state.selection(), Some(1));
@@ -382,8 +390,10 @@ fn state_tab_in_border_transitions_to_overlay() {
 
 #[test]
 fn state_shift_tab_in_border_transitions() {
-    let mut state = WmState::new();
-    state.on_activate();
+    let mut state = WmState::BorderOnly {
+        entered_at: Instant::now(),
+        frame_count: 0,
+    };
     let action = state.on_selection_up();
     assert_eq!(action, Action::ShowOverlay);
     state.set_window_count(5);
@@ -614,20 +624,20 @@ fn scenario_alt_space_repeat_cycles() {
     assert_eq!(state.selection(), Some(0));
 }
 
-/// Alt+Tab repeated should cycle (re-activation from BorderOnly and FullOverlay).
+/// Alt+Tab repeated should cycle selection in FullOverlay.
 #[test]
 fn scenario_alt_tab_repeat_cycles() {
     let mut state = WmState::new();
-    // First: Idle → BorderOnly
-    assert_eq!(state.on_activate(), Action::ShowBorder);
-
-    // Second: BorderOnly → FullOverlay with selection=1
-    let action = state.on_activate();
-    assert_eq!(action, Action::ShowOverlay);
+    // First: Idle → FullOverlay with selection=0
+    assert_eq!(state.on_activate(), Action::ShowOverlay);
     state.set_window_count(3);
+
+    // Second: cycles to 1
+    let action = state.on_activate();
+    assert_eq!(action, Action::Redraw);
     assert_eq!(state.selection(), Some(1));
 
-    // Third: FullOverlay → cycles to 2
+    // Third: cycles to 2
     let action = state.on_activate();
     assert_eq!(action, Action::Redraw);
     assert_eq!(state.selection(), Some(2));
@@ -638,17 +648,16 @@ fn scenario_alt_tab_repeat_cycles() {
     assert_eq!(state.selection(), Some(0));
 }
 
-/// Quick alt+tab with empty MRU should still produce QuickSwitch action.
-/// The caller is responsible for falling back to first non-focused window.
+/// Quick alt+tab activates first window (selection 0).
 #[test]
-fn scenario_quick_alt_tab_empty_mru() {
+fn scenario_quick_alt_tab_activates_first() {
     let mut state = WmState::new();
     state.on_activate();
-    // Fast release within threshold
+    state.set_window_count(3);
+    // Fast release activates selection 0
     let action = state.on_modifier_release(250, 500);
-    assert_eq!(action, Action::QuickSwitch);
+    assert_eq!(action, Action::ActivateWindow(0));
     assert!(state.is_idle());
-    // MRU validation is caller's responsibility — state machine just says QuickSwitch
 }
 
 /// Tab key repeats in FullOverlay should wrap correctly.
