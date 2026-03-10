@@ -26,6 +26,19 @@ fn cosmic_shortcuts_path() -> core_types::Result<PathBuf> {
     Ok(base.join("cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom"))
 }
 
+/// Capitalize a key name to match COSMIC's expected format.
+///
+/// COSMIC uses X11-style key names with initial caps: "Tab", "Space", "Escape",
+/// "Return", etc. Single-character keys (a-z) stay lowercase per XKB convention.
+fn capitalize_key(key: &str) -> String {
+    if key.len() <= 1 {
+        return key.to_string();
+    }
+    let mut chars = key.chars();
+    let first = chars.next().unwrap().to_uppercase().to_string();
+    format!("{first}{}", chars.as_str().to_lowercase())
+}
+
 /// Parse a key combo string like "super+space" into (modifiers, key).
 fn parse_key_combo(combo: &str) -> core_types::Result<(Vec<String>, String)> {
     let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
@@ -33,7 +46,10 @@ fn parse_key_combo(combo: &str) -> core_types::Result<(Vec<String>, String)> {
         return Err(core_types::Error::Platform("empty key combo".into()));
     }
 
-    let key = parts.last().unwrap().to_string();
+    // COSMIC key names are capitalized (e.g. "Tab", "Space", "Escape").
+    // Normalize the key so user input like "tab" becomes "Tab".
+    let raw_key = parts.last().unwrap();
+    let key = capitalize_key(raw_key);
     let modifiers: Vec<String> = parts[..parts.len() - 1]
         .iter()
         .map(|m| match m.to_lowercase().as_str() {
@@ -148,10 +164,10 @@ pub fn setup_keybinding(launcher_key_combo: &str) -> core_types::Result<()> {
     let (launcher_mods, launcher_key) = parse_key_combo(launcher_key_combo)?;
 
     let launcher_binding = format_keybinding(&launcher_mods, &launcher_key, "sesame wm overlay --launcher");
-    let switcher_forward = format_keybinding(&["Alt".to_string()], "tab", "sesame wm overlay");
+    let switcher_forward = format_keybinding(&["Alt".to_string()], "Tab", "sesame wm overlay");
     let switcher_backward = format_keybinding(
         &["Alt".to_string(), "Shift".to_string()],
-        "tab",
+        "Tab",
         "sesame wm overlay --backward",
     );
 
@@ -226,14 +242,14 @@ mod tests {
     fn parse_key_combo_super_space() {
         let (mods, key) = parse_key_combo("super+space").unwrap();
         assert_eq!(mods, vec!["Super"]);
-        assert_eq!(key, "space");
+        assert_eq!(key, "Space");
     }
 
     #[test]
     fn parse_key_combo_alt_tab() {
         let (mods, key) = parse_key_combo("alt+tab").unwrap();
         assert_eq!(mods, vec!["Alt"]);
-        assert_eq!(key, "tab");
+        assert_eq!(key, "Tab");
     }
 
     #[test]
@@ -245,9 +261,9 @@ mod tests {
 
     #[test]
     fn format_keybinding_basic() {
-        let result = format_keybinding(&["Super".to_string()], "space", "sesame");
+        let result = format_keybinding(&["Super".to_string()], "Space", "sesame");
         assert!(result.contains("modifiers: [Super]"));
-        assert!(result.contains("key: \"space\""));
+        assert!(result.contains("key: \"Space\""));
         assert!(result.contains("Spawn(\"sesame\")"));
     }
 
