@@ -247,9 +247,6 @@ enum Phase {
         snap: Snapshot,
         selection: usize,
         input: String,
-        /// Launcher mode ignores ModifierReleased — dismiss only via
-        /// Escape, Confirm, or hint match.
-        launcher: bool,
     },
 }
 
@@ -309,7 +306,6 @@ impl OverlayController {
             snap,
             selection,
             input: String::new(),
-            launcher: false,
         };
     }
 
@@ -395,7 +391,6 @@ impl OverlayController {
                             snap,
                             selection,
                             input: String::new(),
-                            launcher: true,
                         };
                         cmds
                     }
@@ -459,12 +454,6 @@ impl OverlayController {
                     self.activate_index(selection, &snap)
                 }
             }
-            Phase::Picking { launcher: true, snap, selection, input } => {
-                // Launcher mode: ignore modifier release. User dismisses
-                // via hint key, Escape, or Confirm.
-                self.phase = Phase::Picking { snap, selection, input, launcher: true };
-                Vec::new()
-            }
             Phase::Picking { selection, snap, .. } => {
                 self.activate_index(selection, &snap)
             }
@@ -510,7 +499,7 @@ impl OverlayController {
                     windows: snap.overlay_windows.clone(),
                     hints: snap.hints.clone(),
                 }];
-                self.phase = Phase::Picking { snap, selection, input, launcher: false };
+                self.phase = Phase::Picking { snap, selection, input };
                 cmds
             }
             other => {
@@ -606,7 +595,7 @@ impl OverlayController {
                         selection,
                     },
                 ];
-                self.phase = Phase::Picking { snap, selection, input, launcher: false };
+                self.phase = Phase::Picking { snap, selection, input };
                 cmds
             }
             other => {
@@ -1026,16 +1015,15 @@ mod tests {
     }
 
     #[test]
-    fn launcher_modifier_release_is_noop() {
+    fn launcher_modifier_release_commits() {
         let mut ctrl = OverlayController::new();
         let windows = test_windows();
         ctrl.handle(Event::ActivateLauncher, &windows, &test_config());
         ctrl.handle(Event::SelectionDown, &windows, &test_config());
-        // Launcher mode ignores modifier release — user dismisses via
-        // hint key, Escape, or Confirm.
+        // Releasing Alt commits the selection, same as Alt+Tab mode.
         let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
-        assert!(cmds.is_empty());
-        assert!(!ctrl.is_idle()); // still in Picking
+        assert!(cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })));
+        assert!(ctrl.is_idle());
     }
 
     #[test]

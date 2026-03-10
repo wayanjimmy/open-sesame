@@ -286,15 +286,15 @@ fn controller_launcher_skips_armed() {
 }
 
 #[test]
-fn controller_launcher_modifier_release_is_noop() {
+fn controller_launcher_modifier_release_commits() {
     let mut ctrl = OverlayController::new();
     let windows = test_windows();
     ctrl.handle(Event::ActivateLauncher, &windows, &test_config());
     ctrl.handle(Event::SelectionDown, &windows, &test_config());
-    // Launcher mode ignores modifier release.
+    // Releasing Alt commits the selection, same as Alt+Tab mode.
     let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
-    assert!(cmds.is_empty());
-    assert!(!ctrl.is_idle());
+    assert!(cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })));
+    assert!(ctrl.is_idle());
 }
 
 #[test]
