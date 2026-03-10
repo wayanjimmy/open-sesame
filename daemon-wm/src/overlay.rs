@@ -276,6 +276,7 @@ fn run_gtk4_overlay(
 
     // Detect Alt key release for quick-switch.
     let event_tx_cmd = event_tx.clone();
+    let event_tx_poll = event_tx.clone();
     let event_tx_release = event_tx;
     key_controller.connect_key_released(move |_ctrl, keyval, _keycode, _modifiers| {
         if matches!(
@@ -305,10 +306,17 @@ fn run_gtk4_overlay(
     // 4ms interval (~250Hz) balances latency and CPU. Commands are non-blocking
     // try_recv so the GLib loop stays responsive.
     let state_cmd = Rc::clone(&state);
+    let state_poll = Rc::clone(&state);
     let window_cmd = window.clone();
+    let window_poll = window.clone();
     let da_cmd = drawing_area.clone();
     let main_loop = glib::MainLoop::new(None, false);
     let main_loop_quit = main_loop.clone();
+
+    // Track whether we already sent a polled ModifierReleased this cycle
+    // to avoid duplicate events.
+    let modifier_released_sent = Rc::new(RefCell::new(false));
+    let modifier_released_flag = Rc::clone(&modifier_released_sent);
 
     glib::timeout_add_local(std::time::Duration::from_millis(4), move || {
         // Drain all pending commands per tick.
@@ -420,6 +428,39 @@ fn run_gtk4_overlay(
                 }
             }
         }
+
+        // -- Modifier polling safety net --
+        // When activated via COSMIC's system_actions, the compositor may
+        // intercept the Alt key before our surface acquires keyboard
+        // exclusivity. If Alt is released during that race window, we
+        // never see the key-release event and get stuck. Poll the
+        // current modifier state and synthesize ModifierReleased if
+        // Alt/Meta is no longer held.
+        let phase = state_poll.borrow().phase;
+        if phase != OverlayPhase::Hidden {
+            let alt_held = window_poll.surface()
+                .and_then(|surface| surface.display().default_seat())
+                .and_then(|seat| seat.keyboard())
+                .map(|keyboard| {
+                    let mods = keyboard.modifier_state();
+                    mods.contains(gdk::ModifierType::ALT_MASK)
+                })
+                .unwrap_or(true); // assume held if we can't query
+
+            if !alt_held {
+                if !*modifier_released_flag.borrow() {
+                    *modifier_released_flag.borrow_mut() = true;
+                    let _ = event_tx_poll.blocking_send(OverlayEvent::ModifierReleased);
+                }
+            } else {
+                // Alt is held — reset the flag so we detect future releases.
+                *modifier_released_flag.borrow_mut() = false;
+            }
+        } else {
+            // Reset flag when hidden.
+            *modifier_released_flag.borrow_mut() = false;
+        }
+
         glib::ControlFlow::Continue
     });
 
