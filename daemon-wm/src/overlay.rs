@@ -103,6 +103,10 @@ struct OverlayState {
     /// When the overlay was last activated. Used to skip modifier polling
     /// during a grace period while the compositor establishes keyboard focus.
     activated_at: Option<std::time::Instant>,
+    /// Set to true once any keyboard event is received for this activation
+    /// cycle. When true, modifier polling is skipped because keyboard focus
+    /// is confirmed working — the real key-release handler will fire.
+    received_key_event: bool,
 }
 
 /// Grace period (ms) after activation before modifier polling begins.
@@ -121,6 +125,7 @@ impl OverlayState {
             show_app_id,
             show_title,
             activated_at: None,
+            received_key_event: false,
         }
     }
 }
@@ -246,7 +251,10 @@ fn run_gtk4_overlay(
     // Keyboard input controller.
     let key_controller = gtk4::EventControllerKey::new();
     let event_tx_press = event_tx.clone();
+    let state_key = Rc::clone(&state);
     key_controller.connect_key_pressed(move |_ctrl, keyval, _keycode, modifiers| {
+        // Mark that keyboard focus is confirmed working.
+        state_key.borrow_mut().received_key_event = true;
         let event = match keyval {
             gdk::Key::Escape => Some(OverlayEvent::Escape),
             gdk::Key::Return | gdk::Key::KP_Enter => Some(OverlayEvent::Confirm),
@@ -286,7 +294,9 @@ fn run_gtk4_overlay(
     let event_tx_cmd = event_tx.clone();
     let event_tx_poll = event_tx.clone();
     let event_tx_release = event_tx;
+    let state_release = Rc::clone(&state);
     key_controller.connect_key_released(move |_ctrl, keyval, _keycode, _modifiers| {
+        state_release.borrow_mut().received_key_event = true;
         if matches!(
             keyval,
             gdk::Key::Alt_L | gdk::Key::Alt_R | gdk::Key::Meta_L | gdk::Key::Meta_R
@@ -337,6 +347,7 @@ fn run_gtk4_overlay(
                         st.input_buffer.clear();
                         st.selection = 0;
                         st.activated_at = Some(std::time::Instant::now());
+                        st.received_key_event = false;
                     }
                     // Reset modifier poll flag for this activation cycle.
                     *modifier_released_sent.borrow_mut() = false;
@@ -357,6 +368,7 @@ fn run_gtk4_overlay(
                         st.hints = hints;
                         if st.activated_at.is_none() {
                             st.activated_at = Some(std::time::Instant::now());
+                            st.received_key_event = false;
                         }
                     }
                     // Reset modifier poll flag for this activation cycle.
@@ -387,6 +399,7 @@ fn run_gtk4_overlay(
                         st.windows.clear();
                         st.hints.clear();
                         st.activated_at = None;
+                        st.received_key_event = false;
                     }
                     // Release keyboard grab and commit transparent frame.
                     // Surface stays mapped to avoid layer surface destroy.
@@ -412,6 +425,7 @@ fn run_gtk4_overlay(
                         st.windows.clear();
                         st.hints.clear();
                         st.activated_at = None;
+                        st.received_key_event = false;
                     }
                     // Release keyboard grab and commit transparent frame.
                     window_cmd.set_keyboard_mode(KeyboardMode::None);
@@ -459,9 +473,13 @@ fn run_gtk4_overlay(
         let within_grace = st.activated_at
             .map(|t| t.elapsed().as_millis() < MODIFIER_POLL_GRACE_MS)
             .unwrap_or(false);
+        let keyboard_confirmed = st.received_key_event;
         drop(st);
 
-        if phase != OverlayPhase::Hidden && !within_grace {
+        // Only poll modifier state as a safety net when keyboard focus is
+        // NOT confirmed. Once any key event is received, we know the
+        // key-release handler will fire for Alt — no need to poll.
+        if phase != OverlayPhase::Hidden && !within_grace && !keyboard_confirmed {
             let alt_held = window_poll.surface()
                 .and_then(|surface| surface.display().default_seat())
                 .and_then(|seat| seat.keyboard())

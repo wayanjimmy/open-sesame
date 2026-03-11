@@ -537,7 +537,17 @@ impl OverlayController {
             _ => return Vec::new(),
         };
 
-        match hints::match_input(&input, hints) {
+        let match_result = hints::match_input(&input, hints);
+        tracing::debug!(
+            input = %input,
+            ?match_result,
+            ?hints,
+            key_binding_keys = ?key_bindings.keys().collect::<Vec<_>>(),
+            is_armed,
+            "check_hint_or_launch"
+        );
+
+        match match_result {
             MatchResult::Exact(idx) => {
                 // Exact hint match — activate that window. Origin included:
                 // the user explicitly typed a hint, honor the intent.
@@ -939,6 +949,34 @@ mod tests {
         ctrl.handle(Event::Activate, &windows, &test_config());
         let cmds = ctrl.handle(Event::Char('e'), &windows, &test_config());
         assert!(cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })));
+        assert!(ctrl.is_idle());
+    }
+
+    #[test]
+    fn launcher_char_f_launches_firefox_when_not_running() {
+        let mut ctrl = OverlayController::new();
+        // Only ghostty and edge — no firefox window.
+        let windows = vec![test_windows()[0].clone(), test_windows()[2].clone()];
+        ctrl.handle(Event::ActivateLauncher, &windows, &test_config());
+        assert!(matches!(ctrl.phase, Phase::Picking { .. }));
+        let cmds = ctrl.handle(Event::Char('f'), &windows, &test_config());
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::LaunchApp { command } if command == "firefox")),
+            "expected LaunchApp for firefox, got: {cmds:?}"
+        );
+        assert!(ctrl.is_idle());
+    }
+
+    #[test]
+    fn launcher_char_f_focuses_firefox_when_running() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows(); // includes firefox
+        ctrl.handle(Event::ActivateLauncher, &windows, &test_config());
+        let cmds = ctrl.handle(Event::Char('f'), &windows, &test_config());
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })),
+            "expected ActivateWindow for firefox, got: {cmds:?}"
+        );
         assert!(ctrl.is_idle());
     }
 
