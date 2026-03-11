@@ -950,7 +950,7 @@ async fn handle_message(
         EventKind::ProfileActivate { profile_name, .. } => {
             if msg.verified_sender_name.as_deref() != Some("daemon-profile") {
                 tracing::debug!(sender = ?msg.verified_sender_name, "ignoring profile lifecycle event from non-profile sender");
-                return Ok(false);
+                return Ok(true);
             }
             let Some(state) = ctx.unlocked_state.as_mut() else {
                 tracing::warn!(profile = %profile_name, "profile activate while locked");
@@ -978,7 +978,7 @@ async fn handle_message(
         EventKind::ProfileDeactivate { profile_name, .. } => {
             if msg.verified_sender_name.as_deref() != Some("daemon-profile") {
                 tracing::debug!(sender = ?msg.verified_sender_name, "ignoring profile lifecycle event from non-profile sender");
-                return Ok(false);
+                return Ok(true);
             }
             let Some(state) = ctx.unlocked_state.as_mut() else {
                 tracing::warn!(profile = %profile_name, "profile deactivate while locked");
