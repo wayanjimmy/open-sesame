@@ -208,7 +208,7 @@ pub async fn deactivate<W: std::io::Write>(
 ///
 /// The [`ConfirmationGuard`] automatically deregisters the route on drop,
 /// even on timeout or error paths.
-async fn confirmed_rpc(
+pub(crate) async fn confirmed_rpc(
     bus: &BusServer,
     daemon_id: DaemonId,
     event: EventKind,

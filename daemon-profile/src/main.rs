@@ -655,13 +655,46 @@ async fn handle_bus_message<W: std::io::Write>(
         }
 
         EventKind::StatusRequest => {
-            let profiles: Vec<TrustProfileName> = active_profiles.iter().cloned().collect();
-            Some(EventKind::StatusResponse {
-                active_profiles: profiles,
-                default_profile: default_profile_name.clone(),
-                daemon_uptimes_ms: vec![(daemon_id, 0)],
-                locked: *locked,
-            })
+            // Query daemon-secrets for authoritative lock + active profile state
+            // rather than relying on shadow state that may be stale.
+            match activation::confirmed_rpc(
+                bus, daemon_id, EventKind::SecretsStateRequest, confirm_tx, confirm_rx,
+            ).await {
+                Ok(response) => {
+                    if let EventKind::SecretsStateResponse {
+                        locked: auth_locked,
+                        active_profiles: auth_profiles,
+                    } = response.payload {
+                        // Warm the shadow state from the authoritative source.
+                        *locked = auth_locked;
+                        *active_profiles = auth_profiles.iter().cloned().collect();
+                        Some(EventKind::StatusResponse {
+                            active_profiles: auth_profiles,
+                            default_profile: default_profile_name.clone(),
+                            daemon_uptimes_ms: vec![(daemon_id, 0)],
+                            locked: auth_locked,
+                        })
+                    } else {
+                        tracing::warn!("unexpected response to SecretsStateRequest: {:?}", response.payload);
+                        // Fall back to shadow state.
+                        Some(EventKind::StatusResponse {
+                            active_profiles: active_profiles.iter().cloned().collect(),
+                            default_profile: default_profile_name.clone(),
+                            daemon_uptimes_ms: vec![(daemon_id, 0)],
+                            locked: *locked,
+                        })
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to query daemon-secrets for status, using shadow state");
+                    Some(EventKind::StatusResponse {
+                        active_profiles: active_profiles.iter().cloned().collect(),
+                        default_profile: default_profile_name.clone(),
+                        daemon_uptimes_ms: vec![(daemon_id, 0)],
+                        locked: *locked,
+                    })
+                }
+            }
         }
 
         EventKind::ProfileList => {

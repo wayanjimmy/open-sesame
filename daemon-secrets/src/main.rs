@@ -587,19 +587,9 @@ async fn handle_message(
             Some(EventKind::LockResponse { success: true })
         }
 
-        // -- Status --
-        EventKind::StatusRequest => {
-            let locked = ctx.unlocked_state.is_none();
-            let active_profiles = ctx.unlocked_state
-                .as_ref()
-                .map_or_else(Vec::new, |s| s.active_profiles());
-            Some(EventKind::StatusResponse {
-                active_profiles,
-                default_profile: ctx.default_profile.clone(),
-                daemon_uptimes_ms: vec![(ctx.daemon_id, 0)],
-                locked,
-            })
-        }
+        // StatusRequest is handled exclusively by daemon-profile, which queries
+        // daemon-secrets via SecretsStateRequest for authoritative state.
+        EventKind::StatusRequest => None,
 
         // -- Secret Get (profile-scoped) --
         // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
@@ -953,7 +943,15 @@ async fn handle_message(
         }
 
         // -- Profile Activate (authorize + open vault) --
+        // Only process when forwarded by daemon-profile via confirmed_rpc.
+        // The CLI broadcasts ProfileActivate to the bus, but daemon-profile is
+        // the sole orchestrator — it validates config, unicasts to us, and
+        // responds to the CLI. Ignoring broadcast prevents double-processing.
         EventKind::ProfileActivate { profile_name, .. } => {
+            if msg.verified_sender_name.as_deref() != Some("daemon-profile") {
+                tracing::debug!(sender = ?msg.verified_sender_name, "ignoring profile lifecycle event from non-profile sender");
+                return Ok(false);
+            }
             let Some(state) = ctx.unlocked_state.as_mut() else {
                 tracing::warn!(profile = %profile_name, "profile activate while locked");
                 return send_response(ctx.client, msg, EventKind::ProfileActivateResponse { success: false }, ctx.daemon_id).await;
@@ -976,7 +974,12 @@ async fn handle_message(
         }
 
         // -- Profile Deactivate (deauthorize, flush JIT, close vault) --
+        // Same sender gate as ProfileActivate — only from daemon-profile.
         EventKind::ProfileDeactivate { profile_name, .. } => {
+            if msg.verified_sender_name.as_deref() != Some("daemon-profile") {
+                tracing::debug!(sender = ?msg.verified_sender_name, "ignoring profile lifecycle event from non-profile sender");
+                return Ok(false);
+            }
             let Some(state) = ctx.unlocked_state.as_mut() else {
                 tracing::warn!(profile = %profile_name, "profile deactivate while locked");
                 return send_response(ctx.client, msg, EventKind::ProfileDeactivateResponse { success: false }, ctx.daemon_id).await;
