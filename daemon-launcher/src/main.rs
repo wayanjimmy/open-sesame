@@ -342,6 +342,41 @@ fn apply_sandbox() {
     }
 }
 
+/// Resolve a desktop entry ID against the cache with fallback strategies.
+///
+/// 1. Exact match on the full ID
+/// 2. Last dot-separated segment match (e.g. "firefox" matches "org.mozilla.firefox")
+/// 3. Case-insensitive full ID match
+fn resolve_entry<'a>(
+    entry_id: &str,
+    cache: &'a HashMap<String, scanner::CachedEntry>,
+) -> Option<&'a scanner::CachedEntry> {
+    // Strategy 1: exact match
+    if let Some(entry) = cache.get(entry_id) {
+        return Some(entry);
+    }
+
+    // Strategy 2: last segment match (e.g., "firefox" matches "org.mozilla.firefox")
+    let lower = entry_id.to_lowercase();
+    if let Some(entry) = cache.values().find(|e| {
+        e.id.rsplit('.')
+            .next()
+            .map(|seg| seg.to_lowercase() == lower)
+            .unwrap_or(false)
+    }) {
+        tracing::info!(entry_id, resolved_id = %entry.id, "resolved via last-segment match");
+        return Some(entry);
+    }
+
+    // Strategy 3: case-insensitive full ID match
+    if let Some(entry) = cache.values().find(|e| e.id.to_lowercase() == lower) {
+        tracing::info!(entry_id, resolved_id = %entry.id, "resolved via case-insensitive match");
+        return Some(entry);
+    }
+
+    None
+}
+
 /// Launch a desktop entry by its app ID using the pre-sandbox cache.
 ///
 /// Looks up the entry's Exec line from the cache (populated before sandbox),
@@ -353,9 +388,8 @@ fn launch_entry(
     profile: Option<&str>,
     cache: &HashMap<String, scanner::CachedEntry>,
 ) -> anyhow::Result<u32> {
-    let cached = cache
-        .get(entry_id)
-        .ok_or_else(|| anyhow::anyhow!("desktop entry '{entry_id}' not found"))?;
+    let cached = resolve_entry(entry_id, cache)
+        .ok_or_else(|| anyhow::anyhow!("desktop entry '{entry_id}' not found in {} cached entries", cache.len()))?;
 
     let exec = scanner::strip_field_codes(&cached.exec);
     let parts = scanner::tokenize_exec(&exec);
@@ -377,4 +411,45 @@ fn launch_entry(
         .context("failed to spawn process")?;
 
     Ok(child.id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cache() -> HashMap<String, scanner::CachedEntry> {
+        let entries = vec![
+            scanner::CachedEntry { id: "org.mozilla.firefox".into(), exec: "firefox".into() },
+            scanner::CachedEntry { id: "com.mitchellh.ghostty".into(), exec: "ghostty".into() },
+            scanner::CachedEntry { id: "Alacritty".into(), exec: "alacritty".into() },
+        ];
+        entries.into_iter().map(|e| (e.id.clone(), e)).collect()
+    }
+
+    #[test]
+    fn resolve_exact_match() {
+        let cache = test_cache();
+        let entry = resolve_entry("org.mozilla.firefox", &cache).unwrap();
+        assert_eq!(entry.id, "org.mozilla.firefox");
+    }
+
+    #[test]
+    fn resolve_last_segment_match() {
+        let cache = test_cache();
+        let entry = resolve_entry("firefox", &cache).unwrap();
+        assert_eq!(entry.id, "org.mozilla.firefox");
+    }
+
+    #[test]
+    fn resolve_case_insensitive_match() {
+        let cache = test_cache();
+        let entry = resolve_entry("alacritty", &cache).unwrap();
+        assert_eq!(entry.id, "Alacritty");
+    }
+
+    #[test]
+    fn resolve_no_match() {
+        let cache = test_cache();
+        assert!(resolve_entry("nonexistent", &cache).is_none());
+    }
 }

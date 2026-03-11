@@ -146,7 +146,7 @@ pub fn key_for_app(app_id: &str, key_bindings: &BTreeMap<String, WmKeyBinding>) 
 /// Look up the launch command for a key character.
 #[must_use]
 pub fn launch_for_key(key: char, key_bindings: &BTreeMap<String, WmKeyBinding>) -> Option<&str> {
-    let key_str = key.to_string();
+    let key_str = key.to_lowercase().to_string();
     key_bindings.get(&key_str).and_then(|b| b.launch.as_deref())
 }
 
@@ -267,6 +267,18 @@ mod tests {
         assert!(hint_strs.contains(&"ff"));
         assert!(hint_strs.contains(&"g"));
         assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn launch_for_key_case_insensitive() {
+        let mut bindings = BTreeMap::new();
+        bindings.insert("f".to_string(), WmKeyBinding {
+            apps: vec!["app-f".into()],
+            launch: Some("app-f".into()),
+        });
+        assert_eq!(launch_for_key('f', &bindings), Some("app-f"));
+        assert_eq!(launch_for_key('F', &bindings), Some("app-f"));
+        assert_eq!(launch_for_key('z', &bindings), None);
     }
 
     #[test]
