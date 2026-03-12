@@ -333,21 +333,32 @@ fn controller_dwell_timeout_shows_picker() {
 // ============================================================================
 
 #[test]
-fn controller_char_launches_app_when_no_window() {
+fn controller_char_stages_launch_when_no_window() {
     let mut ctrl = OverlayController::new();
     let windows = vec![test_windows()[0].clone()]; // only ghostty
     ctrl.handle(Event::Activate, &windows, &test_config());
+    // 'e' has no window → stages launch, does NOT execute on keypress.
     let cmds = ctrl.handle(Event::Char('e'), &windows, &test_config());
+    assert!(cmds.iter().any(|c| matches!(c, Command::ShowLaunchStaged { .. })),
+        "must stage launch, got: {cmds:?}");
+    assert!(!ctrl.is_idle());
+    // Alt release executes the staged launch.
+    let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
     assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "microsoft-edge")));
-    assert!(!ctrl.is_idle()); // In Launching phase, waiting for LaunchResult
 }
 
 #[test]
-fn controller_char_activates_on_exact_hint() {
+fn controller_char_selects_on_exact_hint() {
     let mut ctrl = OverlayController::new();
     let windows = test_windows();
     ctrl.handle(Event::Activate, &windows, &test_config());
+    // 'e' matches edge hint → selects, does NOT commit on keypress.
     let cmds = ctrl.handle(Event::Char('e'), &windows, &test_config());
+    assert!(!cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })),
+        "must NOT activate on keypress");
+    assert!(!ctrl.is_idle());
+    // Alt release commits.
+    let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
     assert!(cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })));
     assert!(ctrl.is_idle());
 }

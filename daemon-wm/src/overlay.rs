@@ -43,6 +43,10 @@ pub enum OverlayCmd {
     HideAndSync,
     /// Show "Launching..." status.
     ShowLaunching,
+    /// Show staged launch intent (waiting for Alt release to confirm).
+    ShowLaunchStaged {
+        command: String,
+    },
     /// Show launch error with message.
     ShowLaunchError {
         message: String,
@@ -472,6 +476,16 @@ fn run_gtk4_overlay(
                     }
                     let _ = event_tx_cmd.blocking_send(OverlayEvent::SurfaceUnmapped);
                 }
+                OverlayCmd::ShowLaunchStaged { command } => {
+                    // Show staged intent — picker stays visible with a
+                    // status indicator. Phase stays Full so keyboard
+                    // events still route to the controller.
+                    {
+                        let mut st = state_cmd.borrow_mut();
+                        st.error_message = format!("Launch: {command} (release Alt to confirm)");
+                    }
+                    da_cmd.queue_draw();
+                }
                 OverlayCmd::ShowLaunching => {
                     {
                         let mut st = state_cmd.borrow_mut();
@@ -542,10 +556,14 @@ fn run_gtk4_overlay(
         let keyboard_confirmed = st.received_key_event;
         drop(st);
 
-        // Only poll modifier state as a safety net when keyboard focus is
-        // NOT confirmed. Once any key event is received, we know the
-        // key-release handler will fire for Alt — no need to poll.
-        if phase != OverlayPhase::Hidden && !within_grace && !keyboard_confirmed {
+        // Only poll modifier state as a safety net when keyboard focus IS
+        // confirmed (at least one key event received). Before that, the
+        // modifier state is unreliable — IPC activations (e.g. COSMIC
+        // system actions) consume the Alt press, so the overlay's keyboard
+        // device never sees it and modifier_state() won't include ALT_MASK
+        // even when Alt is physically held. The key-release handler is the
+        // primary commit mechanism; this poll is a backup for missed releases.
+        if phase != OverlayPhase::Hidden && !within_grace && keyboard_confirmed {
             let alt_held = window_poll.surface()
                 .and_then(|surface| surface.display().default_seat())
                 .and_then(|seat| seat.keyboard())

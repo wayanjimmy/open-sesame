@@ -66,8 +66,10 @@ pub enum Command {
         message: String,
         denial: Option<LaunchDenial>,
     },
-    /// Show "Launching..." spinner/status in the overlay.
+    /// Show "Launching..." spinner/status in the overlay (launch in progress).
     ShowLaunching,
+    /// Show staged launch intent in the overlay (waiting for Alt release).
+    ShowLaunchStaged { command: String },
     /// Reset the overlay's modifier-poll grace timer. Sent on IPC
     /// re-activation to prove Alt is still held and prevent premature commit.
     ResetGrace,
@@ -250,6 +252,14 @@ impl Snapshot {
 // Controller state
 // ---------------------------------------------------------------------------
 
+/// Staged launch — user typed a launch key but hasn't released Alt yet.
+/// Stored in Armed/Picking so `on_modifier_released` can execute it.
+#[derive(Debug, Clone)]
+struct PendingLaunch {
+    command: String,
+    tags: Vec<String>,
+}
+
 #[derive(Debug)]
 enum Phase {
     Idle,
@@ -259,11 +269,13 @@ enum Phase {
         selection: usize,
         input: String,
         dwell_ms: u32,
+        pending_launch: Option<PendingLaunch>,
     },
     Picking {
         snap: Snapshot,
         selection: usize,
         input: String,
+        pending_launch: Option<PendingLaunch>,
     },
     /// Waiting for LaunchExecuteResponse from daemon-launcher.
     Launching,
@@ -317,6 +329,7 @@ impl OverlayController {
             selection,
             input: String::new(),
             dwell_ms,
+            pending_launch: None,
         };
     }
 
@@ -328,6 +341,7 @@ impl OverlayController {
             snap,
             selection,
             input: String::new(),
+            pending_launch: None,
         };
     }
 
@@ -386,6 +400,7 @@ impl OverlayController {
                             selection,
                             input: String::new(),
                             dwell_ms: config.quick_switch_threshold_ms,
+                            pending_launch: None,
                         };
                         vec![
                             Command::ShowBorder,
@@ -400,6 +415,7 @@ impl OverlayController {
                             selection,
                             input: String::new(),
                             dwell_ms: config.quick_switch_threshold_ms,
+                            pending_launch: None,
                         };
                         vec![
                             Command::ShowBorder,
@@ -418,6 +434,7 @@ impl OverlayController {
                             selection,
                             input: String::new(),
                             dwell_ms: config.overlay_delay_ms.min(100),
+                            pending_launch: None,
                         };
                         vec![
                             Command::ShowBorder,
@@ -426,7 +443,7 @@ impl OverlayController {
                     }
                 }
             }
-            Phase::Armed { snap, mut selection, input, .. } => {
+            Phase::Armed { snap, mut selection, input, pending_launch, .. } => {
                 // Re-activation via IPC (e.g. repeated Alt+Space intercepted
                 // by compositor). Cycle selection, show the picker so the user
                 // sees feedback, and reset the modifier-poll grace timer to
@@ -449,10 +466,10 @@ impl OverlayController {
                     },
                     Command::ResetGrace,
                 ];
-                self.phase = Phase::Picking { snap, selection, input };
+                self.phase = Phase::Picking { snap, selection, input, pending_launch };
                 cmds
             }
-            Phase::Picking { snap, mut selection, input } => {
+            Phase::Picking { snap, mut selection, input, pending_launch } => {
                 // Re-activation while picker is visible. Cycle and reset grace.
                 if !snap.windows.is_empty() {
                     let len = snap.windows.len();
@@ -468,7 +485,7 @@ impl OverlayController {
                     },
                     Command::ResetGrace,
                 ];
-                self.phase = Phase::Picking { snap, selection, input };
+                self.phase = Phase::Picking { snap, selection, input, pending_launch };
                 cmds
             }
             other @ (Phase::Launching | Phase::LaunchError) => {
@@ -490,7 +507,20 @@ impl OverlayController {
                 selection,
                 input,
                 snap,
+                pending_launch,
             } => {
+                // Pending launch takes priority over window activation.
+                if let Some(launch) = pending_launch {
+                    self.phase = Phase::Launching;
+                    return vec![
+                        Command::ShowLaunching,
+                        Command::LaunchApp {
+                            command: launch.command,
+                            tags: launch.tags,
+                        },
+                    ];
+                }
+
                 let elapsed = entered_at.elapsed().as_millis() as u32;
 
                 if elapsed < dwell_ms && selection == snap.initial_forward() && input.is_empty() {
@@ -501,7 +531,18 @@ impl OverlayController {
                     self.activate_index(selection, &snap)
                 }
             }
-            Phase::Picking { selection, snap, .. } => {
+            Phase::Picking { selection, snap, pending_launch, .. } => {
+                // Pending launch takes priority over window activation.
+                if let Some(launch) = pending_launch {
+                    self.phase = Phase::Launching;
+                    return vec![
+                        Command::ShowLaunching,
+                        Command::LaunchApp {
+                            command: launch.command,
+                            tags: launch.tags,
+                        },
+                    ];
+                }
                 self.activate_index(selection, &snap)
             }
             other @ (Phase::Idle | Phase::Launching | Phase::LaunchError) => {
@@ -544,12 +585,12 @@ impl OverlayController {
 
     fn on_dwell_timeout(&mut self) -> Vec<Command> {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
-            Phase::Armed { snap, selection, input, .. } => {
+            Phase::Armed { snap, selection, input, pending_launch, .. } => {
                 let cmds = vec![Command::ShowPicker {
                     windows: snap.overlay_windows.clone(),
                     hints: snap.hints.clone(),
                 }];
-                self.phase = Phase::Picking { snap, selection, input };
+                self.phase = Phase::Picking { snap, selection, input, pending_launch };
                 cmds
             }
             other => {
@@ -606,27 +647,46 @@ impl OverlayController {
 
         match match_result {
             MatchResult::Exact(idx) => {
-                // Exact hint match — activate that window. Origin included:
-                // the user explicitly typed a hint, honor the intent.
-                let snap = match std::mem::replace(&mut self.phase, Phase::Idle) {
-                    Phase::Armed { snap, .. } | Phase::Picking { snap, .. } => snap,
-                    _ => unreachable!(),
-                };
-                self.activate_index(idx, &snap)
+                // Exact hint match — SELECT the window, do NOT commit.
+                // Commitment only happens on Alt release (on_modifier_released)
+                // or explicit Enter (on_confirm). This gives the user time to
+                // see the selection, press Backspace to correct, or Escape.
+                self.update_selection(idx);
+                // Clear any pending launch — user switched to window selection.
+                self.clear_pending_launch();
+                if is_armed {
+                    self.transition_armed_to_picking()
+                } else {
+                    vec![Command::UpdatePicker {
+                        input,
+                        selection: idx,
+                    }]
+                }
             }
             MatchResult::NoMatch => {
                 if input.len() == 1 {
                     let key = input.chars().next().unwrap();
                     if let Some(cmd) = hints::launch_for_key(key, key_bindings) {
+                        // Stage the launch — do NOT execute yet.
+                        // Commitment happens on Alt release or Enter.
+                        // User can Backspace to cancel or Escape to dismiss.
                         let command = cmd.to_string();
                         let tags = hints::tags_for_key(key, key_bindings);
-                        self.phase = Phase::Launching;
-                        return vec![
-                            Command::ShowLaunching,
-                            Command::LaunchApp { command, tags },
-                        ];
+                        self.set_pending_launch(PendingLaunch { command: command.clone(), tags });
+                        let mut cmds = if is_armed {
+                            self.transition_armed_to_picking()
+                        } else {
+                            vec![Command::UpdatePicker {
+                                input,
+                                selection: self.current_selection(),
+                            }]
+                        };
+                        cmds.push(Command::ShowLaunchStaged { command });
+                        return cmds;
                     }
                 }
+                // Clear any pending launch — input no longer matches.
+                self.clear_pending_launch();
                 if is_armed {
                     self.transition_armed_to_picking()
                 } else {
@@ -637,6 +697,8 @@ impl OverlayController {
                 }
             }
             MatchResult::Partial(_) => {
+                // Clear any pending launch — still typing.
+                self.clear_pending_launch();
                 if is_armed {
                     self.transition_armed_to_picking()
                 } else {
@@ -651,7 +713,7 @@ impl OverlayController {
 
     fn transition_armed_to_picking(&mut self) -> Vec<Command> {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
-            Phase::Armed { snap, selection, input, .. } => {
+            Phase::Armed { snap, selection, input, pending_launch, .. } => {
                 let cmds = vec![
                     Command::ShowPicker {
                         windows: snap.overlay_windows.clone(),
@@ -662,7 +724,7 @@ impl OverlayController {
                         selection,
                     },
                 ];
-                self.phase = Phase::Picking { snap, selection, input };
+                self.phase = Phase::Picking { snap, selection, input, pending_launch };
                 cmds
             }
             other => {
@@ -720,12 +782,19 @@ impl OverlayController {
 
     fn on_backspace(&mut self) -> Vec<Command> {
         match &mut self.phase {
-            Phase::Armed { input, .. } => {
+            Phase::Armed { input, pending_launch, .. } => {
                 input.pop();
+                // Clear pending launch if input is emptied (user cancelled).
+                if input.is_empty() {
+                    *pending_launch = None;
+                }
                 Vec::new()
             }
-            Phase::Picking { input, selection, .. } => {
+            Phase::Picking { input, selection, pending_launch, .. } => {
                 input.pop();
+                if input.is_empty() {
+                    *pending_launch = None;
+                }
                 vec![Command::UpdatePicker {
                     input: input.clone(),
                     selection: *selection,
@@ -794,6 +863,33 @@ impl OverlayController {
         match &self.phase {
             Phase::Armed { selection, .. } | Phase::Picking { selection, .. } => *selection,
             _ => 0,
+        }
+    }
+
+    fn update_selection(&mut self, idx: usize) {
+        match &mut self.phase {
+            Phase::Armed { selection, .. } | Phase::Picking { selection, .. } => {
+                *selection = idx;
+            }
+            _ => {}
+        }
+    }
+
+    fn set_pending_launch(&mut self, launch: PendingLaunch) {
+        match &mut self.phase {
+            Phase::Armed { pending_launch, .. } | Phase::Picking { pending_launch, .. } => {
+                *pending_launch = Some(launch);
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_pending_launch(&mut self) {
+        match &mut self.phase {
+            Phase::Armed { pending_launch, .. } | Phase::Picking { pending_launch, .. } => {
+                *pending_launch = None;
+            }
+            _ => {}
         }
     }
 }
@@ -1005,17 +1101,23 @@ mod tests {
             "full-circle cycling must visit all {snap_len} indices, visited {visited:?}");
     }
 
-    // === Hint match activates origin when user explicitly types it ===
+    // === Hint match selects, does NOT commit (commit on Alt release) ===
 
     #[test]
-    fn hint_match_honors_origin() {
+    fn hint_match_selects_origin_without_commit() {
         let mut ctrl = OverlayController::new();
         let windows = test_windows();
         ctrl.handle(Event::Activate, &windows, &test_config());
         // 'g' is the hint for ghostty (the origin/focused window).
-        // User explicitly typed it — must be honored.
+        // Typing it SELECTS ghostty but does NOT commit.
         let cmds = ctrl.handle(Event::Char('g'), &windows, &test_config());
-        assert!(cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })));
+        assert!(!cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })),
+            "hint match must NOT activate on keypress");
+        assert!(!ctrl.is_idle(), "must stay in Picking, not Idle");
+        // Alt release commits the selection.
+        let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
+        assert!(cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })),
+            "Alt release must commit the hint selection");
         assert!(ctrl.is_idle());
     }
 
@@ -1031,56 +1133,95 @@ mod tests {
         assert!(matches!(ctrl.phase, Phase::Picking { .. }));
     }
 
-    // === Char input — launch-or-focus ===
+    // === Char input — stage launch or select, never commit on keypress ===
 
     #[test]
-    fn char_launches_app_when_no_window() {
+    fn char_stages_launch_when_no_window() {
         let mut ctrl = OverlayController::new();
         let windows = vec![test_windows()[0].clone()]; // only ghostty
         ctrl.handle(Event::Activate, &windows, &test_config());
+        // 'e' has no window → stages launch, does NOT execute.
         let cmds = ctrl.handle(Event::Char('e'), &windows, &test_config());
-        assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "microsoft-edge")));
-        assert!(matches!(ctrl.phase, Phase::Launching));
+        assert!(cmds.iter().any(|c| matches!(c, Command::ShowLaunchStaged { .. })),
+            "must show staged launch, got: {cmds:?}");
+        assert!(!cmds.iter().any(|c| matches!(c, Command::LaunchApp { .. })),
+            "must NOT execute launch on keypress");
+        assert!(matches!(ctrl.phase, Phase::Picking { .. }));
+        // Alt release executes the staged launch.
+        let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
+        assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "microsoft-edge")),
+            "Alt release must execute staged launch");
     }
 
     #[test]
-    fn char_matches_hint_activates() {
+    fn char_selects_hint_without_commit() {
         let mut ctrl = OverlayController::new();
         let windows = test_windows();
         ctrl.handle(Event::Activate, &windows, &test_config());
+        // 'e' matches edge window hint → selects, does NOT commit.
         let cmds = ctrl.handle(Event::Char('e'), &windows, &test_config());
+        assert!(!cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })),
+            "hint match must NOT activate on keypress");
+        assert!(!ctrl.is_idle());
+        // Alt release commits.
+        let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
         assert!(cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })));
         assert!(ctrl.is_idle());
     }
 
     #[test]
-    fn launcher_char_f_launches_firefox_when_not_running() {
+    fn launcher_char_f_stages_launch_when_not_running() {
         let mut ctrl = OverlayController::new();
         // Only ghostty and edge — no firefox window.
         let windows = vec![test_windows()[0].clone(), test_windows()[2].clone()];
         ctrl.handle(Event::ActivateLauncher, &windows, &test_config());
         assert!(matches!(ctrl.phase, Phase::Armed { .. }));
-        // Char input works in Armed phase (the fix: keyboard focus acquired).
+        // 'f' has no window → stages launch, does NOT execute.
         let cmds = ctrl.handle(Event::Char('f'), &windows, &test_config());
         assert!(
-            cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "firefox")),
-            "expected LaunchApp for firefox, got: {cmds:?}"
+            cmds.iter().any(|c| matches!(c, Command::ShowLaunchStaged { .. })),
+            "expected ShowLaunchStaged for firefox, got: {cmds:?}"
         );
-        assert!(matches!(ctrl.phase, Phase::Launching));
+        assert!(matches!(ctrl.phase, Phase::Picking { .. }));
+        // Alt release executes.
+        let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
+        assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "firefox")));
     }
 
     #[test]
-    fn launcher_char_f_focuses_firefox_when_running() {
+    fn launcher_char_f_selects_firefox_when_running() {
         let mut ctrl = OverlayController::new();
         let windows = test_windows(); // includes firefox
         ctrl.handle(Event::ActivateLauncher, &windows, &test_config());
-        // Char input in Armed phase — keyboard focus already acquired.
+        // 'f' matches firefox hint → selects, does NOT commit.
         let cmds = ctrl.handle(Event::Char('f'), &windows, &test_config());
         assert!(
-            cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })),
-            "expected ActivateWindow for firefox, got: {cmds:?}"
+            !cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })),
+            "hint match must NOT activate on keypress, got: {cmds:?}"
         );
+        assert!(!ctrl.is_idle());
+        // Alt release commits.
+        let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
+        assert!(cmds.iter().any(|c| matches!(c, Command::ActivateWindow { .. })));
         assert!(ctrl.is_idle());
+    }
+
+    #[test]
+    fn backspace_cancels_staged_launch() {
+        let mut ctrl = OverlayController::new();
+        let windows = vec![test_windows()[0].clone()]; // only ghostty
+        ctrl.handle(Event::Activate, &windows, &test_config());
+        ctrl.handle(Event::DwellTimeout, &windows, &test_config());
+        // Stage a launch.
+        ctrl.handle(Event::Char('e'), &windows, &test_config());
+        assert!(matches!(ctrl.phase, Phase::Picking { pending_launch: Some(_), .. }));
+        // Backspace clears input and pending launch.
+        ctrl.handle(Event::Backspace, &windows, &test_config());
+        assert!(matches!(ctrl.phase, Phase::Picking { pending_launch: None, .. }));
+        // Alt release now activates a window, not a launch.
+        let cmds = ctrl.handle(Event::ModifierReleased, &windows, &test_config());
+        assert!(!cmds.iter().any(|c| matches!(c, Command::LaunchApp { .. })),
+            "backspace must cancel staged launch");
     }
 
     // === Navigation shows picker ===
