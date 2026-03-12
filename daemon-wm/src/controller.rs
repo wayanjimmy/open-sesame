@@ -387,7 +387,10 @@ impl OverlayController {
             Phase::Idle => {
                 let snap = Snapshot::build(windows, config);
 
-                if !snap.has_targets() {
+                // Launcher mode always activates — it's a launcher, not just
+                // a switcher. Zero windows is a valid state for launching apps.
+                // Forward/Backward require at least one switchable target.
+                if !matches!(mode, ActivationMode::Launcher) && !snap.has_targets() {
                     return Vec::new();
                 }
 
@@ -1061,11 +1064,34 @@ mod tests {
     }
 
     #[test]
-    fn no_targets_is_noop() {
+    fn no_targets_is_noop_for_switcher() {
         let mut ctrl = OverlayController::new();
         let cmds = ctrl.handle(Event::Activate, &[], &test_config());
         assert!(cmds.is_empty());
         assert!(ctrl.is_idle());
+    }
+
+    #[test]
+    fn launcher_activates_with_zero_windows() {
+        let mut ctrl = OverlayController::new();
+        let cmds = ctrl.handle(Event::ActivateLauncher, &[], &test_config());
+        assert!(cmds.iter().any(|c| matches!(c, Command::ShowBorder)),
+            "launcher must activate even with zero windows");
+        assert!(!ctrl.is_idle());
+    }
+
+    #[test]
+    fn launcher_zero_windows_can_stage_launch() {
+        let mut ctrl = OverlayController::new();
+        let config = test_config();
+        ctrl.handle(Event::ActivateLauncher, &[], &config);
+        // Type 'g' — no ghostty window, but launch binding exists.
+        let cmds = ctrl.handle(Event::Char('g'), &[], &config);
+        assert!(cmds.iter().any(|c| matches!(c, Command::ShowLaunchStaged { .. })),
+            "must stage ghostty launch with zero windows, got: {cmds:?}");
+        // Alt release executes.
+        let cmds = ctrl.handle(Event::ModifierReleased, &[], &config);
+        assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "ghostty")));
     }
 
     // === Full-circle cycling reaches origin ===
