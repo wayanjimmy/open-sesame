@@ -50,11 +50,20 @@ enum Command {
     /// Show daemon status, active profiles, and lock state.
     Status,
 
-    /// Unlock the secrets daemon with master password.
-    Unlock,
+    /// Unlock a vault with its password.
+    Unlock {
+        /// Target profile (default: "default"). Omit to unlock the default profile,
+        /// or set SESAME_UNLOCK_PROFILES=profile1,profile2 for bulk unlock.
+        #[arg(short, long)]
+        profile: Option<String>,
+    },
 
-    /// Lock the secrets daemon (zeroize cached master key).
-    Lock,
+    /// Lock a vault (zeroize cached key material).
+    Lock {
+        /// Target profile. Omit to lock all vaults.
+        #[arg(short, long)]
+        profile: Option<String>,
+    },
 
     /// Profile management.
     #[command(subcommand)]
@@ -381,8 +390,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Command::Status => cmd_status().await,
-        Command::Unlock => cmd_unlock().await,
-        Command::Lock => cmd_lock().await,
+        Command::Unlock { profile } => cmd_unlock(profile).await,
+        Command::Lock { profile } => cmd_lock(profile).await,
         Command::Profile(sub) => match sub {
             ProfileCmd::List => cmd_profile_list().await,
             ProfileCmd::Activate { name } => cmd_profile_activate(&name).await,
@@ -525,15 +534,31 @@ async fn cmd_status() -> anyhow::Result<()> {
             active_profiles,
             default_profile,
             locked,
+            lock_state,
             ..
         } => {
-            let lock_status = if locked {
-                "locked".red().bold().to_string()
+            // Per-profile lock state display.
+            if lock_state.is_empty() {
+                // Fallback: daemon didn't return per-profile state, use global locked flag.
+                let lock_status = if locked {
+                    "locked".red().bold().to_string()
+                } else {
+                    "unlocked".green().bold().to_string()
+                };
+                println!("Secrets daemon: {lock_status}");
             } else {
-                "unlocked".green().bold().to_string()
-            };
+                println!("Vaults:");
+                let max_name_len = lock_state.keys().map(|k| k.as_ref().len()).max().unwrap_or(0);
+                for (profile, is_locked) in &lock_state {
+                    let status = if *is_locked {
+                        "locked".red().bold().to_string()
+                    } else {
+                        "unlocked".green().bold().to_string()
+                    };
+                    println!("  {:width$}  {status}", profile.as_ref(), width = max_name_len);
+                }
+            }
 
-            println!("Secrets daemon: {lock_status}");
             println!("Default profile: {}", default_profile.as_ref().bold());
 
             if active_profiles.is_empty() {
@@ -552,67 +577,109 @@ async fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_unlock() -> anyhow::Result<()> {
+/// Parse SESAME_UNLOCK_PROFILES env var.
+/// Supports: `profile1,profile2` or `org:profile1,profile2;org2:profile3`
+fn parse_unlock_profiles(input: &str) -> Vec<String> {
+    input.split(';')
+        .flat_map(|group| {
+            let vaults = if let Some((_org, vaults)) = group.split_once(':') {
+                vaults
+            } else {
+                group
+            };
+            vaults.split(',').map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+async fn cmd_unlock(profile_arg: Option<String>) -> anyhow::Result<()> {
     let client = connect().await?;
 
-    // Check if already unlocked.
-    if let EventKind::StatusResponse { locked: false, .. } =
-        rpc(&client, EventKind::StatusRequest, SecurityLevel::Internal).await?
-    {
-        println!("Already unlocked.");
-        return Ok(());
-    }
-
-    let mut password = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        dialoguer::Password::new()
-            .with_prompt("Master password")
-            .interact()
-            .context("failed to read password")?
-    } else {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-            .context("failed to read password from stdin")?;
-        if buf.ends_with('\n') {
-            buf.pop();
-            if buf.ends_with('\r') {
-                buf.pop();
+    // Determine which profiles to unlock.
+    let profiles: Vec<String> = match profile_arg {
+        Some(p) => vec![p],
+        None => {
+            if let Ok(env_val) = std::env::var("SESAME_UNLOCK_PROFILES") {
+                parse_unlock_profiles(&env_val)
+            } else {
+                vec!["default".to_string()]
             }
         }
-        buf
     };
 
-    let mut password_bytes = password.as_bytes().to_vec();
-    password.zeroize();
+    for profile_name in &profiles {
+        let target_profile = TrustProfileName::try_from(profile_name.as_str())
+            .map_err(|e| anyhow::anyhow!("invalid profile name '{profile_name}': {e}"))?;
 
-    let event = EventKind::UnlockRequest {
-        password: SensitiveBytes::new(std::mem::take(&mut password_bytes)),
-    };
-    password_bytes.zeroize();
+        let mut password = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            dialoguer::Password::new()
+                .with_prompt(format!("Password for vault '{profile_name}'"))
+                .interact()
+                .context("failed to read password")?
+        } else {
+            let mut buf = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+                .context("failed to read password from stdin")?;
+            if buf.ends_with('\n') {
+                buf.pop();
+                if buf.ends_with('\r') {
+                    buf.pop();
+                }
+            }
+            if buf.is_empty() {
+                anyhow::bail!("empty password from stdin for vault '{profile_name}' — refusing to unlock with no password");
+            }
+            buf
+        };
 
-    match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-        EventKind::UnlockResponse { success: true } => {
-            println!("{}", "Secrets unlocked.".green());
+        let mut password_bytes = password.as_bytes().to_vec();
+        password.zeroize();
+
+        let event = EventKind::UnlockRequest {
+            password: SensitiveBytes::new(std::mem::take(&mut password_bytes)),
+            profile: Some(target_profile),
+        };
+        password_bytes.zeroize();
+
+        match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
+            EventKind::UnlockResponse { success: true, profile } => {
+                println!("{}", format!("Vault '{}' unlocked.", profile).green());
+            }
+            EventKind::UnlockResponse { success: false, profile } => {
+                anyhow::bail!("unlock failed for vault '{}' — wrong password or keyring error", profile);
+            }
+            EventKind::UnlockRejected { reason: core_types::UnlockRejectedReason::AlreadyUnlocked, profile } => {
+                println!("{}", format!("Vault '{}' already unlocked.", profile.as_ref().map_or("unknown", |p| p.as_ref())).yellow());
+            }
+            other => anyhow::bail!("unexpected response: {other:?}"),
         }
-        EventKind::UnlockResponse { success: false } => {
-            anyhow::bail!("unlock failed — wrong password or keyring error");
-        }
-        EventKind::UnlockRejected { reason: core_types::UnlockRejectedReason::AlreadyUnlocked } => {
-            println!("{}", "Already unlocked.".yellow());
-        }
-        other => anyhow::bail!("unexpected response: {other:?}"),
     }
 
     Ok(())
 }
 
-async fn cmd_lock() -> anyhow::Result<()> {
+async fn cmd_lock(profile_arg: Option<String>) -> anyhow::Result<()> {
     let client = connect().await?;
 
-    match rpc(&client, EventKind::LockRequest, SecurityLevel::SecretsOnly).await? {
-        EventKind::LockResponse { success: true } => {
-            println!("{}", "Secrets locked. Master key zeroized.".green());
+    let target_profile = profile_arg
+        .map(|p| TrustProfileName::try_from(p.as_str()))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid profile name: {e}"))?;
+
+    let event = EventKind::LockRequest { profile: target_profile };
+
+    match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
+        EventKind::LockResponse { success: true, profiles_locked } => {
+            if profiles_locked.is_empty() {
+                println!("{}", "All vaults locked. Key material zeroized.".green());
+            } else {
+                for p in &profiles_locked {
+                    println!("{}", format!("Vault '{}' locked. Key material zeroized.", p).green());
+                }
+            }
         }
-        EventKind::LockResponse { success: false } => {
+        EventKind::LockResponse { success: false, .. } => {
             anyhow::bail!("lock failed");
         }
         other => anyhow::bail!("unexpected response: {other:?}"),

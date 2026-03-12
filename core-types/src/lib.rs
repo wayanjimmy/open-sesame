@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Deref;
 use std::time::{Duration, Instant, SystemTime};
@@ -1153,26 +1153,42 @@ pub enum EventKind {
         active_profiles: Vec<TrustProfileName>,
         default_profile: TrustProfileName,
         daemon_uptimes_ms: Vec<(DaemonId, u64)>,
+        /// True if ALL vaults are locked. Convenience for callers that don't need per-profile granularity.
         locked: bool,
+        /// Per-profile lock state. Key = profile name, value = true if locked.
+        #[serde(default)]
+        lock_state: BTreeMap<TrustProfileName, bool>,
     },
 
     // -- RPC: Unlock/Lock --
     UnlockRequest {
-        /// Master password bytes (transmitted over UCred-authenticated Unix socket only).
+        /// Vault password bytes (transmitted over UCred-authenticated Unix socket only).
         password: SensitiveBytes,
+        /// Target profile to unlock. None = default profile.
+        #[serde(default)]
+        profile: Option<TrustProfileName>,
     },
     UnlockResponse {
         success: bool,
+        /// Which profile was unlocked.
+        profile: TrustProfileName,
     },
     /// Typed rejection for unlock when preconditions are not met.
     /// Distinct from `UnlockResponse` { success: false } to avoid ambiguity
     /// between "wrong password" and "already unlocked".
     UnlockRejected {
         reason: UnlockRejectedReason,
+        profile: Option<TrustProfileName>,
     },
-    LockRequest,
+    LockRequest {
+        /// Target profile. None = lock all vaults.
+        #[serde(default)]
+        profile: Option<TrustProfileName>,
+    },
     LockResponse {
         success: bool,
+        /// Which profiles were locked.
+        profiles_locked: Vec<TrustProfileName>,
     },
 
     // -- RPC: State Reconciliation --
@@ -1180,8 +1196,12 @@ pub enum EventKind {
     SecretsStateRequest,
     /// daemon-secrets returns authoritative lock + active profiles.
     SecretsStateResponse {
+        /// True if ALL vaults are locked. Convenience for callers that don't need per-profile granularity.
         locked: bool,
         active_profiles: Vec<TrustProfileName>,
+        /// Per-profile lock state.
+        #[serde(default)]
+        lock_state: BTreeMap<TrustProfileName, bool>,
     },
 
     // -- RPC: Window Manager --
@@ -1428,7 +1448,7 @@ impl_event_debug! {
     sensitive {
         SecretGetResponse { key, value => REDACTED, denial },
         SecretSet { profile, key, value => REDACTED },
-        UnlockRequest { password => REDACTED },
+        UnlockRequest { password => REDACTED, profile },
     }
     transparent {
         WindowFocused { window_id, app_id, workspace_id },
@@ -1475,13 +1495,13 @@ impl_event_debug! {
         SetDefaultProfile { profile_name },
         SetDefaultProfileResponse { success },
         StatusRequest,
-        StatusResponse { active_profiles, default_profile, daemon_uptimes_ms, locked },
-        UnlockResponse { success },
-        UnlockRejected { reason },
-        LockRequest,
-        LockResponse { success },
+        StatusResponse { active_profiles, default_profile, daemon_uptimes_ms, locked, lock_state },
+        UnlockResponse { success, profile },
+        UnlockRejected { reason, profile },
+        LockRequest { profile },
+        LockResponse { success, profiles_locked },
         SecretsStateRequest,
-        SecretsStateResponse { locked, active_profiles },
+        SecretsStateResponse { locked, active_profiles, lock_state },
         WmListWindows,
         WmListWindowsResponse { windows },
         WmActivateWindow { window_id },
@@ -2180,7 +2200,7 @@ mod tests {
 
     #[test]
     fn event_kind_debug_redacts_secrets() {
-        let unlock = EventKind::UnlockRequest { password: SensitiveBytes::new(b"hunter2".to_vec()) };
+        let unlock = EventKind::UnlockRequest { password: SensitiveBytes::new(b"hunter2".to_vec()), profile: None };
         let debug = format!("{unlock:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("hunter2"));

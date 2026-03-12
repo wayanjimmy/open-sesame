@@ -341,17 +341,18 @@ async fn init_unlock() -> anyhow::Result<()> {
 
         let event = EventKind::UnlockRequest {
             password: SensitiveBytes::new(std::mem::take(&mut password_bytes)),
+            profile: None,
         };
         password_bytes.zeroize();
 
         match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-            EventKind::UnlockResponse { success: true } => {
+            EventKind::UnlockResponse { success: true, .. } => {
                 step_done("Secrets vault unlocked");
             }
-            EventKind::UnlockResponse { success: false } => {
+            EventKind::UnlockResponse { success: false, .. } => {
                 anyhow::bail!("unlock failed — wrong password or keyring error");
             }
-            EventKind::UnlockRejected { reason: core_types::UnlockRejectedReason::AlreadyUnlocked } => {
+            EventKind::UnlockRejected { reason: core_types::UnlockRejectedReason::AlreadyUnlocked, .. } => {
                 // Benign: another client unlocked between our StatusRequest and UnlockRequest.
                 step_skip("Secrets already unlocked");
             }

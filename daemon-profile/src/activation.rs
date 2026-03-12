@@ -216,7 +216,11 @@ pub(crate) async fn confirmed_rpc(
     confirm_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<Message<EventKind>, String> {
     let msg_ctx = core_ipc::MessageContext::new(daemon_id);
-    let msg = Message::new(&msg_ctx, event, SecurityLevel::SecretsOnly, bus.epoch());
+    let mut msg = Message::new(&msg_ctx, event, SecurityLevel::SecretsOnly, bus.epoch());
+    // Stamp verified identity: send_to_named bypasses route_frame() which
+    // normally stamps this. daemon-profile is the bus host so self-stamping
+    // is safe — the identity is authoritative.
+    msg.verified_sender_name = Some("daemon-profile".into());
     let msg_id = msg.msg_id;
 
     // Register confirmation route — guard deregisters on drop.

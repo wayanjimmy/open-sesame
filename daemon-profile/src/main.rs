@@ -664,6 +664,7 @@ async fn handle_bus_message<W: std::io::Write>(
                     if let EventKind::SecretsStateResponse {
                         locked: auth_locked,
                         active_profiles: auth_profiles,
+                        lock_state: auth_lock_state,
                     } = response.payload {
                         // Warm the shadow state from the authoritative source.
                         *locked = auth_locked;
@@ -673,15 +674,16 @@ async fn handle_bus_message<W: std::io::Write>(
                             default_profile: default_profile_name.clone(),
                             daemon_uptimes_ms: vec![(daemon_id, 0)],
                             locked: auth_locked,
+                            lock_state: auth_lock_state,
                         })
                     } else {
                         tracing::warn!("unexpected response to SecretsStateRequest: {:?}", response.payload);
-                        // Fall back to shadow state.
                         Some(EventKind::StatusResponse {
                             active_profiles: active_profiles.iter().cloned().collect(),
                             default_profile: default_profile_name.clone(),
                             daemon_uptimes_ms: vec![(daemon_id, 0)],
                             locked: *locked,
+                            lock_state: std::collections::BTreeMap::new(),
                         })
                     }
                 }
@@ -692,6 +694,7 @@ async fn handle_bus_message<W: std::io::Write>(
                         default_profile: default_profile_name.clone(),
                         daemon_uptimes_ms: vec![(daemon_id, 0)],
                         locked: *locked,
+                        lock_state: std::collections::BTreeMap::new(),
                     })
                 }
             }
@@ -795,17 +798,25 @@ async fn handle_bus_message<W: std::io::Write>(
             Some(EventKind::SetDefaultProfileResponse { success: true })
         }
 
-        EventKind::UnlockResponse { success: true } => {
-            *locked = false;
-            active_profiles.clear(); // Fresh unlock = no profiles active.
-            tracing::info!("secrets daemon unlocked, lock state updated, active profiles cleared");
+        EventKind::UnlockResponse { success: true, profile } => {
+            *locked = false; // At least one vault is unlocked.
+            tracing::info!(profile = %profile, "vault unlocked, shadow state updated");
             None
         }
 
-        EventKind::LockResponse { success: true } => {
-            *locked = true;
-            active_profiles.clear();
-            tracing::info!(audit = "security", "secrets locked, active profiles cleared");
+        EventKind::LockResponse { success: true, profiles_locked } => {
+            if profiles_locked.is_empty() {
+                // Lock-all: clear everything.
+                *locked = true;
+                active_profiles.clear();
+                tracing::info!(audit = "security", "all vaults locked, active profiles cleared");
+            } else {
+                // Per-profile lock: remove locked profiles from active set.
+                for p in profiles_locked {
+                    active_profiles.remove(p);
+                }
+                tracing::info!(audit = "security", profiles = ?profiles_locked, "vault(s) locked");
+            }
             None
         }
 
@@ -916,6 +927,7 @@ async fn reconcile_secrets_state(
                     if let EventKind::SecretsStateResponse {
                         locked: auth_locked,
                         active_profiles: auth_profiles,
+                        ..
                     } = response.payload
                     {
                         // Log discrepancies before overwriting.

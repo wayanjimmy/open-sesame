@@ -1,33 +1,34 @@
 //! daemon-secrets: Secrets broker daemon.
 //!
 //! Manages encrypted per-profile secret vaults with JIT caching and IPC-based
-//! request handling. Connects to the IPC bus as a client, waits for master
-//! password unlock, then serves SecretGet/Set/Delete/List requests against
-//! SQLCipher-backed stores keyed with BLAKE3-derived per-profile vault keys.
+//! request handling. Connects to the IPC bus as a client, accepts per-profile
+//! `UnlockRequest` messages, then serves SecretGet/Set/Delete/List requests
+//! against SQLCipher-backed stores keyed with BLAKE3-derived per-profile vault keys.
 //!
 //! # Startup sequence
 //!
 //! 1. Parse CLI, init logging, load config
 //! 2. Apply Landlock + seccomp sandbox
 //! 3. Connect to IPC bus as client
-//! 4. Wait for `UnlockRequest` with master password
-//! 5. Derive master key via Argon2id, persist salt to config dir
-//! 6. Enter IPC event loop — vaults opened lazily on first access per profile
+//! 4. Enter IPC event loop — vaults unlocked independently per profile
+//! 5. Each `UnlockRequest` derives a per-profile master key via Argon2id
+//! 6. Vaults opened lazily on first access after unlock + profile activation
 //!
-//! Multiple profiles may have open vaults concurrently. Every secret RPC
-//! carries a `profile` field identifying which vault to query.
+//! Multiple profiles may have open vaults concurrently. Each profile has its
+//! own password, salt, and master key. Every secret RPC carries a `profile`
+//! field identifying which vault to query.
 //!
 //! # Security constraints
 //!
 //! - Landlock: config dir (read), runtime dir (read/write), D-Bus socket (read/write)
 //! - seccomp: restricted syscall set (no network, no ptrace)
 //! - systemd: `PrivateNetwork=yes` (no network access)
-//! - Master password required at first unlock per session (ADR-SEC-003)
+//! - Per-profile password required to unlock each vault independently
 //!
 //! # Key hierarchy (ADR-SEC-002)
 //!
 //! ```text
-//! Master password → Argon2id → Master Key → BLAKE3 derive_key → per-profile vault keys
+//! Per-profile password → Argon2id(password, per-profile salt) → Master Key → BLAKE3 derive_key → vault key
 //! ```
 
 #[cfg(target_os = "linux")]
@@ -68,10 +69,14 @@ struct Cli {
     log_format: String,
 }
 
-/// Runtime state for the secrets daemon after unlock.
-struct UnlockedState {
-    /// Master key (mlock'd, zeroize-on-drop).
-    master_key: SecureBytes,
+/// Runtime state for the secrets daemon.
+///
+/// Always present after daemon init (as an empty container). Individual profiles
+/// are unlocked/locked independently — there is no global "locked" state.
+struct VaultState {
+    /// Per-profile master keys. Each derived independently from its own password+salt.
+    /// Key: profile name. Value: master key (mlock'd, zeroize-on-drop).
+    master_keys: HashMap<TrustProfileName, SecureBytes>,
     /// Trust profile name -> JitDelivery wrapping SqlCipherStore.
     /// Multiple vaults may be open concurrently.
     vaults: HashMap<TrustProfileName, JitDelivery<SqlCipherStore>>,
@@ -86,10 +91,11 @@ struct UnlockedState {
     config_dir: PathBuf,
 }
 
-impl UnlockedState {
+impl VaultState {
     /// Get or lazily open a vault for the given trust profile.
     ///
-    /// Refuses access if the profile is not in the active_profiles authorization set.
+    /// Refuses access if the profile is not in the active_profiles authorization set
+    /// or if the profile's vault has not been unlocked.
     ///
     /// Vault opening uses `spawn_blocking` to avoid blocking the tokio event loop
     /// during synchronous SQLCipher I/O (PRAGMA key, schema migration).
@@ -99,8 +105,13 @@ impl UnlockedState {
                 "profile '{}' is not active — access denied", profile
             )));
         }
+        let master_key = self.master_keys.get(profile).ok_or_else(|| {
+            core_types::Error::Secrets(format!(
+                "profile '{}' is not unlocked — run: sesame unlock --profile {}", profile, profile
+            ))
+        })?;
         if !self.vaults.contains_key(profile) {
-            let vault_key = core_crypto::derive_vault_key(self.master_key.as_bytes(), profile);
+            let vault_key = core_crypto::derive_vault_key(master_key.as_bytes(), profile);
             let db_path = self.config_dir.join("vaults").join(format!("{profile}.db"));
 
             if let Some(parent) = db_path.parent() {
@@ -176,8 +187,11 @@ impl UnlockedState {
     /// Enable for research into daemon-to-daemon relay defense-in-depth.
     #[cfg(feature = "ipc-field-encryption")]
     fn ipc_encryption_key(&self, profile: &TrustProfileName) -> core_types::Result<core_crypto::EncryptionKey> {
+        let master_key = self.master_keys.get(profile).ok_or_else(|| {
+            core_types::Error::Secrets(format!("profile '{}' not unlocked for IPC encryption", profile))
+        })?;
         let key_bytes = core_crypto::derive_ipc_encryption_key(
-            self.master_key.as_bytes(),
+            master_key.as_bytes(),
             profile,
         );
         let key_array: &[u8; 32] = key_bytes.as_bytes().try_into().map_err(|_| {
@@ -254,9 +268,9 @@ async fn emit_audit_event(
     }
 }
 
-/// Salt file path within the config directory.
-fn salt_path(config_dir: &Path) -> PathBuf {
-    config_dir.join("secrets.salt")
+/// Per-profile salt file path: `{config_dir}/vaults/{profile}.salt`
+fn profile_salt_path(config_dir: &Path, profile: &TrustProfileName) -> PathBuf {
+    config_dir.join("vaults").join(format!("{profile}.salt"))
 }
 
 /// Derive the master key from password + salt via Argon2id.
@@ -264,38 +278,31 @@ fn derive_master_key(password: &[u8], salt: &[u8; 16]) -> core_types::Result<Sec
     core_crypto::derive_key_argon2(password, salt)
 }
 
-/// First-run: generate salt, derive master key, store salt to disk.
-fn first_run_derive(password: &[u8], config_dir: &Path) -> core_types::Result<SecureBytes> {
+/// Generate a new per-profile salt and persist to disk.
+fn generate_profile_salt(salt_path: &Path) -> core_types::Result<[u8; 16]> {
     let mut salt = [0u8; 16];
     getrandom::getrandom(&mut salt).map_err(|e| {
         core_types::Error::Crypto(format!("getrandom failed: {e}"))
     })?;
-
-    // Persist salt.
-    let sp = salt_path(config_dir);
-    if let Some(parent) = sp.parent() {
+    if let Some(parent) = salt_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            core_types::Error::Config(format!("failed to create config dir: {e}"))
+            core_types::Error::Config(format!("failed to create vault directory: {e}"))
         })?;
     }
-    std::fs::write(&sp, salt).map_err(|e| {
-        core_types::Error::Config(format!("failed to write salt: {e}"))
+    std::fs::write(salt_path, salt).map_err(|e| {
+        core_types::Error::Config(format!("failed to write profile salt: {e}"))
     })?;
-    tracing::info!(path = %sp.display(), "salt generated and stored");
-
-    derive_master_key(password, &salt)
+    Ok(salt)
 }
 
-/// Subsequent run: load salt from disk, derive master key.
-fn subsequent_run_derive(password: &[u8], config_dir: &Path) -> core_types::Result<SecureBytes> {
-    let sp = salt_path(config_dir);
-    let salt_bytes = std::fs::read(&sp).map_err(|e| {
-        core_types::Error::Config(format!("failed to read salt from {}: {e}", sp.display()))
+/// Load a salt file from disk.
+fn load_salt(path: &Path) -> core_types::Result<[u8; 16]> {
+    let salt_bytes = std::fs::read(path).map_err(|e| {
+        core_types::Error::Config(format!("failed to read salt from {}: {e}", path.display()))
     })?;
-    let salt: [u8; 16] = salt_bytes.try_into().map_err(|_| {
+    salt_bytes.try_into().map_err(|_| {
         core_types::Error::Config("salt file is not 16 bytes".into())
-    })?;
-    derive_master_key(password, &salt)
+    })
 }
 
 #[tokio::main]
@@ -377,8 +384,15 @@ async fn main() -> anyhow::Result<()> {
     // -- Watchdog timer: half the WatchdogSec=30 interval --
     let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(15));
 
-    // -- Main event loop: locked phase then unlocked phase --
-    let mut unlocked_state: Option<UnlockedState> = None;
+    // -- Main event loop --
+    // VaultState is always present; individual profiles are unlocked/locked independently.
+    let mut vault_state = VaultState {
+        master_keys: HashMap::new(),
+        vaults: HashMap::new(),
+        active_profiles: HashSet::new(),
+        ttl: Duration::from_secs(cli.ttl),
+        config_dir: config_dir.clone(),
+    };
     let mut rate_limiter = SecretRateLimiter::new();
 
     loop {
@@ -393,10 +407,8 @@ async fn main() -> anyhow::Result<()> {
                     // std::process::exit() skips destructors. Explicitly zeroize
                     // all open vault key material before exiting so the C-level
                     // SQLCipher key buffer is cleared even on crash-restart paths.
-                    if let Some(state) = unlocked_state.as_mut() {
-                        for (_profile, vault) in state.vaults.drain() {
-                            vault.store().pragma_rekey_clear();
-                        }
+                    for (_profile, vault) in vault_state.vaults.drain() {
+                        vault.store().pragma_rekey_clear();
                     }
                     std::process::exit(1);
                 };
@@ -408,10 +420,9 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut ctx = MessageContext {
                     client: &mut client,
-                    unlocked_state: &mut unlocked_state,
+                    vault_state: &mut vault_state,
                     config_dir: &config_dir,
                     default_profile: &default_profile,
-                    ttl: cli.ttl,
                     daemon_id,
                     rate_limiter: &mut rate_limiter,
                     config: &config,
@@ -460,20 +471,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Graceful shutdown: zeroize master key, close all open vaults, clear keyring.
+    // Graceful shutdown: zeroize all master keys, close all open vaults, clear keyring.
     // SecureBytes zeroizes on drop. SqlCipherStore closes DB connections on drop.
-    if let Some(mut state) = unlocked_state.take() {
-        let count = state.vaults.len();
-        state.active_profiles.clear();
-        for (_profile, vault) in state.vaults.drain() {
+    {
+        let count = vault_state.vaults.len();
+        let profile_names: Vec<TrustProfileName> = vault_state.master_keys.keys().cloned().collect();
+        vault_state.active_profiles.clear();
+        for (_profile, vault) in vault_state.vaults.drain() {
             vault.flush().await;
             vault.store().pragma_rekey_clear();
             drop(vault);
         }
-        drop(state);
+        vault_state.master_keys.clear(); // Each SecureBytes zeroizes on drop.
         #[cfg(target_os = "linux")]
-        keyring_delete().await;
-        tracing::info!(vault_count = count, "master key zeroized, all vaults closed");
+        keyring_delete_all(&profile_names).await;
+        tracing::info!(vault_count = count, "all master keys zeroized, all vaults closed");
     }
 
     client
@@ -494,10 +506,9 @@ async fn main() -> anyhow::Result<()> {
 /// Grouped context for `handle_message` to avoid parameter explosion.
 struct MessageContext<'a> {
     client: &'a mut BusClient,
-    unlocked_state: &'a mut Option<UnlockedState>,
+    vault_state: &'a mut VaultState,
     config_dir: &'a Path,
     default_profile: &'a TrustProfileName,
-    ttl: u64,
     daemon_id: DaemonId,
     rate_limiter: &'a mut SecretRateLimiter,
     config: &'a core_config::Config,
@@ -542,49 +553,93 @@ async fn handle_message(
             None
         }
 
-        // -- Unlock --
-        EventKind::UnlockRequest { password } => {
-            if ctx.unlocked_state.is_some() {
-                tracing::warn!(audit = "security", "unlock request while already unlocked — rejected");
-                audit_secret_access("unlock", msg.sender, "-", None, "rejected-already-unlocked");
+        // -- Unlock (per-profile) --
+        EventKind::UnlockRequest { password, profile } => {
+            let target = profile.clone().unwrap_or_else(|| ctx.default_profile.clone());
+
+            if ctx.vault_state.master_keys.contains_key(&target) {
+                tracing::warn!(audit = "security", profile = %target, "unlock request for already-unlocked profile — rejected");
+                audit_secret_access("unlock", msg.sender, &target, None, "rejected-already-unlocked");
                 return send_response(
                     ctx.client, msg,
-                    EventKind::UnlockRejected { reason: core_types::UnlockRejectedReason::AlreadyUnlocked },
+                    EventKind::UnlockRejected {
+                        reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
+                        profile: Some(target),
+                    },
                     ctx.daemon_id,
                 ).await;
             }
-            let outcome = match unlock(password.as_bytes(), ctx.config_dir, ctx.ttl, ctx.default_profile).await {
-                Ok(state) => {
-                    tracing::info!("secrets unlocked");
-                    *ctx.unlocked_state = Some(state);
+            let outcome = match unlock_profile(password.as_bytes(), &target, ctx.config_dir).await {
+                Ok(result) => {
+                    // Store per-profile keyring entry BEFORE transferring ownership
+                    // to the map — avoids retrieving from map and eliminates unwrap.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let salt_path = profile_salt_path(ctx.config_dir, &target);
+                        if let Ok(salt_bytes) = std::fs::read(&salt_path) {
+                            keyring_store_profile(
+                                &result.master_key,
+                                password.as_bytes(), &salt_bytes, &target,
+                            ).await;
+                        }
+                    }
+
+                    ctx.vault_state.master_keys.insert(target.clone(), result.master_key);
+
+                    // Cache verified store to avoid redundant SQLCipher open on ProfileActivate.
+                    if let Some(store) = result.verified_store {
+                        let jit = JitDelivery::new(store, ctx.vault_state.ttl);
+                        ctx.vault_state.vaults.insert(target.clone(), jit);
+                    }
+
+                    tracing::info!(profile = %target, "vault unlocked");
                     "success"
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "unlock failed");
+                    tracing::error!(error = %e, profile = %target, "unlock failed");
                     "failed"
                 }
             };
-            audit_secret_access("unlock", msg.sender, "-", None, outcome);
-            Some(EventKind::UnlockResponse { success: outcome == "success" })
+            audit_secret_access("unlock", msg.sender, &target, None, outcome);
+            Some(EventKind::UnlockResponse { success: outcome == "success", profile: target })
         }
 
-        // -- Lock --
-        EventKind::LockRequest => {
-            if let Some(mut state) = ctx.unlocked_state.take() {
-                state.active_profiles.clear();
-                for (_profile, vault) in state.vaults.drain() {
-                    vault.flush().await;
-                    vault.store().pragma_rekey_clear();
-                    drop(vault);
+        // -- Lock (per-profile or all) --
+        EventKind::LockRequest { profile } => {
+            let profiles_locked: Vec<TrustProfileName> = match profile {
+                Some(target) => {
+                    // Lock single profile.
+                    ctx.vault_state.active_profiles.remove(target);
+                    if let Some(vault) = ctx.vault_state.vaults.remove(target) {
+                        vault.flush().await;
+                        vault.store().pragma_rekey_clear();
+                        drop(vault);
+                    }
+                    ctx.vault_state.master_keys.remove(target); // zeroizes on drop
+                    #[cfg(target_os = "linux")]
+                    keyring_delete_profile(target).await;
+                    tracing::info!(profile = %target, "vault locked, key material zeroized");
+                    vec![target.clone()]
                 }
-                drop(state); // SecureBytes zeroizes master_key on drop.
-                #[cfg(target_os = "linux")]
-                keyring_delete().await;
-                tracing::info!("secrets locked, master key zeroized");
-            }
+                None => {
+                    // Lock all profiles.
+                    let locked: Vec<TrustProfileName> = ctx.vault_state.master_keys.keys().cloned().collect();
+                    ctx.vault_state.active_profiles.clear();
+                    for (_profile, vault) in ctx.vault_state.vaults.drain() {
+                        vault.flush().await;
+                        vault.store().pragma_rekey_clear();
+                        drop(vault);
+                    }
+                    ctx.vault_state.master_keys.clear(); // each SecureBytes zeroizes on drop
+                    #[cfg(target_os = "linux")]
+                    keyring_delete_all(&locked).await;
+                    tracing::info!("all vaults locked, key material zeroized");
+                    locked
+                }
+            };
             *ctx.rate_limiter = SecretRateLimiter::new();
             audit_secret_access("lock", msg.sender, "-", None, "success");
-            Some(EventKind::LockResponse { success: true })
+            Some(EventKind::LockResponse { success: true, profiles_locked })
         }
 
         // StatusRequest is handled exclusively by daemon-profile, which queries
@@ -595,7 +650,7 @@ async fn handle_message(
         // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
         EventKind::SecretGet { profile, key } => {
             // 1. LOCK CHECK (cheapest, most restrictive — no timing/rate leaks when locked).
-            let Some(state) = ctx.unlocked_state.as_mut() else {
+            let Some(state) = Some(&mut ctx.vault_state).filter(|s| !s.master_keys.is_empty()) else {
                 audit_secret_access("get", msg.sender, profile, Some(key), "denied-locked");
                 emit_audit_event(ctx.client, "get", profile, Some(key), msg.sender, msg.verified_sender_name.as_deref(), "denied-locked").await;
                 return send_response(ctx.client, msg, EventKind::SecretGetResponse {
@@ -719,7 +774,7 @@ async fn handle_message(
         // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
         EventKind::SecretSet { profile, key, value } => {
             // 1. LOCK CHECK.
-            let Some(state) = ctx.unlocked_state.as_mut() else {
+            let Some(state) = Some(&mut ctx.vault_state).filter(|s| !s.master_keys.is_empty()) else {
                 audit_secret_access("set", msg.sender, profile, Some(key), "denied-locked");
                 emit_audit_event(ctx.client, "set", profile, Some(key), msg.sender, msg.verified_sender_name.as_deref(), "denied-locked").await;
                 return send_response(ctx.client, msg, EventKind::SecretSetResponse { success: false, denial: Some(SecretDenialReason::Locked) }, ctx.daemon_id).await;
@@ -815,7 +870,7 @@ async fn handle_message(
         // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
         EventKind::SecretDelete { profile, key } => {
             // 1. LOCK CHECK.
-            let Some(state) = ctx.unlocked_state.as_mut() else {
+            let Some(state) = Some(&mut ctx.vault_state).filter(|s| !s.master_keys.is_empty()) else {
                 audit_secret_access("delete", msg.sender, profile, Some(key), "denied-locked");
                 emit_audit_event(ctx.client, "delete", profile, Some(key), msg.sender, msg.verified_sender_name.as_deref(), "denied-locked").await;
                 return send_response(ctx.client, msg, EventKind::SecretDeleteResponse { success: false, denial: Some(SecretDenialReason::Locked) }, ctx.daemon_id).await;
@@ -890,7 +945,7 @@ async fn handle_message(
         // Check order: lock -> active profile -> identity -> rate limit -> ACL -> vault
         EventKind::SecretList { profile } => {
             // 1. LOCK CHECK.
-            let Some(state) = ctx.unlocked_state.as_mut() else {
+            let Some(state) = Some(&mut ctx.vault_state).filter(|s| !s.master_keys.is_empty()) else {
                 audit_secret_access("list", msg.sender, profile, None, "denied-locked");
                 emit_audit_event(ctx.client, "list", profile, None, msg.sender, msg.verified_sender_name.as_deref(), "denied-locked").await;
                 return send_response(ctx.client, msg, EventKind::SecretListResponse { keys: vec![], denial: Some(SecretDenialReason::Locked) }, ctx.daemon_id).await;
@@ -952,10 +1007,12 @@ async fn handle_message(
                 tracing::debug!(sender = ?msg.verified_sender_name, "ignoring profile lifecycle event from non-profile sender");
                 return Ok(true);
             }
-            let Some(state) = ctx.unlocked_state.as_mut() else {
-                tracing::warn!(profile = %profile_name, "profile activate while locked");
+            // Per-vault check: reject if this specific profile's vault is not unlocked.
+            if !ctx.vault_state.master_keys.contains_key(profile_name) {
+                tracing::warn!(profile = %profile_name, "profile activate rejected: vault not unlocked");
                 return send_response(ctx.client, msg, EventKind::ProfileActivateResponse { success: false }, ctx.daemon_id).await;
-            };
+            }
+            let state = &mut ctx.vault_state;
             // Authorize first, then open vault (vault_for gates on active_profiles).
             state.activate_profile(profile_name);
             let success = match state.vault_for(profile_name).await {
@@ -980,24 +1037,28 @@ async fn handle_message(
                 tracing::debug!(sender = ?msg.verified_sender_name, "ignoring profile lifecycle event from non-profile sender");
                 return Ok(true);
             }
-            let Some(state) = ctx.unlocked_state.as_mut() else {
-                tracing::warn!(profile = %profile_name, "profile deactivate while locked");
-                return send_response(ctx.client, msg, EventKind::ProfileDeactivateResponse { success: false }, ctx.daemon_id).await;
-            };
-            // Idempotent: deactivating an already-inactive profile succeeds.
-            state.deactivate_profile(profile_name).await;
+            // Deactivation is idempotent and doesn't require vault to be unlocked.
+            ctx.vault_state.deactivate_profile(profile_name).await;
             Some(EventKind::ProfileDeactivateResponse { success: true })
         }
 
         // -- State reconciliation: daemon-profile queries authoritative state --
         EventKind::SecretsStateRequest => {
-            let locked = ctx.unlocked_state.is_none();
-            let active_profiles = ctx.unlocked_state
-                .as_ref()
-                .map_or_else(Vec::new, |s| s.active_profiles());
+            let state = &ctx.vault_state;
+            let all_locked = state.master_keys.is_empty();
+            let active_profiles = state.active_profiles();
+            // Build per-profile lock state from config profile names.
+            let lock_state: std::collections::BTreeMap<TrustProfileName, bool> = ctx.config.profiles.keys()
+                .filter_map(|name| TrustProfileName::try_from(name.as_str()).ok())
+                .map(|name| {
+                    let is_locked = !state.master_keys.contains_key(&name);
+                    (name, is_locked)
+                })
+                .collect();
             Some(EventKind::SecretsStateResponse {
-                locked,
+                locked: all_locked,
                 active_profiles,
+                lock_state,
             })
         }
 
@@ -1010,8 +1071,8 @@ async fn handle_message(
         // This ensures daemon-profile sees the state change even if a crash occurs
         // between the broadcast and the CLI response.
         let broadcast = match &event {
-            EventKind::UnlockResponse { success } => Some(EventKind::UnlockResponse { success: *success }),
-            EventKind::LockResponse { success } => Some(EventKind::LockResponse { success: *success }),
+            EventKind::UnlockResponse { success, profile } => Some(EventKind::UnlockResponse { success: *success, profile: profile.clone() }),
+            EventKind::LockResponse { success, profiles_locked } => Some(EventKind::LockResponse { success: *success, profiles_locked: profiles_locked.clone() }),
             _ => None,
         };
 
@@ -1051,104 +1112,78 @@ async fn send_response(
     Ok(true)
 }
 
-/// Perform the unlock flow: derive master key from password.
-///
-/// Vaults are opened lazily on first access to each profile, not eagerly.
-///
-/// ADR-SEC-001 keyring integration:
-/// 1. If salt exists and keyring has a wrapped key, try the fast path
-///    (derive KEK, unwrap master key from keyring — avoids Argon2id).
-/// 2. If fast path fails (wrong password, no keyring entry, first run),
-///    fall through to full Argon2id derivation.
-/// 3. After successful derivation, store KEK-wrapped master key in keyring.
-async fn unlock(
-    password: &[u8],
-    config_dir: &Path,
-    ttl: u64,
-    default_profile: &TrustProfileName,
-) -> core_types::Result<UnlockedState> {
-    let sp = salt_path(config_dir);
-    let salt_exists = sp.exists();
+/// Result of a successful profile unlock.
+struct UnlockResult {
+    /// Per-profile master key (mlock'd, zeroize-on-drop).
+    master_key: SecureBytes,
+    /// Pre-verified vault store, if a vault DB existed at unlock time.
+    /// Cached to avoid redundant SQLCipher open on first ProfileActivate.
+    verified_store: Option<SqlCipherStore>,
+}
 
-    // Fast path: try keyring retrieval (avoids Argon2id).
+/// Unlock a specific profile's vault by deriving its master key from a
+/// per-profile salt via Argon2id. Fast path uses platform keyring.
+///
+/// Each profile has its own salt at `{config_dir}/vaults/{profile}.salt`.
+/// First unlock generates the salt. Subsequent unlocks read existing salt.
+/// If a vault DB exists, the derived key is verified against it and the
+/// opened store is returned for caching.
+async fn unlock_profile(
+    password: &[u8],
+    profile: &TrustProfileName,
+    config_dir: &Path,
+) -> core_types::Result<UnlockResult> {
+    let salt_file = profile_salt_path(config_dir, profile);
+
+    // Fast path: try per-profile keyring retrieval (avoids Argon2id).
     #[cfg(target_os = "linux")]
-    if salt_exists {
-        let salt_bytes = std::fs::read(&sp).map_err(|e| {
-            core_types::Error::Config(format!("failed to read salt: {e}"))
+    if salt_file.exists() {
+        let salt_bytes = std::fs::read(&salt_file).map_err(|e| {
+            core_types::Error::Config(format!("failed to read profile salt: {e}"))
         })?;
-        if let Some(master_key) = keyring_retrieve(password, &salt_bytes).await {
-            return Ok(UnlockedState {
-                master_key,
-                vaults: HashMap::new(),
-                active_profiles: HashSet::new(),
-                ttl: Duration::from_secs(ttl),
-                config_dir: config_dir.to_path_buf(),
-            });
+        if let Some(master_key) = keyring_retrieve_profile(password, &salt_bytes, profile).await {
+            return Ok(UnlockResult { master_key, verified_store: None });
         }
     }
 
-    // Slow path: full Argon2id derivation.
-    let master_key = if salt_exists {
-        subsequent_run_derive(password, config_dir)?
+    // Derive master key: load existing salt or generate new one.
+    let master_key = if salt_file.exists() {
+        let salt = load_salt(&salt_file)?;
+        derive_master_key(password, &salt)?
     } else {
-        first_run_derive(password, config_dir)?
+        let new_salt = generate_profile_salt(&salt_file)?;
+        tracing::info!(profile = %profile, path = %salt_file.display(), "per-profile salt generated");
+        derive_master_key(password, &new_salt)?
     };
 
-    // Store KEK-wrapped master key in keyring for next unlock.
-    #[cfg(target_os = "linux")]
-    {
-        let salt_bytes = std::fs::read(salt_path(config_dir)).map_err(|e| {
-            core_types::Error::Config(format!("failed to read salt for keyring store: {e}"))
-        })?;
-        keyring_store(&master_key, password, &salt_bytes).await;
-    }
-
-    // Verify the derived master key against the default vault before reporting
-    // success. A wrong password produces a wrong master key, which produces
-    // wrong vault keys for ALL profiles (deterministic BLAKE3 derivation).
-    //
-    // SqlCipherStore::open() runs `SELECT count(*) FROM sqlite_master` which
-    // triggers HMAC verification — a wrong vault key fails immediately.
-    //
-    // On success, cache the opened vault in UnlockedState to avoid a
-    // redundant SQLCipher open when ProfileActivate arrives.
-    //
-    // Skip verification if the default vault does not exist (first-ever
-    // unlock before any profile activation).
-    let mut vaults: HashMap<TrustProfileName, JitDelivery<SqlCipherStore>> = HashMap::new();
-    let default_profile_str = default_profile.to_string();
-    let default_vault_path = config_dir.join("vaults").join(format!("{default_profile_str}.db"));
-    if default_vault_path.exists() {
-        let vault_key = core_crypto::derive_vault_key(master_key.as_bytes(), &default_profile_str);
-        let db_path = default_vault_path;
-        let ttl_dur = Duration::from_secs(ttl);
-        let verification_result = tokio::task::spawn_blocking(move || {
-            SqlCipherStore::open(&db_path, &vault_key)
+    // Verify against existing vault DB if it exists.
+    let vault_path = config_dir.join("vaults").join(format!("{profile}.db"));
+    let verified_store = if vault_path.exists() {
+        let vault_key = core_crypto::derive_vault_key(master_key.as_bytes(), profile);
+        let vp = vault_path;
+        let result = tokio::task::spawn_blocking(move || {
+            SqlCipherStore::open(&vp, &vault_key)
         })
         .await
-        .map_err(|e| core_types::Error::Secrets(format!("spawn_blocking join error: {e}")))?;
+        .map_err(|e| core_types::Error::Secrets(format!("spawn_blocking: {e}")))?;
 
-        match verification_result {
+        match result {
             Ok(store) => {
-                tracing::info!(profile = %default_profile, "master key verified against default vault");
-                vaults.insert(default_profile.clone(), JitDelivery::new(store, ttl_dur));
+                tracing::info!(profile = %profile, "vault key verified");
+                Some(store)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "master key verification failed — wrong password");
+                tracing::warn!(error = %e, profile = %profile, "vault key verification failed — wrong password");
                 return Err(core_types::Error::Secrets(
-                    "wrong password: master key verification failed".into(),
+                    "wrong password: vault key verification failed".into(),
                 ));
             }
         }
-    }
+    } else {
+        None
+    };
 
-    Ok(UnlockedState {
-        master_key,
-        vaults,
-        active_profiles: HashSet::new(),
-        ttl: Duration::from_secs(ttl),
-        config_dir: config_dir.to_path_buf(),
-    })
+    Ok(UnlockResult { master_key, verified_store })
 }
 
 /// Wait for SIGTERM (Unix) or simulate on non-Unix.
@@ -1283,39 +1318,38 @@ fn apply_sandbox() {
 //    is decrypted. GCM tag verification rejects wrong passwords.
 // ============================================================================
 
-/// KeyLocker service/account constants for platform keyring.
+/// KeyLocker service constant for platform keyring.
 const KEYLOCKER_SERVICE: &str = "pds";
-const KEYLOCKER_ACCOUNT: &str = "master-key";
 
-/// Wrap the master key with a KEK and store the wrapped blob in the
-/// platform keyring (best-effort).
+/// Per-profile keyring account name.
+fn keylocker_account(profile: &TrustProfileName) -> String {
+    format!("vault-key-{profile}")
+}
+
+/// Wrap a profile's master key with a KEK and store in the platform keyring.
 ///
 /// Wire format: `[12-byte random nonce][ciphertext + 16-byte GCM tag]`
-/// Total: 12 + 32 + 16 = 60 bytes for a 32-byte master key.
 #[cfg(target_os = "linux")]
-async fn keyring_store(master_key: &SecureBytes, password: &[u8], salt: &[u8]) {
+async fn keyring_store_profile(master_key: &SecureBytes, password: &[u8], salt: &[u8], profile: &TrustProfileName) {
     use core_secrets::KeyLocker;
 
-    // Derive KEK from password+salt (BLAKE3, independent of Argon2id).
     let kek = core_crypto::derive_kek(password, salt);
     let enc_key = match core_crypto::EncryptionKey::from_bytes(
         kek.as_bytes().try_into().unwrap_or(&[0u8; 32]),
     ) {
         Ok(k) => k,
         Err(e) => {
-            tracing::warn!(error = %e, "keyring: KEK construction failed");
+            tracing::warn!(error = %e, profile = %profile, "keyring: KEK construction failed");
             return;
         }
     };
 
-    // Random nonce for wrapping.
     let mut nonce = [0u8; 12];
     if let Err(e) = getrandom::getrandom(&mut nonce) {
         tracing::warn!(error = %e, "keyring: nonce generation failed");
         return;
     }
 
-    // Encrypt master key under KEK.
     let ciphertext = match enc_key.encrypt(&nonce, master_key.as_bytes()) {
         Ok(ct) => ct,
         Err(e) => {
@@ -1324,7 +1358,6 @@ async fn keyring_store(master_key: &SecureBytes, password: &[u8], salt: &[u8]) {
         }
     };
 
-    // Wire format: [nonce || ciphertext+tag]
     let mut wrapped = Vec::with_capacity(12 + ciphertext.len());
     wrapped.extend_from_slice(&nonce);
     wrapped.extend(ciphertext);
@@ -1336,22 +1369,17 @@ async fn keyring_store(master_key: &SecureBytes, password: &[u8], salt: &[u8]) {
             return;
         }
     };
+    let account = keylocker_account(profile);
     let locker = key_locker_linux::SecretServiceKeyLocker::new(bus);
-    match locker
-        .store_wrapped_key(KEYLOCKER_SERVICE, KEYLOCKER_ACCOUNT, &wrapped)
-        .await
-    {
-        Ok(()) => tracing::info!(wrapped_len = wrapped.len(), "KEK-wrapped master key stored in platform keyring"),
-        Err(e) => tracing::warn!(error = %e, "keyring: failed to store wrapped key"),
+    match locker.store_wrapped_key(KEYLOCKER_SERVICE, &account, &wrapped).await {
+        Ok(()) => tracing::info!(profile = %profile, "KEK-wrapped vault key stored in keyring"),
+        Err(e) => tracing::warn!(error = %e, profile = %profile, "keyring: store failed"),
     }
 }
 
-/// Retrieve and unwrap the master key from the platform keyring.
-///
-/// Returns `Some(master_key)` on success, `None` if the keyring entry
-/// doesn't exist, the password is wrong (GCM tag fails), or any I/O error.
+/// Retrieve and unwrap a profile's master key from the platform keyring.
 #[cfg(target_os = "linux")]
-async fn keyring_retrieve(password: &[u8], salt: &[u8]) -> Option<SecureBytes> {
+async fn keyring_retrieve_profile(password: &[u8], salt: &[u8], profile: &TrustProfileName) -> Option<SecureBytes> {
     use core_secrets::KeyLocker;
 
     let bus = match platform_linux::dbus::SessionBus::connect().await {
@@ -1361,10 +1389,10 @@ async fn keyring_retrieve(password: &[u8], salt: &[u8]) -> Option<SecureBytes> {
             return None;
         }
     };
+    let account = keylocker_account(profile);
     let locker = key_locker_linux::SecretServiceKeyLocker::new(bus);
 
-    // Check if a wrapped key exists.
-    match locker.has_wrapped_key(KEYLOCKER_SERVICE, KEYLOCKER_ACCOUNT).await {
+    match locker.has_wrapped_key(KEYLOCKER_SERVICE, &account).await {
         Ok(true) => {}
         Ok(false) => return None,
         Err(e) => {
@@ -1373,11 +1401,7 @@ async fn keyring_retrieve(password: &[u8], salt: &[u8]) -> Option<SecureBytes> {
         }
     }
 
-    // Retrieve the wrapped blob.
-    let wrapped = match locker
-        .retrieve_wrapped_key(KEYLOCKER_SERVICE, KEYLOCKER_ACCOUNT)
-        .await
-    {
+    let wrapped = match locker.retrieve_wrapped_key(KEYLOCKER_SERVICE, &account).await {
         Ok(w) => w,
         Err(e) => {
             tracing::debug!(error = %e, "keyring: retrieve failed");
@@ -1385,13 +1409,11 @@ async fn keyring_retrieve(password: &[u8], salt: &[u8]) -> Option<SecureBytes> {
         }
     };
 
-    // Validate minimum size: 12 (nonce) + 32 (master key) + 16 (tag) = 60.
     if wrapped.len() < 60 {
-        tracing::warn!(len = wrapped.len(), "keyring: wrapped blob too short, ignoring");
+        tracing::warn!(len = wrapped.len(), "keyring: wrapped blob too short");
         return None;
     }
 
-    // Derive KEK from password+salt.
     let kek = core_crypto::derive_kek(password, salt);
     let enc_key = match core_crypto::EncryptionKey::from_bytes(
         kek.as_bytes().try_into().unwrap_or(&[0u8; 32]),
@@ -1403,26 +1425,44 @@ async fn keyring_retrieve(password: &[u8], salt: &[u8]) -> Option<SecureBytes> {
         }
     };
 
-    // Split nonce and ciphertext.
     let nonce: [u8; 12] = wrapped.as_bytes()[..12].try_into().ok()?;
     let ciphertext = &wrapped.as_bytes()[12..];
 
-    // Decrypt — GCM tag verification rejects wrong passwords.
     match enc_key.decrypt(&nonce, ciphertext) {
         Ok(master_key) => {
-            tracing::info!("master key unwrapped from platform keyring (fast path)");
+            tracing::info!(profile = %profile, "vault key unwrapped from keyring (fast path)");
             Some(master_key)
         }
         Err(_) => {
-            tracing::debug!("keyring: GCM tag verification failed (wrong password or corrupted)");
+            tracing::debug!(profile = %profile, "keyring: GCM tag failed (wrong password or corrupted)");
             None
         }
     }
 }
 
-/// Delete the wrapped master key from the platform keyring (best-effort).
+/// Delete a specific profile's wrapped key from the platform keyring.
 #[cfg(target_os = "linux")]
-async fn keyring_delete() {
+async fn keyring_delete_profile(profile: &TrustProfileName) {
+    use core_secrets::KeyLocker;
+
+    let bus = match platform_linux::dbus::SessionBus::connect().await {
+        Ok(b) => Arc::new(b),
+        Err(e) => {
+            tracing::warn!(error = %e, "keyring: failed to connect to session bus");
+            return;
+        }
+    };
+    let account = keylocker_account(profile);
+    let locker = key_locker_linux::SecretServiceKeyLocker::new(bus);
+    match locker.delete_wrapped_key(KEYLOCKER_SERVICE, &account).await {
+        Ok(()) => tracing::info!(profile = %profile, "wrapped vault key deleted from keyring"),
+        Err(e) => tracing::debug!(error = %e, profile = %profile, "keyring: delete failed"),
+    }
+}
+
+/// Delete wrapped keys for all given profiles from the platform keyring (best-effort).
+#[cfg(target_os = "linux")]
+async fn keyring_delete_all(profiles: &[TrustProfileName]) {
     use core_secrets::KeyLocker;
 
     let bus = match platform_linux::dbus::SessionBus::connect().await {
@@ -1433,13 +1473,13 @@ async fn keyring_delete() {
         }
     };
     let locker = key_locker_linux::SecretServiceKeyLocker::new(bus);
-    match locker
-        .delete_wrapped_key(KEYLOCKER_SERVICE, KEYLOCKER_ACCOUNT)
-        .await
-    {
-        Ok(()) => tracing::info!("wrapped master key deleted from platform keyring"),
-        Err(e) => tracing::debug!(error = %e, "keyring: delete failed (may not exist)"),
+    for profile in profiles {
+        let account = keylocker_account(profile);
+        if let Err(e) = locker.delete_wrapped_key(KEYLOCKER_SERVICE, &account).await {
+            tracing::debug!(error = %e, profile = %profile, "keyring: delete failed (may not exist)");
+        }
     }
+    tracing::info!(count = profiles.len(), "per-profile keyring entries deleted");
 }
 
 #[cfg(test)]
@@ -1458,10 +1498,16 @@ mod tests {
         SecureBytes::new(key)
     }
 
-    /// Create an UnlockedState with a real temp directory for vault storage.
-    fn make_unlocked_state(config_dir: &std::path::Path) -> UnlockedState {
-        UnlockedState {
-            master_key: test_master_key(),
+    /// Create a VaultState with a test master key for "work" profile.
+    fn make_vault_state(config_dir: &std::path::Path) -> VaultState {
+        let mut master_keys = HashMap::new();
+        // Pre-unlock "work" and "alpha" and "beta" profiles for tests.
+        for name in &["work", "alpha", "beta", "never-activated"] {
+            let p = profile(name);
+            master_keys.insert(p, test_master_key());
+        }
+        VaultState {
+            master_keys,
             vaults: HashMap::new(),
             active_profiles: HashSet::new(),
             ttl: Duration::from_secs(60),
@@ -1477,7 +1523,7 @@ mod tests {
     #[tokio::test]
     async fn test_vault_for_rejects_inactive_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = make_unlocked_state(dir.path());
+        let mut state = make_vault_state(dir.path());
         let p = profile("work");
         let result = state.vault_for(&p).await;
         assert!(result.is_err(), "vault_for must reject inactive profile");
@@ -1488,11 +1534,27 @@ mod tests {
         );
     }
 
+    // vault_for() returns error if profile is active but not unlocked
+    #[tokio::test]
+    async fn test_vault_for_rejects_active_but_not_unlocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_vault_state(dir.path());
+        let p = profile("not-in-master-keys");
+        state.active_profiles.insert(p.clone());
+        let result = state.vault_for(&p).await;
+        assert!(result.is_err(), "vault_for must reject profile without master key");
+        let err = result.err().expect("expected error").to_string();
+        assert!(
+            err.contains("not unlocked"),
+            "error must mention 'not unlocked', got: {err}"
+        );
+    }
+
     // activate then vault_for succeeds (lazy open)
     #[tokio::test]
     async fn test_activate_then_vault_for_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = make_unlocked_state(dir.path());
+        let mut state = make_vault_state(dir.path());
         let p = profile("work");
         state.activate_profile(&p);
         let result = state.vault_for(&p).await;
@@ -1503,7 +1565,7 @@ mod tests {
     #[tokio::test]
     async fn test_deactivate_then_vault_for_rejects() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = make_unlocked_state(dir.path());
+        let mut state = make_vault_state(dir.path());
         let p = profile("work");
         state.activate_profile(&p);
         let _ = state.vault_for(&p).await; // open vault
@@ -1516,7 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn test_deactivate_inactive_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = make_unlocked_state(dir.path());
+        let mut state = make_vault_state(dir.path());
         let p = profile("never-activated");
         // Must not panic or error
         state.deactivate_profile(&p).await;
@@ -1526,7 +1588,7 @@ mod tests {
     #[tokio::test]
     async fn test_activate_deactivate_reactivate_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = make_unlocked_state(dir.path());
+        let mut state = make_vault_state(dir.path());
         let p = profile("work");
 
         state.activate_profile(&p);
@@ -1543,7 +1605,7 @@ mod tests {
     #[tokio::test]
     async fn test_active_profiles_returns_authorization_set() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = make_unlocked_state(dir.path());
+        let mut state = make_vault_state(dir.path());
         let p1 = profile("alpha");
         let p2 = profile("beta");
 
@@ -1576,7 +1638,7 @@ mod tests {
     #[tokio::test]
     async fn test_lock_clears_active_profiles() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = make_unlocked_state(dir.path());
+        let mut state = make_vault_state(dir.path());
         let p1 = profile("alpha");
         let p2 = profile("beta");
 
@@ -1584,19 +1646,21 @@ mod tests {
         state.activate_profile(&p2);
         assert_eq!(state.active_profiles().len(), 2);
 
-        // Simulate lock: clear active profiles (as the lock handler does)
+        // Simulate lock: clear active profiles and master keys (as the lock handler does)
         state.active_profiles.clear();
+        state.master_keys.clear();
         assert!(state.active_profiles().is_empty(), "active_profiles must be empty after lock");
+        assert!(state.master_keys.is_empty(), "master_keys must be empty after lock");
     }
 
     // Unlock initializes empty active_profiles
     #[test]
     fn test_unlock_initializes_empty_active_profiles() {
         let dir = tempfile::tempdir().unwrap();
-        let state = make_unlocked_state(dir.path());
+        let state = make_vault_state(dir.path());
         assert!(
             state.active_profiles().is_empty(),
-            "fresh UnlockedState must have empty active_profiles"
+            "fresh VaultState must have empty active_profiles"
         );
     }
 }
