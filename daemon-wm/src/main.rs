@@ -520,6 +520,14 @@ async fn execute_commands(
             }
             Command::LaunchApp { command, tags } => {
                 tracing::info!(command = %command, ?tags, "launch-or-focus: launching app");
+
+                // Dismiss overlay IMMEDIATELY so the user isn't blocked.
+                // The IPC round-trip can take seconds — the overlay must not
+                // freeze on screen while we wait for the launcher daemon.
+                if overlay_cmd_tx.send(OverlayCmd::HideAndSync).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
+
                 let active_profile = {
                     let cfg_guard = config_state.read().ok();
                     cfg_guard.and_then(|c| {
@@ -576,14 +584,12 @@ async fn execute_commands(
                 let result_cmds = controller.handle(launch_event, &win_list, &cfg);
                 drop(cfg);
                 drop(win_list);
-                // Recurse to execute the result commands (ShowLaunchError, Hide, etc.)
-                // Use a boxed future to avoid infinite recursion type issues.
+                // Process launch result commands (error toasts, publish events).
+                // Hide was already sent above — no need to wait for result.
                 for result_cmd in result_cmds {
                     match result_cmd {
                         Command::Hide => {
-                            if overlay_cmd_tx.send(OverlayCmd::Hide).is_err() {
-                                tracing::error!("overlay thread has exited unexpectedly");
-                            }
+                            // Already hidden above; skip duplicate.
                         }
                         Command::ShowLaunchError { message, .. } => {
                             if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError { message }).is_err() {

@@ -132,6 +132,11 @@ struct OverlayState {
 /// Gives the compositor time to forward modifier state to our surface.
 const MODIFIER_POLL_GRACE_MS: u128 = 150;
 
+/// Stale activation timeout (ms). If the overlay has been visible this long
+/// without any keyboard event, assume the user released Alt before we got
+/// keyboard focus and dismiss. Prevents the overlay getting permanently stuck.
+const STALE_ACTIVATION_TIMEOUT_MS: u128 = 3000;
+
 impl OverlayState {
     fn new(theme: OverlayTheme, show_app_id: bool, show_title: bool) -> Self {
         Self {
@@ -560,20 +565,19 @@ fn run_gtk4_overlay(
         // Alt/Meta is no longer held.
         let st = state_poll.borrow();
         let phase = st.phase;
-        let within_grace = st.activated_at
-            .map(|t| t.elapsed().as_millis() < MODIFIER_POLL_GRACE_MS)
-            .unwrap_or(false);
+        let elapsed_ms = st.activated_at
+            .map(|t| t.elapsed().as_millis())
+            .unwrap_or(0);
+        let within_grace = elapsed_ms < MODIFIER_POLL_GRACE_MS;
         let keyboard_confirmed = st.received_key_event;
         drop(st);
 
-        // Only poll modifier state as a safety net when keyboard focus IS
-        // confirmed (at least one key event received). Before that, the
-        // modifier state is unreliable — IPC activations (e.g. COSMIC
-        // system actions) consume the Alt press, so the overlay's keyboard
-        // device never sees it and modifier_state() won't include ALT_MASK
-        // even when Alt is physically held. The key-release handler is the
-        // primary commit mechanism; this poll is a backup for missed releases.
-        if phase != OverlayPhase::Hidden && !within_grace && keyboard_confirmed {
+        // Poll modifier state when keyboard focus is confirmed (key events
+        // prove modifier_state() is reliable). Also dismiss if the overlay
+        // has been up too long with no keyboard interaction (stale timeout)
+        // — the user likely released Alt before we got keyboard focus.
+        let stale = !keyboard_confirmed && elapsed_ms >= STALE_ACTIVATION_TIMEOUT_MS;
+        if phase != OverlayPhase::Hidden && !within_grace && (keyboard_confirmed || stale) {
             let alt_held = window_poll.surface()
                 .and_then(|surface| surface.display().default_seat())
                 .and_then(|seat| seat.keyboard())
