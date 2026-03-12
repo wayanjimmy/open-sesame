@@ -103,6 +103,9 @@ pub enum Event {
     Confirm,
     /// Escape.
     Escape,
+    /// Stale activation timeout — overlay was visible too long with no
+    /// keyboard interaction. Dismiss without activating any window.
+    Dismiss,
     /// The dwell timer expired (main loop polls `next_deadline()`).
     DwellTimeout,
     /// Launch request completed (success or failure). Fed back from main loop.
@@ -362,7 +365,7 @@ impl OverlayController {
             Event::SelectionDown => self.on_selection_down(),
             Event::SelectionUp => self.on_selection_up(),
             Event::Confirm => self.on_confirm(),
-            Event::Escape => self.on_escape(),
+            Event::Escape | Event::Dismiss => self.on_escape(),
             Event::DwellTimeout => self.on_dwell_timeout(),
             Event::LaunchResult { success, error, denial } => {
                 self.on_launch_result(success, error, denial)

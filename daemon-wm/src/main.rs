@@ -236,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
                     OverlayEvent::SelectionUp => Some(Event::SelectionUp),
                     OverlayEvent::Confirm => Some(Event::Confirm),
                     OverlayEvent::Escape => Some(Event::Escape),
+                    OverlayEvent::Dismiss => Some(Event::Dismiss),
                     OverlayEvent::ModifierReleased => Some(Event::ModifierReleased),
                     OverlayEvent::SurfaceUnmapped => None, // handled in execute_commands
                 };

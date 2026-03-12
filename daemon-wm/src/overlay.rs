@@ -77,6 +77,8 @@ pub enum OverlayEvent {
     Escape,
     /// Modifier (Alt) released.
     ModifierReleased,
+    /// Stale activation — dismiss without activating.
+    Dismiss,
     /// Acknowledgment: the layer-shell surface has been unmapped and the
     /// compositor has confirmed via display sync. Safe to activate a window.
     SurfaceUnmapped,
@@ -572,6 +574,15 @@ fn run_gtk4_overlay(
         let keyboard_confirmed = st.received_key_event;
         drop(st);
 
+        // If keyboard focus hasn't been confirmed yet, re-request Exclusive
+        // every tick. COSMIC may not honor mode changes on an existing surface
+        // when no window is focused — hammering the request ensures the
+        // compositor eventually grants focus (similar to cosmic-launcher
+        // which creates a fresh Exclusive surface each time).
+        if phase != OverlayPhase::Hidden && !keyboard_confirmed {
+            window_poll.set_keyboard_mode(KeyboardMode::Exclusive);
+        }
+
         // Poll modifier state when keyboard focus is confirmed (key events
         // prove modifier_state() is reliable). Also dismiss if the overlay
         // has been up too long with no keyboard interaction (stale timeout)
@@ -590,7 +601,14 @@ fn run_gtk4_overlay(
             if !alt_held {
                 if !*modifier_released_flag.borrow() {
                     *modifier_released_flag.borrow_mut() = true;
-                    let _ = event_tx_poll.blocking_send(OverlayEvent::ModifierReleased);
+                    // Stale timeout: dismiss without activating (no user interaction).
+                    // Normal modifier release: commit the current selection.
+                    let event = if stale {
+                        OverlayEvent::Dismiss
+                    } else {
+                        OverlayEvent::ModifierReleased
+                    };
+                    let _ = event_tx_poll.blocking_send(event);
                 }
             } else {
                 // Alt is held — reset the flag so we detect future releases.
