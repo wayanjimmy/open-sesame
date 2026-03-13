@@ -719,18 +719,17 @@ async fn execute_commands(
             Command::LaunchApp { command, tags } => {
                 tracing::info!(command = %command, ?tags, "launch-or-focus: launching app");
 
-                // Release keyboard grab before hiding.
+                // Release keyboard grab — no more key forwarding needed.
                 client.publish(
                     EventKind::InputGrabRelease { requester: client.daemon_id() },
                     SecurityLevel::Internal,
                 ).await.ok();
 
-                // Dismiss overlay IMMEDIATELY so the user isn't blocked.
-                // The IPC round-trip can take seconds — the overlay must not
-                // freeze on screen while we wait for the launcher daemon.
-                if overlay_cmd_tx.send(OverlayCmd::HideAndSync).is_err() {
-                    tracing::error!("overlay thread has exited unexpectedly");
-                }
+                // Keep the "Launching..." toast visible during the IPC request.
+                // The overlay runs on a separate GTK4 thread so it keeps rendering
+                // while tokio blocks on the launch request. This gives the user
+                // visual feedback that the action was received.
+                // (ShowLaunching was already sent by the controller before this command.)
 
                 let active_profile = {
                     let cfg_guard = config_state.read().ok();
@@ -788,12 +787,26 @@ async fn execute_commands(
                 let result_cmds = controller.handle(launch_event, &win_list, &cfg);
                 drop(cfg);
                 drop(win_list);
-                // Process launch result commands (error toasts, publish events).
-                // Hide was already sent above — no need to wait for result.
+                // Process launch result commands. On success the controller
+                // returns Hide — dismiss the overlay now that the app is launching.
+                // On failure it returns ShowLaunchError to display the error toast.
                 for result_cmd in result_cmds {
                     match result_cmd {
                         Command::Hide => {
-                            // Already hidden above; skip duplicate.
+                            if overlay_cmd_tx.send(OverlayCmd::Hide).is_err() {
+                                tracing::error!("overlay thread has exited unexpectedly");
+                            }
+                        }
+                        Command::HideAndSync => {
+                            if overlay_cmd_tx.send(OverlayCmd::HideAndSync).is_err() {
+                                tracing::error!("overlay thread has exited unexpectedly");
+                                continue;
+                            }
+                            while let Some(ev) = overlay_event_rx.recv().await {
+                                if matches!(ev, OverlayEvent::SurfaceUnmapped) {
+                                    break;
+                                }
+                            }
                         }
                         Command::ShowLaunchError { message, .. } => {
                             if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError { message }).is_err() {

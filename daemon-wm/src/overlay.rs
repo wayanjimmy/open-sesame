@@ -125,9 +125,14 @@ struct OverlayState {
     /// during a grace period while the compositor establishes keyboard focus.
     activated_at: Option<std::time::Instant>,
     /// Set to true once any keyboard event is received for this activation
-    /// cycle. When true, modifier polling is skipped because keyboard focus
-    /// is confirmed working — the real key-release handler will fire.
+    /// cycle via GTK4. Enables the modifier poll safety net.
     received_key_event: bool,
+    /// Set to true when IPC keyboard routing is confirmed active. When true,
+    /// the GTK4 modifier poll is suppressed — Alt release detection is
+    /// handled by daemon-input forwarding InputKeyEvent over IPC. Without
+    /// this, COSMIC's system_actions causes the modifier poll to see Alt
+    /// as not held (compositor consumed it) and commit prematurely.
+    ipc_keyboard_active: bool,
     /// Error message to display in LaunchError phase.
     error_message: String,
     /// Staged launch command — shown in picker instead of "no matches".
@@ -158,6 +163,7 @@ impl OverlayState {
             received_key_event: false,
             error_message: String::new(),
             staged_launch: None,
+            ipc_keyboard_active: false,
         }
     }
 }
@@ -393,6 +399,7 @@ fn run_gtk4_overlay(
                         st.selection = 0;
                         st.activated_at = Some(std::time::Instant::now());
                         st.received_key_event = false;
+                        st.ipc_keyboard_active = false;
                         st.staged_launch = None;
                     }
                     // Reset modifier poll flag for this activation cycle.
@@ -415,6 +422,7 @@ fn run_gtk4_overlay(
                         if st.activated_at.is_none() {
                             st.activated_at = Some(std::time::Instant::now());
                             st.received_key_event = false;
+                        st.ipc_keyboard_active = false;
                         }
                     }
                     // Reset modifier poll flag for this activation cycle.
@@ -449,6 +457,7 @@ fn run_gtk4_overlay(
                         st.hints.clear();
                         st.activated_at = None;
                         st.received_key_event = false;
+                        st.ipc_keyboard_active = false;
                         st.staged_launch = None;
                     }
                     // Release keyboard grab and commit transparent frame.
@@ -476,6 +485,7 @@ fn run_gtk4_overlay(
                         st.hints.clear();
                         st.activated_at = None;
                         st.received_key_event = false;
+                        st.ipc_keyboard_active = false;
                         st.staged_launch = None;
                     }
                     // Release keyboard grab and commit transparent frame.
@@ -544,11 +554,14 @@ fn run_gtk4_overlay(
                         let mut st = state_cmd.borrow_mut();
                         st.activated_at = Some(std::time::Instant::now());
                         st.received_key_event = false;
+                        st.ipc_keyboard_active = false;
                     }
                     *modifier_released_sent.borrow_mut() = false;
                 }
                 OverlayCmd::ConfirmKeyboardInput => {
-                    state_cmd.borrow_mut().received_key_event = true;
+                    let mut st = state_cmd.borrow_mut();
+                    st.received_key_event = true;
+                    st.ipc_keyboard_active = true;
                 }
                 OverlayCmd::UpdateTheme(theme) => {
                     {
@@ -579,6 +592,7 @@ fn run_gtk4_overlay(
             .unwrap_or(0);
         let within_grace = elapsed_ms < MODIFIER_POLL_GRACE_MS;
         let keyboard_confirmed = st.received_key_event;
+        let ipc_active = st.ipc_keyboard_active;
         drop(st);
 
         // If keyboard focus hasn't been confirmed yet, re-request Exclusive
@@ -601,10 +615,12 @@ fn run_gtk4_overlay(
             let _ = event_tx_poll.blocking_send(OverlayEvent::Dismiss);
         }
 
-        // Normal modifier poll: only when keyboard focus IS confirmed (key
-        // events prove modifier_state() is reliable). Before that, the state
-        // is unreliable — IPC activations from COSMIC consume the Alt press.
-        if phase != OverlayPhase::Hidden && !within_grace && keyboard_confirmed {
+        // Normal modifier poll: only when GTK4 keyboard focus IS confirmed
+        // AND IPC keyboard routing is NOT active. When IPC is active,
+        // daemon-input delivers Alt release via InputKeyEvent — the GTK4
+        // modifier state is unreliable because COSMIC's system_actions
+        // consumes Alt before our surface sees it.
+        if phase != OverlayPhase::Hidden && !within_grace && keyboard_confirmed && !ipc_active {
             let alt_held = window_poll.surface()
                 .and_then(|surface| surface.display().default_seat())
                 .and_then(|seat| seat.keyboard())
