@@ -2,11 +2,9 @@
 //!
 //! The `CompositorBackend` trait abstracts window/workspace management over
 //! multiple Wayland compositor protocol sets:
-//! - `cosmic-toplevel-info-v1` + `cosmic-toplevel-management-v1` (COSMIC)
+//! - `ext_foreign_toplevel_list_v1` + `zcosmic_toplevel_info_v1` +
+//!   `zcosmic_toplevel_manager_v1` (COSMIC)
 //! - `wlr-foreign-toplevel-management-v1` (Hyprland, sway, niri, Wayfire)
-//! - Sway/i3 IPC socket fallback
-//!
-//! Phase 1: trait + type definitions only. Backend implementations in Phase 2+.
 
 use core_types::{Geometry, Window, WindowId, WorkspaceId};
 use std::future::Future;
@@ -20,65 +18,18 @@ pub struct Workspace {
     pub is_active: bool,
 }
 
-/// Configuration for creating a layer-shell surface.
-#[derive(Debug, Clone)]
-pub struct LayerSurfaceConfig {
-    pub namespace: String,
-    pub layer: Layer,
-    pub anchor: Anchor,
-    pub exclusive_zone: i32,
-    pub keyboard_mode: KeyboardMode,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-}
-
-/// Wayland layer-shell layer.
-#[derive(Debug, Clone, Copy)]
-pub enum Layer {
-    Background,
-    Bottom,
-    Top,
-    Overlay,
-}
-
-/// Anchor edges for layer-shell surfaces.
-#[derive(Debug, Clone, Copy)]
-pub struct Anchor {
-    pub top: bool,
-    pub right: bool,
-    pub bottom: bool,
-    pub left: bool,
-}
-
-/// Keyboard focus mode for layer-shell surfaces.
-#[derive(Debug, Clone, Copy)]
-pub enum KeyboardMode {
-    None,
-    Exclusive,
-    OnDemand,
-}
-
-/// Opaque handle to a layer-shell surface.
-pub struct LayerSurface {
-    _private: (),
-}
-
 // Type alias for boxed async results used by CompositorBackend methods.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Abstraction over Wayland compositor protocols for window management.
 ///
 /// Implementations:
-/// - `CosmicBackend` (cosmic-toplevel-info-v1 + cosmic-toplevel-management-v1)
-/// - `WlrBackend` (wlr-foreign-toplevel-management-v1)
-/// - `SwayIpcBackend` (sway/i3 IPC socket)
+/// - `CosmicBackend` — ext_foreign_toplevel + zcosmic_toplevel_{info,manager}
+/// - `WlrBackend` — wlr-foreign-toplevel-management-v1
 ///
 /// Uses `Pin<Box<dyn Future>>` return types for dyn-compatibility — required
 /// because `detect_compositor()` returns `Box<dyn CompositorBackend>` for
-/// runtime backend selection. Rust RPITIT (`-> impl Future`) is not
-/// dyn-compatible.
-///
-/// Phase 1: trait definition only. Implementations in Phase 2+.
+/// runtime backend selection.
 pub trait CompositorBackend: Send + Sync {
     fn list_windows(&self) -> BoxFuture<'_, core_types::Result<Vec<Window>>>;
     fn list_workspaces(&self) -> BoxFuture<'_, core_types::Result<Vec<Workspace>>>;
@@ -105,9 +56,6 @@ pub trait CompositorBackend: Send + Sync {
 /// Detection order:
 /// 1. COSMIC-specific protocols (if `cosmic` feature enabled)
 /// 2. wlr-foreign-toplevel-management-v1 (Hyprland, sway, niri)
-/// 3. Sway IPC socket at `$SWAYSOCK`
-/// 4. Error with available protocol listing
-///
 pub fn detect_compositor() -> core_types::Result<Box<dyn CompositorBackend>> {
     #[cfg(feature = "cosmic")]
     {
@@ -258,22 +206,26 @@ impl wayland_client::Dispatch<wayland_protocols_wlr::foreign_toplevel::v1::clien
             }
             zwlr_foreign_toplevel_handle_v1::Event::Done => {
                 // Atomic commit point — publish to shared state.
-                if let Some(tl) = state.pending.get(&id)
-                    && let Ok(mut shared) = state.shared.lock()
-                {
-                    shared.toplevels.insert(tl.window_id, WlrToplevelSnapshot {
-                        app_id: tl.app_id.clone(),
-                        title: tl.title.clone(),
-                        activated: tl.activated,
-                        handle: tl.handle.clone(),
-                    });
+                if let Some(tl) = state.pending.get(&id) {
+                    match state.shared.lock() {
+                        Ok(mut shared) => {
+                            shared.toplevels.insert(tl.window_id, WlrToplevelSnapshot {
+                                app_id: tl.app_id.clone(),
+                                title: tl.title.clone(),
+                                activated: tl.activated,
+                                handle: tl.handle.clone(),
+                            });
+                        }
+                        Err(e) => tracing::error!("wlr shared state mutex poisoned on Done: {e}"),
+                    }
                 }
             }
             zwlr_foreign_toplevel_handle_v1::Event::Closed => {
-                if let Some(tl) = state.pending.remove(&id)
-                    && let Ok(mut shared) = state.shared.lock()
-                {
-                    shared.toplevels.remove(&tl.window_id);
+                if let Some(tl) = state.pending.remove(&id) {
+                    match state.shared.lock() {
+                        Ok(mut shared) => { shared.toplevels.remove(&tl.window_id); }
+                        Err(e) => tracing::error!("wlr shared state mutex poisoned on Closed: {e}"),
+                    }
                 }
                 handle.destroy();
             }
@@ -360,7 +312,7 @@ fn wlr_dispatch_loop(
         // Prepare to read — if events are already buffered, this returns None
         // and we should dispatch immediately.
         if let Some(guard) = conn.prepare_read() {
-            // Wait for Wayland fd to be readable (50ms timeout for graceful shutdown).
+            // Wait for Wayland fd to be readable (50ms periodic wake-up).
             let mut pollfd = libc::pollfd {
                 fd: conn.as_fd().as_raw_fd(),
                 events: libc::POLLIN,
@@ -420,13 +372,13 @@ impl CompositorBackend for WlrBackend {
                     id: *wid,
                     app_id: core_types::AppId::new(&tl.app_id),
                     title: tl.title.clone(),
-                    workspace_id: WorkspaceId::new(),
-                    monitor_id: core_types::MonitorId::new(),
+                    workspace_id: WorkspaceId::from_uuid(uuid::Uuid::nil()),
+                    monitor_id: core_types::MonitorId::from_uuid(uuid::Uuid::nil()),
                     geometry: Geometry { x: 0, y: 0, width: 0, height: 0 },
                     is_focused: tl.activated,
                     is_minimized: false,
                     is_fullscreen: false,
-                    profile_id: core_types::ProfileId::new(),
+                    profile_id: core_types::ProfileId::from_uuid(uuid::Uuid::nil()),
                 }
             }).collect();
             Ok(windows)
@@ -503,19 +455,14 @@ impl CompositorBackend for WlrBackend {
 /// - `zcosmic_toplevel_info_v1`: get cosmic handles with activation state
 /// - `zcosmic_toplevel_manager_v1`: window activation via `manager.activate(handle, seat)`
 ///
-/// Architecture: a dedicated dispatch thread continuously reads Wayland events.
 /// Window enumeration follows a 2-roundtrip pattern (enumerate → get cosmic state).
 /// Activation follows a 3-roundtrip pattern (enumerate → get cosmic handle → activate).
 ///
-/// Unlike WlrBackend which maintains a live snapshot, CosmicBackend re-enumerates
-/// on each list_windows() call because the ext_foreign_toplevel_list_v1 protocol
-/// sends `Finished` after the initial burst — there's no continuous event stream.
-/// This matches v1's proven behavior.
+/// Re-enumerates on each list_windows() call — the ext_foreign_toplevel_list_v1
+/// protocol doesn't provide continuous updates after the initial burst.
 #[cfg(feature = "cosmic")]
 pub struct CosmicBackend {
     conn: wayland_client::Connection,
-    #[allow(dead_code)]
-    globals: wayland_client::globals::GlobalList,
     /// Serializes all protocol operations (enumerate, activate) on the shared
     /// connection. Concurrent bind/destroy cycles on the same wl_display corrupt
     /// compositor state and can crash cosmic-comp.
@@ -560,14 +507,15 @@ impl CosmicBackend {
             ));
         }
 
-        Ok(Self { conn, globals, op_lock: std::sync::Mutex::new(()) })
+        drop(globals);
+        Ok(Self { conn, op_lock: std::sync::Mutex::new(()) })
     }
 
     /// Enumerate all windows using the 2-roundtrip COSMIC protocol flow.
     ///
     /// Roundtrip 1: receive ext_foreign_toplevel handles (identifier, app_id, title, Done).
     /// Then request zcosmic_toplevel_handle for each via info.get_cosmic_toplevel().
-    /// Roundtrip 2: receive cosmic state events (activation detection: state_value == 2).
+    /// Roundtrip 2: receive cosmic state events (activation detection via State::Activated).
     fn enumerate(&self) -> core_types::Result<Vec<Window>> {
         let _guard = self.op_lock.lock().map_err(|e| {
             core_types::Error::Platform(format!("op_lock poisoned: {e}"))
@@ -630,13 +578,13 @@ impl CosmicBackend {
                     id: window_id,
                     app_id: core_types::AppId::new(app_id),
                     title: pending.title.clone().unwrap_or_default(),
-                    workspace_id: WorkspaceId::new(),
-                    monitor_id: core_types::MonitorId::new(),
+                    workspace_id: WorkspaceId::from_uuid(uuid::Uuid::nil()),
+                    monitor_id: core_types::MonitorId::from_uuid(uuid::Uuid::nil()),
                     geometry: core_types::Geometry { x: 0, y: 0, width: 0, height: 0 },
                     is_focused: pending.is_activated,
                     is_minimized: false,
                     is_fullscreen: false,
-                    profile_id: core_types::ProfileId::new(),
+                    profile_id: core_types::ProfileId::from_uuid(uuid::Uuid::nil()),
                 })
             })
             .collect();
@@ -768,6 +716,82 @@ impl CosmicBackend {
 
         Ok(())
     }
+
+    /// Close a window using the COSMIC protocol.
+    ///
+    /// Uses the same disposable-connection pattern as `activate()` to avoid
+    /// crashing cosmic-comp when protocol objects are destroyed in flight.
+    fn close(&self, target_id: &WindowId) -> core_types::Result<()> {
+        let _guard = self.op_lock.lock().map_err(|e| {
+            core_types::Error::Platform(format!("op_lock poisoned: {e}"))
+        })?;
+
+        use wayland_client::{Connection, globals::registry_queue_init};
+        use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
+        use cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1;
+        use cosmic_client_toolkit::cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1;
+
+        let close_conn = Connection::connect_to_env().map_err(|e| {
+            core_types::Error::Platform(format!("Wayland close connection failed: {e}"))
+        })?;
+
+        let (globals, mut event_queue) = registry_queue_init::<CosmicEnumState>(&close_conn).map_err(|e| {
+            let proto_err = close_conn.protocol_error();
+            core_types::Error::Platform(format!(
+                "registry init failed: {e} (protocol_error: {proto_err:?})"
+            ))
+        })?;
+        let qh = event_queue.handle();
+
+        let _list: ExtForeignToplevelListV1 = globals.bind(&qh, 1..=1, ()).map_err(|e| {
+            core_types::Error::Platform(format!("ext_foreign_toplevel_list bind: {e}"))
+        })?;
+        let info: ZcosmicToplevelInfoV1 = globals.bind(&qh, 2..=3, ()).map_err(|e| {
+            core_types::Error::Platform(format!("zcosmic_toplevel_info bind: {e}"))
+        })?;
+        let manager: ZcosmicToplevelManagerV1 = globals.bind(&qh, 1..=4, ()).map_err(|e| {
+            core_types::Error::Platform(format!("zcosmic_toplevel_manager bind: {e}"))
+        })?;
+
+        let mut state = CosmicEnumState {
+            pending: std::collections::HashMap::new(),
+            cosmic_pending: std::collections::HashMap::new(),
+            toplevels: Vec::new(),
+        };
+
+        // Roundtrip 1: enumerate toplevels.
+        cosmic_roundtrip(&close_conn, &mut event_queue, &mut state)?;
+
+        let target_handle = state.toplevels.iter()
+            .find(|(_handle, pending)| {
+                let identifier = pending.identifier.as_deref().unwrap_or("");
+                let wid = WindowId::from_uuid(uuid::Uuid::new_v5(
+                    &COSMIC_WINDOW_NAMESPACE,
+                    identifier.as_bytes(),
+                ));
+                wid == *target_id
+            })
+            .map(|(handle, _)| handle.clone());
+
+        let target_handle = target_handle.ok_or_else(|| {
+            core_types::Error::Platform(format!("window {target_id} not found"))
+        })?;
+
+        let cosmic_handle = info.get_cosmic_toplevel(&target_handle, &qh, ());
+
+        // Roundtrip 2: receive cosmic handle.
+        cosmic_roundtrip(&close_conn, &mut event_queue, &mut state)?;
+
+        manager.close(&cosmic_handle);
+
+        // Roundtrip 3: ensure close is processed.
+        cosmic_roundtrip(&close_conn, &mut event_queue, &mut state)?;
+
+        tracing::info!(window_id = %target_id, "cosmic: window closed");
+
+        let _ = close_conn.flush();
+        Ok(())
+    }
 }
 
 /// UUID v5 namespace for deterministic WindowId derivation from COSMIC protocol identifiers.
@@ -777,17 +801,17 @@ const COSMIC_WINDOW_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
     0x61, 0x6d, 0x65, 0x2d, 0x77, 0x69, 0x6e, 0x64,
 ]); // "open-sesame-wind" as bytes
 
-/// Wayland roundtrip with timeout protection (2s default).
-/// Prevents indefinite blocking if the compositor hangs.
+/// Wayland roundtrip using `event_queue.roundtrip()`.
+///
+/// Sends a `wl_display.sync` request, guaranteeing the compositor responds even
+/// when there are zero protocol objects to enumerate. This is a blocking call —
+/// callers that need timeout protection should run on a dedicated thread.
 #[cfg(feature = "cosmic")]
 fn cosmic_roundtrip<D: 'static>(
     conn: &wayland_client::Connection,
     event_queue: &mut wayland_client::EventQueue<D>,
     state: &mut D,
 ) -> core_types::Result<()> {
-    use std::os::unix::io::{AsFd, AsRawFd};
-
-    // Helper: format error with protocol_error() context for diagnostics.
     let fmt_err = |phase: &str, e: &dyn std::fmt::Display| -> core_types::Error {
         let proto_err = conn.protocol_error();
         core_types::Error::Platform(format!(
@@ -795,46 +819,18 @@ fn cosmic_roundtrip<D: 'static>(
         ))
     };
 
-    let timeout = std::time::Duration::from_secs(2);
-    let start = std::time::Instant::now();
-    let fd = conn.as_fd().as_raw_fd();
+    // Flush any pending outbound requests so the compositor sees them.
+    conn.flush().map_err(|e| fmt_err("flush", &e))?;
 
-    loop {
-        conn.flush().map_err(|e| fmt_err("flush", &e))?;
+    // Dispatch any events already buffered in the client-side queue.
+    event_queue.dispatch_pending(state).map_err(|e| fmt_err("dispatch_pending", &e))?;
 
-        event_queue.dispatch_pending(state).map_err(|e| fmt_err("dispatch_pending", &e))?;
+    // Standard roundtrip: sends wl_display.sync, flushes, then reads events
+    // until the sync callback arrives. This guarantees completion even with
+    // zero toplevels because the compositor always responds to sync.
+    event_queue.roundtrip(state).map_err(|e| fmt_err("roundtrip", &e))?;
 
-        if start.elapsed() >= timeout {
-            return Err(core_types::Error::Platform(
-                format!("Wayland roundtrip timed out after {timeout:?}"),
-            ));
-        }
-
-        let remaining = timeout.saturating_sub(start.elapsed());
-        let timeout_ms = remaining.as_millis().min(100) as i32;
-
-        let mut pollfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted { continue; }
-            return Err(fmt_err("poll", &err));
-        }
-
-        if ret > 0 && (pollfd.revents & libc::POLLIN) != 0 {
-            if let Some(guard) = conn.prepare_read()
-                && let Err(e) = guard.read()
-            {
-                return Err(fmt_err("read", &e));
-            }
-            event_queue.dispatch_pending(state).map_err(|e| fmt_err("dispatch_pending[2]", &e))?;
-
-            // Final blocking roundtrip to ensure all server events are received.
-            event_queue.roundtrip(state).map_err(|e| fmt_err("roundtrip", &e))?;
-            return Ok(());
-        }
-    }
+    Ok(())
 }
 
 #[cfg(feature = "cosmic")]
@@ -868,11 +864,9 @@ impl CompositorBackend for CosmicBackend {
         self.activate_window(id)
     }
 
-    fn close_window(&self, _id: &WindowId) -> BoxFuture<'_, core_types::Result<()>> {
-        // TODO: implement via zcosmic_toplevel_manager_v1.close()
-        Box::pin(async move {
-            Err(core_types::Error::Platform("close_window not yet implemented for cosmic".into()))
-        })
+    fn close_window(&self, id: &WindowId) -> BoxFuture<'_, core_types::Result<()>> {
+        let id = *id;
+        Box::pin(async move { self.close(&id) })
     }
 
     fn name(&self) -> &str {
@@ -1006,10 +1000,10 @@ impl wayland_client::Dispatch<cosmic_client_toolkit::cosmic_protocols::toplevel_
             if state_bytes.len() % 4 != 0 { return; }
             for chunk in state_bytes.chunks_exact(4) {
                 let val = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                if val == 2 { // State::Activated
-                    if let Some((_h, p)) = state.toplevels.iter_mut().find(|(h, _)| h.id().protocol_id() == foreign_id) {
-                        p.is_activated = true;
-                    }
+                if val == cosmic_client_toolkit::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::State::Activated as u32
+                    && let Some((_h, p)) = state.toplevels.iter_mut().find(|(h, _)| h.id().protocol_id() == foreign_id)
+                {
+                    p.is_activated = true;
                 }
             }
         }
