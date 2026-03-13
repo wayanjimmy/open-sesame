@@ -155,25 +155,6 @@ async fn main() -> anyhow::Result<()> {
                         grab_active = true;
                         grab_requester = Some(*requester);
 
-                        // Check if Alt is already released — if so, send a synthetic
-                        // key-release event so daemon-wm doesn't wait forever for
-                        // an Alt release that already happened.
-                        if let Some(ref xkb) = xkb_ctx
-                            && !xkb.is_alt_active()
-                        {
-                            tracing::debug!("Alt already released at grab time, sending synthetic release");
-                            client.publish(
-                                EventKind::InputKeyEvent {
-                                    keyval: 0xFFE9, // XKB_KEY_Alt_L
-                                    keycode: 56,    // KEY_LEFTALT
-                                    pressed: false,
-                                    modifiers: 0,
-                                    unicode: None,
-                                },
-                                SecurityLevel::Internal,
-                            ).await.ok();
-                        }
-
                         // Send correlated response.
                         let response = Message::new(
                             &msg_ctx,

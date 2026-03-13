@@ -89,9 +89,7 @@ impl XkbContext {
     }
 
     /// Query whether Alt (Mod1) is currently active in the XKB state.
-    ///
-    /// Used for synthetic Alt-release check when a grab is first activated —
-    /// if Alt is already released, daemon-input sends a synthetic release event.
+    #[cfg(test)]
     pub fn is_alt_active(&self) -> bool {
         self.state.mod_name_is_active(
             xkbcommon::xkb::MOD_NAME_ALT,
