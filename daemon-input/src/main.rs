@@ -152,8 +152,40 @@ async fn main() -> anyhow::Result<()> {
 
                     EventKind::InputGrabRequest { requester } => {
                         tracing::info!(%requester, "keyboard grab requested");
+
+                        // Drain all pending keyboard events to bring XKB state
+                        // up to date BEFORE checking modifier state. Without this,
+                        // Alt press/release events sitting in the channel buffer
+                        // make XKB state stale — the grab activates thinking Alt
+                        // is not held when it actually is (or vice versa).
+                        while let Ok(raw) = keyboard_rx.try_recv() {
+                            if let Some(ref mut xkb) = xkb_ctx {
+                                xkb.process_key(raw.keycode, raw.pressed);
+                            }
+                        }
+
                         grab_active = true;
                         grab_requester = Some(*requester);
+
+                        // If Alt is already released at grab activation time,
+                        // the user released it before the IPC roundtrip completed.
+                        // Send a synthetic Alt-release so daemon-wm doesn't wait
+                        // forever for a release that already happened.
+                        if let Some(ref xkb) = xkb_ctx
+                            && !xkb.is_alt_active()
+                        {
+                            tracing::debug!("Alt not active at grab time — sending synthetic release");
+                            client.publish(
+                                EventKind::InputKeyEvent {
+                                    keyval: 0xFFE9, // XKB_KEY_Alt_L
+                                    keycode: 56,    // KEY_LEFTALT
+                                    pressed: false,
+                                    modifiers: 0,
+                                    unicode: None,
+                                },
+                                SecurityLevel::Internal,
+                            ).await.ok();
+                        }
 
                         // Send correlated response.
                         let response = Message::new(
