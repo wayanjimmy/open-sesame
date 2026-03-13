@@ -17,6 +17,7 @@ use core_ipc::BusClient;
 use core_types::{DaemonId, EventKind, ProfileId, SecurityLevel, SensitiveBytes, TrustProfileName};
 use owo_colors::OwoColorize;
 use std::time::Duration;
+use clap::ValueEnum;
 use zeroize::Zeroize;
 
 /// Default RPC timeout.
@@ -137,6 +138,41 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+
+    /// Print profile secrets as shell/dotenv/json for eval or piping.
+    ///
+    /// Formats:
+    ///   shell  (default) — export KEY="value"  (eval in bash/zsh/direnv)
+    ///   dotenv           — KEY=value           (Docker, docker-compose, node)
+    ///   json             — {"KEY":"value",...}  (jq, CI/CD, programmatic)
+    ///
+    /// Usage:
+    ///   eval "$(sesame export -p work)"
+    ///   sesame export -p work --format dotenv > .env.secrets
+    ///   sesame export -p work --format json | jq .
+    Export {
+        /// Profile to source secrets from.
+        #[arg(short, long)]
+        profile: String,
+
+        /// Output format: shell, dotenv, json.
+        #[arg(short, long, default_value = "shell")]
+        format: ExportFormat,
+
+        /// Prefix for env var names (e.g., --prefix MYAPP: "api-key" becomes "MYAPP_API_KEY").
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+}
+
+#[derive(Clone, ValueEnum)]
+enum ExportFormat {
+    /// export KEY="value" — for eval in bash/zsh/direnv
+    Shell,
+    /// KEY=value — for Docker, docker-compose, node, python-dotenv
+    Dotenv,
+    /// {"KEY":"value",...} — for jq, CI/CD, programmatic consumers
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -457,6 +493,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Env { profile, prefix, command } => {
             cmd_env(&profile, prefix.as_deref(), &command).await
+        }
+        Command::Export { profile, format, prefix } => {
+            cmd_export(&profile, &format, prefix.as_deref()).await
         }
     }
 }
@@ -1751,6 +1790,15 @@ async fn cmd_env(profile: &str, prefix: Option<&str>, command: &[String]) -> any
         match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
             EventKind::SecretGetResponse { value, denial, .. } if denial.is_none() && !value.is_empty() => {
                 let env_name = secret_key_to_env_var(key, prefix);
+                if is_denied_env_var(&env_name) {
+                    eprintln!(
+                        "{}: secret '{}' maps to denied env var '{}', skipping (security policy)",
+                        "error".red().bold(),
+                        key,
+                        env_name,
+                    );
+                    continue;
+                }
                 env_vars.push((env_name, value.as_bytes().to_vec()));
             }
             _ => {
@@ -1793,6 +1841,180 @@ async fn cmd_env(profile: &str, prefix: Option<&str>, command: &[String]) -> any
     std::process::exit(status.code().unwrap_or(1));
 }
 
+// ============================================================================
+// Export command — print secrets as shell/dotenv/json
+// ============================================================================
+
+/// Env var names that must never be overwritten by secret export.
+/// Covers dynamic linker, shell execution, path hijack, and privilege escalation vectors.
+const DENIED_ENV_VARS: &[&str] = &[
+    // Dynamic linker — arbitrary code execution
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
+    "LD_DEBUG_OUTPUT", "LD_DYNAMIC_WEAK", "LD_PROFILE",
+    "LD_SHOW_AUXV", "LD_BIND_NOW", "LD_BIND_NOT",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    // Core execution environment
+    "PATH", "HOME", "USER", "SHELL", "LOGNAME", "LANG",
+    "TERM", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+    // Shell injection vectors
+    "BASH_ENV", "ENV", "BASH_FUNC_", "CDPATH", "GLOBIGNORE",
+    "SHELLOPTS", "BASHOPTS", "PROMPT_COMMAND", "PS1", "PS2", "PS4",
+    "MAIL", "MAILPATH", "MAILCHECK", "IFS",
+    // Language runtime code execution
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+    "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS",
+    "PERL5LIB", "PERL5OPT", "RUBYLIB", "RUBYOPT",
+    "GOPATH", "GOROOT", "GOFLAGS",
+    "JAVA_HOME", "CLASSPATH", "JAVA_TOOL_OPTIONS",
+    // Security / auth
+    "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "KRB5_CONFIG", "KRB5CCNAME",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "NIX_SSL_CERT_FILE",
+    // Nix
+    "NIX_PATH", "NIX_CONF_DIR",
+    // Sudo / privilege
+    "SUDO_ASKPASS", "SUDO_EDITOR", "VISUAL", "EDITOR",
+    // Systemd
+    "SYSTEMD_UNIT_PATH", "DBUS_SESSION_BUS_ADDRESS",
+    // Open Sesame's own namespace
+    "SESAME_PROFILE",
+];
+
+/// Returns true if `name` is a denied env var (case-insensitive prefix match for BASH_FUNC_).
+fn is_denied_env_var(name: &str) -> bool {
+    if name.starts_with("BASH_FUNC_") {
+        return true;
+    }
+    DENIED_ENV_VARS.iter().any(|&d| d.eq_ignore_ascii_case(name))
+}
+
+/// Shell-escape a value for safe embedding in `export K="V"`.
+/// Strips null bytes (C string truncation), escapes shell metacharacters.
+fn shell_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\0' => {} // strip null bytes — C string truncation risk
+            '"' | '\\' | '$' | '`' | '!' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// JSON-escape a string value.
+fn json_escape(s: &str) -> String {
+    s.chars().map(|c| match c {
+        '\0' => String::new(),
+        '"' => "\\\"".to_string(),
+        '\\' => "\\\\".to_string(),
+        '\n' => "\\n".to_string(),
+        '\r' => "\\r".to_string(),
+        '\t' => "\\t".to_string(),
+        c if c.is_control() => format!("\\u{:04x}", c as u32),
+        c => c.to_string(),
+    }).collect()
+}
+
+async fn cmd_export(profile: &str, format: &ExportFormat, prefix: Option<&str>) -> anyhow::Result<()> {
+    validate_profile_in_config(profile)?;
+    let client = connect().await?;
+    let profile = TrustProfileName::try_from(profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // 1. List all secret keys in this profile.
+    let keys = match rpc(
+        &client,
+        EventKind::SecretList { profile: profile.clone() },
+        SecurityLevel::SecretsOnly,
+    ).await? {
+        EventKind::SecretListResponse { keys, denial } => {
+            if let Some(reason) = denial {
+                anyhow::bail!("{}", format_denial_reason(&reason, "", &profile));
+            }
+            keys
+        }
+        other => anyhow::bail!("unexpected response to SecretList: {other:?}"),
+    };
+
+    if keys.is_empty() {
+        eprintln!(
+            "{}: profile '{}' has no secrets",
+            "warning".yellow().bold(),
+            profile,
+        );
+        return Ok(());
+    }
+
+    // 2. Fetch each secret value.
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(keys.len());
+
+    for key in &keys {
+        let event = EventKind::SecretGet {
+            profile: profile.clone(),
+            key: key.clone(),
+        };
+
+        match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
+            EventKind::SecretGetResponse { value, denial, .. } if denial.is_none() && !value.is_empty() => {
+                let env_name = secret_key_to_env_var(key, prefix);
+                if is_denied_env_var(&env_name) {
+                    eprintln!(
+                        "{}: secret '{}' maps to denied env var '{}', skipping (security policy)",
+                        "error".red().bold(),
+                        key,
+                        env_name,
+                    );
+                    continue;
+                }
+                let val_str = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                entries.push((env_name, val_str));
+            }
+            _ => {
+                eprintln!(
+                    "{}: failed to resolve secret '{}', skipping",
+                    "warning".yellow().bold(),
+                    key,
+                );
+            }
+        }
+    }
+
+    // 3. Output in requested format.
+    match format {
+        ExportFormat::Shell => {
+            for (k, v) in &entries {
+                println!("export {}=\"{}\"", k, shell_escape(v));
+            }
+        }
+        ExportFormat::Dotenv => {
+            for (k, v) in &entries {
+                println!("{}=\"{}\"", k, shell_escape(v));
+            }
+        }
+        ExportFormat::Json => {
+            print!("{{");
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 { print!(","); }
+                print!("\"{}\":\"{}\"", json_escape(k), json_escape(v));
+            }
+            println!("}}");
+        }
+    }
+
+    // 4. Zeroize secret copies.
+    for (_, mut v) in entries {
+        unsafe { v.as_bytes_mut().zeroize(); }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1833,5 +2055,88 @@ mod tests {
     fn test_parse_unlock_profiles_org_with_no_vaults() {
         let result = parse_unlock_profiles("org:");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn shell_escape_plain() {
+        assert_eq!(shell_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn shell_escape_special_chars() {
+        assert_eq!(shell_escape(r#"a"b$c`d\e!f"#), r#"a\"b\$c\`d\\e\!f"#);
+    }
+
+    #[test]
+    fn shell_escape_newlines() {
+        assert_eq!(shell_escape("line1\nline2\r"), "line1\\nline2\\r");
+    }
+
+    #[test]
+    fn secret_name_to_env_var_basic() {
+        assert_eq!(secret_key_to_env_var("api-key", None), "API_KEY");
+    }
+
+    #[test]
+    fn secret_name_to_env_var_with_prefix() {
+        assert_eq!(secret_key_to_env_var("api-key", Some("MYAPP")), "MYAPP_API_KEY");
+    }
+
+    #[test]
+    fn secret_name_to_env_var_dots_and_mixed() {
+        assert_eq!(secret_key_to_env_var("db.host-name", None), "DB_HOST_NAME");
+    }
+
+    #[test]
+    fn shell_escape_strips_null_bytes() {
+        assert_eq!(shell_escape("before\0after"), "beforeafter");
+    }
+
+    #[test]
+    fn denied_env_var_ld_preload() {
+        assert!(is_denied_env_var("LD_PRELOAD"));
+    }
+
+    #[test]
+    fn denied_env_var_path() {
+        assert!(is_denied_env_var("PATH"));
+    }
+
+    #[test]
+    fn denied_env_var_case_insensitive() {
+        assert!(is_denied_env_var("ld_preload"));
+        assert!(is_denied_env_var("Path"));
+    }
+
+    #[test]
+    fn denied_env_var_bash_func_prefix() {
+        assert!(is_denied_env_var("BASH_FUNC_evil%%"));
+    }
+
+    #[test]
+    fn denied_env_var_allows_normal_names() {
+        assert!(!is_denied_env_var("GITHUB_TOKEN"));
+        assert!(!is_denied_env_var("AWS_SECRET_ACCESS_KEY"));
+        assert!(!is_denied_env_var("CORP_API_KEY"));
+    }
+
+    #[test]
+    fn denied_env_var_sesame_profile() {
+        assert!(is_denied_env_var("SESAME_PROFILE"));
+    }
+
+    #[test]
+    fn json_escape_special_chars() {
+        assert_eq!(json_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn json_escape_strips_null() {
+        assert_eq!(json_escape("ab\0cd"), "abcd");
+    }
+
+    #[test]
+    fn json_escape_control_chars() {
+        assert_eq!(json_escape("\x01\x1f"), "\\u0001\\u001f");
     }
 }
