@@ -213,6 +213,11 @@ enum WorkspaceCmd {
         /// Link to a profile after cloning.
         #[arg(short, long)]
         profile: Option<String>,
+
+        /// Adopt a pre-existing directory if it has the correct remote.
+        /// Enabled by default; use --no-adopt to require a fresh clone.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        adopt: bool,
     },
 
     /// List all discovered workspaces.
@@ -2170,6 +2175,14 @@ fn needs_privilege(path: &std::path::Path) -> bool {
     }
 }
 
+/// Compare two git remote URLs, normalizing `.git` suffix and trailing slashes.
+fn urls_match(a: &str, b: &str) -> bool {
+    fn normalize(url: &str) -> String {
+        url.trim_end_matches('/').trim_end_matches(".git").to_lowercase()
+    }
+    normalize(a) == normalize(b)
+}
+
 async fn cmd_workspace(cmd: WorkspaceCmd) -> anyhow::Result<()> {
     match cmd {
         WorkspaceCmd::Init { root, user } => {
@@ -2228,7 +2241,7 @@ async fn cmd_workspace(cmd: WorkspaceCmd) -> anyhow::Result<()> {
             Ok(())
         }
 
-        WorkspaceCmd::Clone { url, depth, profile } => {
+        WorkspaceCmd::Clone { url, depth, profile, adopt } => {
             let config = core_config::load_workspace_config().unwrap_or_default();
             let root = sesame_workspace::config::resolve_root(&config);
             let user = sesame_workspace::config::resolve_user(&config);
@@ -2237,19 +2250,58 @@ async fn cmd_workspace(cmd: WorkspaceCmd) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let target = sesame_workspace::convention::canonical_path(&root, &user, &conv);
 
-            let result_path = sesame_workspace::git::clone_repo(&url, &target, depth)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Check if the target directory already exists and can be adopted.
+            let target_path = match &target {
+                sesame_workspace::CloneTarget::Regular(p) => p.clone(),
+                sesame_workspace::CloneTarget::WorkspaceGit(p) => p.clone(),
+            };
 
-            // Contextual output based on clone target type.
-            match &target {
-                sesame_workspace::CloneTarget::WorkspaceGit(_) => {
-                    println!("Cloned workspace.git to org directory: {}", result_path.display());
-                    println!("  Peer repos will be cloned as siblings inside this directory.");
+            let adopted = if target_path.exists() && sesame_workspace::git::is_git_repo(&target_path) && adopt {
+                // Verify the remote matches the requested URL.
+                let existing_remote = sesame_workspace::git::remote_url(&target_path)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                match existing_remote {
+                    Some(ref remote) if urls_match(remote, &url) => {
+                        true
+                    }
+                    Some(ref remote) => {
+                        anyhow::bail!(
+                            "directory exists with different remote:\n  existing: {remote}\n  requested: {url}\nRemove the directory or fix the remote manually."
+                        );
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "directory exists as a git repo but has no 'origin' remote: {}",
+                            target_path.display()
+                        );
+                    }
                 }
-                sesame_workspace::CloneTarget::Regular(_) => {
-                    println!("Cloned to: {}", result_path.display());
+            } else {
+                false
+            };
+
+            let result_path = if adopted {
+                println!(
+                    "\x1b[32mAdopted\x1b[0m existing repository: {}",
+                    target_path.display()
+                );
+                target_path
+            } else {
+                let rp = sesame_workspace::git::clone_repo(&url, &target, depth)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                // Contextual output based on clone target type.
+                match &target {
+                    sesame_workspace::CloneTarget::WorkspaceGit(_) => {
+                        println!("Cloned workspace.git to org directory: {}", rp.display());
+                        println!("  Peer repos will be cloned as siblings inside this directory.");
+                    }
+                    sesame_workspace::CloneTarget::Regular(_) => {
+                        println!("Cloned to: {}", rp.display());
+                    }
                 }
-            }
+                rp
+            };
 
             // Link to profile if requested.
             if let Some(ref profile_name) = profile {
