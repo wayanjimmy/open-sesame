@@ -934,7 +934,12 @@ impl OverlayController {
         {
             let profile = profiles_to_unlock[*current_index].clone();
             *unlock_mode = UnlockMode::Verifying;
-            return vec![Command::SubmitPasswordUnlock { profile }, Command::ShowVerifying];
+            // ShowVerifying is handled inside the SubmitPasswordUnlock executor
+            // BEFORE the IPC round-trip, not as a separate command after it.
+            // Emitting it here would cause it to execute AFTER the unlock IPC
+            // completes and its result commands are recursively processed,
+            // overwriting whatever the unlock result displayed.
+            return vec![Command::SubmitPasswordUnlock { profile }];
         }
 
         match std::mem::replace(&mut self.phase, Phase::Idle) {
@@ -2206,7 +2211,8 @@ mod tests {
         let cmds = ctrl.handle(Event::Confirm, &windows, &config);
         assert!(cmds.iter().any(|c| matches!(c, Command::SubmitPasswordUnlock { .. })),
             "Confirm during password must emit SubmitPasswordUnlock, got: {cmds:?}");
-        assert!(cmds.iter().any(|c| matches!(c, Command::ShowVerifying)));
+        // ShowVerifying is now emitted by the main.rs handler before IPC,
+        // not by the controller, so we only check SubmitPasswordUnlock here.
     }
 
     #[test]

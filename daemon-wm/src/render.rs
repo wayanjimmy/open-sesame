@@ -856,10 +856,15 @@ pub fn draw_unlock_prompt(
     let max_width = (width * 0.6).min(500.0);
     pango_layout.set_width((max_width * gtk4::pango::SCALE as f64) as i32);
     pango_layout.set_wrap(gtk4::pango::WrapMode::WordChar);
-    let (tw, th) = pango_layout.pixel_size();
+    let (_tw, th) = pango_layout.pixel_size();
 
+    // Use the pango layout width (max_width) as card content width, not the
+    // actual text pixel width. With Alignment::Center, pango centers the text
+    // relative to the layout width. If the card were sized to the text width
+    // instead, the centering offset would be lost and text would hang off the
+    // right edge.
     let pad = layout.padding * 2.0;
-    let cw = tw as f64 + pad * 2.0;
+    let cw = max_width + pad * 2.0;
     let ch = th as f64 + pad * 2.0;
     let cx = (width - cw) / 2.0;
     let cy = (height - ch) / 2.0;

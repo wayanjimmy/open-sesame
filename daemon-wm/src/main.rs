@@ -1027,6 +1027,19 @@ async fn execute_commands(
                     "submitting password unlock for vault"
                 );
 
+                // Show "Verifying..." overlay BEFORE the IPC round-trip so the
+                // user sees immediate feedback. This must happen here (not as a
+                // separate Command after SubmitPasswordUnlock) because the IPC
+                // call and its recursive result processing happen inline — a
+                // ShowVerifying command after this one would execute AFTER the
+                // unlock result is already processed and displayed.
+                if overlay_cmd_tx.send(OverlayCmd::ShowUnlockProgress {
+                    profile: profile.to_string(),
+                    message: "Verifying\u{2026}".into(),
+                }).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
+
                 let password_bytes = password_buffer.take();
 
                 if password_bytes.is_empty() {
@@ -1075,9 +1088,14 @@ async fn execute_commands(
                             }
                         }
                         EventKind::UnlockRejected { reason, profile: resp_profile } => {
-                            tracing::info!(?reason, ?resp_profile, "unlock rejected");
+                            let already = reason == core_types::UnlockRejectedReason::AlreadyUnlocked;
+                            if already {
+                                tracing::info!(?resp_profile, "vault already unlocked, treating as success");
+                            } else {
+                                tracing::info!(?reason, ?resp_profile, "unlock rejected");
+                            }
                             daemon_wm::controller::Event::UnlockResult {
-                                success: false,
+                                success: already,
                                 profile: resp_profile.unwrap_or(profile),
                             }
                         }
