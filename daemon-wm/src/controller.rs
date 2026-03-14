@@ -22,7 +22,7 @@ use crate::hints::{self, MatchResult};
 use crate::mru;
 use crate::overlay::WindowInfo;
 use core_config::WmConfig;
-use core_types::{EventKind, LaunchDenial, SecurityLevel, Window};
+use core_types::{EventKind, LaunchDenial, SecurityLevel, TrustProfileName, Window};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -76,6 +76,26 @@ pub enum Command {
     ResetGrace,
     /// Publish an IPC event.
     Publish(EventKind, SecurityLevel),
+    /// Attempt auto-unlock via `AuthDispatcher`.
+    AttemptAutoUnlock { profile: TrustProfileName },
+    /// Show password entry prompt.
+    ShowPasswordPrompt { profile: TrustProfileName },
+    /// Show "Touch your security key..." prompt.
+    ShowTouchPrompt { profile: TrustProfileName },
+    /// Show "Authenticating..." progress.
+    ShowAutoUnlockProgress { profile: TrustProfileName },
+    /// Show "Verifying..." while password IPC round-trip is in progress.
+    ShowVerifying,
+    /// A password character was typed. Main loop appends to `SecureVec`.
+    PasswordChar(char),
+    /// Backspace in password mode. Main loop truncates `SecureVec`.
+    PasswordBackspace,
+    /// Submit password buffer to daemon-secrets via `UnlockRequest`.
+    SubmitPasswordUnlock { profile: TrustProfileName },
+    /// Zeroize and reset the password buffer.
+    ClearPasswordBuffer,
+    /// Show error message in unlock overlay.
+    ShowUnlockError { message: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +134,25 @@ pub enum Event {
         success: bool,
         error: Option<String>,
         denial: Option<LaunchDenial>,
+        original_command: Option<String>,
+        original_tags: Option<Vec<String>>,
+        original_launch_args: Option<Vec<String>>,
+    },
+    /// Auto-unlock backend completed. Fed back from main loop.
+    AutoUnlockResult {
+        success: bool,
+        profile: TrustProfileName,
+        needs_touch: bool,
+    },
+    /// Touch-based unlock completed. Fed back from main loop.
+    TouchResult {
+        success: bool,
+        profile: TrustProfileName,
+    },
+    /// Password unlock IPC response received. Fed back from main loop.
+    UnlockResult {
+        success: bool,
+        profile: TrustProfileName,
     },
 }
 
@@ -265,6 +304,19 @@ struct PendingLaunch {
     launch_args: Vec<String>,
 }
 
+/// Sub-mode within the vault unlock flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockMode {
+    /// core-auth attempting non-interactive unlock. Overlay shows "Authenticating...".
+    AutoAttempt,
+    /// Waiting for hardware token touch. Overlay shows "Touch your security key...".
+    WaitingForTouch,
+    /// Password entry mode. Overlay shows dot-masked field.
+    Password,
+    /// Unlock request in-flight. Overlay shows "Verifying...".
+    Verifying,
+}
+
 #[derive(Debug)]
 enum Phase {
     Idle,
@@ -287,6 +339,23 @@ enum Phase {
     /// Launch failed — showing error toast. Any key dismisses.
     /// Error details are already forwarded to the overlay via ShowLaunchError.
     LaunchError,
+    /// Vault unlock in progress — waiting for auth or password input.
+    Unlocking {
+        /// All profiles that need unlocking.
+        profiles_to_unlock: Vec<TrustProfileName>,
+        /// Index into `profiles_to_unlock` for the current profile.
+        current_index: usize,
+        /// Number of characters in the password buffer (for dot rendering).
+        password_len: usize,
+        /// Current unlock sub-mode.
+        unlock_mode: UnlockMode,
+        /// Original launch command for auto-retry.
+        retry_command: String,
+        /// Original launch tags.
+        retry_tags: Vec<String>,
+        /// Original launch args.
+        retry_launch_args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -369,8 +438,17 @@ impl OverlayController {
             Event::Confirm => self.on_confirm(),
             Event::Escape | Event::Dismiss => self.on_escape(),
             Event::DwellTimeout => self.on_dwell_timeout(),
-            Event::LaunchResult { success, error, denial } => {
-                self.on_launch_result(success, error, denial)
+            Event::LaunchResult { success, error, denial, original_command, original_tags, original_launch_args } => {
+                self.on_launch_result(success, error, denial, original_command, original_tags, original_launch_args)
+            }
+            Event::AutoUnlockResult { success, profile, needs_touch } => {
+                self.on_auto_unlock_result(success, profile, needs_touch)
+            }
+            Event::TouchResult { success, profile } => {
+                self.on_touch_result(success, profile)
+            }
+            Event::UnlockResult { success, profile } => {
+                self.on_unlock_result(success, profile)
             }
         }
     }
@@ -496,7 +574,7 @@ impl OverlayController {
                 self.phase = Phase::Picking { snap, selection, input, pending_launch };
                 cmds
             }
-            other @ (Phase::Launching | Phase::LaunchError) => {
+            other @ (Phase::Launching | Phase::LaunchError | Phase::Unlocking { .. }) => {
                 self.phase = other;
                 Vec::new()
             }
@@ -555,7 +633,7 @@ impl OverlayController {
                 }
                 self.activate_index(selection, &snap)
             }
-            other @ (Phase::Idle | Phase::Launching | Phase::LaunchError) => {
+            other @ (Phase::Idle | Phase::Launching | Phase::LaunchError | Phase::Unlocking { .. }) => {
                 self.phase = other;
                 Vec::new()
             }
@@ -630,6 +708,11 @@ impl OverlayController {
                 input.push(ch);
                 self.check_hint_or_launch()
             }
+            Phase::Unlocking { unlock_mode: UnlockMode::Password, password_len, .. } => {
+                *password_len += 1;
+                vec![Command::PasswordChar(ch)]
+            }
+            Phase::Unlocking { .. } => Vec::new(),
             Phase::LaunchError => {
                 self.phase = Phase::Idle;
                 vec![
@@ -800,6 +883,14 @@ impl OverlayController {
 
     fn on_backspace(&mut self) -> Vec<Command> {
         match &mut self.phase {
+            Phase::Unlocking { unlock_mode: UnlockMode::Password, password_len, .. } => {
+                if *password_len > 0 {
+                    *password_len -= 1;
+                    vec![Command::PasswordBackspace]
+                } else {
+                    Vec::new()
+                }
+            }
             Phase::Armed { input, pending_launch, .. } => {
                 input.pop();
                 // Clear pending launch if input is emptied (user cancelled).
@@ -823,7 +914,26 @@ impl OverlayController {
     }
 
     fn on_confirm(&mut self) -> Vec<Command> {
+        // Handle Unlocking/Password first via mutable borrow.
+        if let Phase::Unlocking {
+            unlock_mode,
+            profiles_to_unlock,
+            current_index,
+            ..
+        } = &mut self.phase
+            && *unlock_mode == UnlockMode::Password
+        {
+            let profile = profiles_to_unlock[*current_index].clone();
+            *unlock_mode = UnlockMode::Verifying;
+            return vec![Command::SubmitPasswordUnlock { profile }, Command::ShowVerifying];
+        }
+
         match std::mem::replace(&mut self.phase, Phase::Idle) {
+            unlocking @ Phase::Unlocking { .. } => {
+                // Confirm during non-Password unlock modes is a no-op.
+                self.phase = unlocking;
+                Vec::new()
+            }
             Phase::Armed { selection, snap, .. } |
             Phase::Picking { selection, snap, .. } => {
                 self.activate_index(selection, &snap)
@@ -839,6 +949,13 @@ impl OverlayController {
     fn on_escape(&mut self) -> Vec<Command> {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
             Phase::Idle => Vec::new(),
+            Phase::Unlocking { .. } => {
+                vec![
+                    Command::ClearPasswordBuffer,
+                    Command::Hide,
+                    Command::Publish(EventKind::WmOverlayDismissed, SecurityLevel::Internal),
+                ]
+            }
             _ => vec![
                 Command::Hide,
                 Command::Publish(EventKind::WmOverlayDismissed, SecurityLevel::Internal),
@@ -850,11 +967,15 @@ impl OverlayController {
     // Launch result
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn on_launch_result(
         &mut self,
         success: bool,
         error: Option<String>,
         denial: Option<LaunchDenial>,
+        original_command: Option<String>,
+        original_tags: Option<Vec<String>>,
+        original_launch_args: Option<Vec<String>>,
     ) -> Vec<Command> {
         if !matches!(self.phase, Phase::Launching) {
             return Vec::new();
@@ -862,15 +983,162 @@ impl OverlayController {
 
         if success {
             self.phase = Phase::Idle;
-            vec![
+            return vec![
                 Command::Hide,
                 Command::Publish(EventKind::WmOverlayDismissed, SecurityLevel::Internal),
-            ]
-        } else {
-            let message = error.unwrap_or_else(|| "launch failed".into());
-            self.phase = Phase::LaunchError;
-            vec![Command::ShowLaunchError { message, denial }]
+            ];
         }
+
+        // Check for VaultsLocked denial — transition to inline unlock.
+        if let Some(LaunchDenial::VaultsLocked { locked_profiles }) = denial
+            && let (Some(cmd), Some(tags), Some(args)) =
+                (original_command, original_tags, original_launch_args)
+            && let Some(first_profile) = locked_profiles.first()
+        {
+            let profile = first_profile.clone();
+            self.phase = Phase::Unlocking {
+                profiles_to_unlock: locked_profiles,
+                current_index: 0,
+                password_len: 0,
+                unlock_mode: UnlockMode::AutoAttempt,
+                retry_command: cmd,
+                retry_tags: tags,
+                retry_launch_args: args,
+            };
+            return vec![Command::AttemptAutoUnlock { profile }];
+        }
+
+        let message = error.unwrap_or_else(|| "launch failed".into());
+        self.phase = Phase::LaunchError;
+        vec![Command::ShowLaunchError { message, denial: None }]
+    }
+
+    // -----------------------------------------------------------------------
+    // Unlock result handlers
+    // -----------------------------------------------------------------------
+
+    fn on_auto_unlock_result(
+        &mut self,
+        success: bool,
+        profile: TrustProfileName,
+        needs_touch: bool,
+    ) -> Vec<Command> {
+        if !matches!(self.phase, Phase::Unlocking { .. }) {
+            return Vec::new();
+        }
+        if success {
+            return self.advance_to_next_profile_or_retry();
+        }
+        if needs_touch {
+            if let Phase::Unlocking { unlock_mode, .. } = &mut self.phase {
+                *unlock_mode = UnlockMode::WaitingForTouch;
+            }
+            return vec![Command::ShowTouchPrompt { profile }];
+        }
+        // Fall back to password.
+        if let Phase::Unlocking { unlock_mode, .. } = &mut self.phase {
+            *unlock_mode = UnlockMode::Password;
+        }
+        vec![Command::ShowPasswordPrompt { profile }]
+    }
+
+    fn on_touch_result(
+        &mut self,
+        success: bool,
+        profile: TrustProfileName,
+    ) -> Vec<Command> {
+        if !matches!(self.phase, Phase::Unlocking { .. }) {
+            return Vec::new();
+        }
+        if success {
+            return self.advance_to_next_profile_or_retry();
+        }
+        // Fall back to password on touch failure.
+        if let Phase::Unlocking { unlock_mode, .. } = &mut self.phase {
+            *unlock_mode = UnlockMode::Password;
+        }
+        vec![
+            Command::ShowPasswordPrompt { profile },
+            Command::ShowUnlockError {
+                message: "Touch verification failed".into(),
+            },
+        ]
+    }
+
+    fn on_unlock_result(
+        &mut self,
+        success: bool,
+        profile: TrustProfileName,
+    ) -> Vec<Command> {
+        if !matches!(self.phase, Phase::Unlocking { .. }) {
+            return Vec::new();
+        }
+        if success {
+            return self.advance_to_next_profile_or_retry();
+        }
+        // Wrong password — reset for retry.
+        if let Phase::Unlocking {
+            password_len,
+            unlock_mode,
+            ..
+        } = &mut self.phase
+        {
+            *password_len = 0;
+            *unlock_mode = UnlockMode::Password;
+        }
+        vec![
+            Command::ClearPasswordBuffer,
+            Command::ShowPasswordPrompt { profile },
+            Command::ShowUnlockError {
+                message: "Wrong password".into(),
+            },
+        ]
+    }
+
+    /// Advance to the next locked profile, or retry the original launch.
+    fn advance_to_next_profile_or_retry(&mut self) -> Vec<Command> {
+        let mut cmds = vec![Command::ClearPasswordBuffer];
+
+        match std::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::Unlocking {
+                profiles_to_unlock,
+                current_index,
+                retry_command,
+                retry_tags,
+                retry_launch_args,
+                ..
+            } => {
+                let next_index = current_index + 1;
+                if next_index < profiles_to_unlock.len() {
+                    // More profiles to unlock.
+                    let profile = profiles_to_unlock[next_index].clone();
+                    self.phase = Phase::Unlocking {
+                        profiles_to_unlock,
+                        current_index: next_index,
+                        password_len: 0,
+                        unlock_mode: UnlockMode::AutoAttempt,
+                        retry_command,
+                        retry_tags,
+                        retry_launch_args,
+                    };
+                    cmds.push(Command::AttemptAutoUnlock { profile });
+                } else {
+                    // All profiles unlocked — retry the launch.
+                    self.phase = Phase::Launching;
+                    cmds.push(Command::ShowLaunching);
+                    cmds.push(Command::LaunchApp {
+                        command: retry_command,
+                        tags: retry_tags,
+                        launch_args: retry_launch_args,
+                    });
+                }
+            }
+            other => {
+                self.phase = other;
+            }
+        }
+
+        cmds
     }
 
     // -----------------------------------------------------------------------

@@ -604,6 +604,68 @@ async fn handle_message(
             Some(EventKind::UnlockResponse { success: outcome == "success", profile: target })
         }
 
+        // -- SSH-agent unlock (pre-derived master key) --
+        EventKind::SshUnlockRequest { master_key, profile, ssh_fingerprint } => {
+            let target = profile.clone();
+
+            if ctx.vault_state.master_keys.contains_key(&target) {
+                tracing::warn!(audit = "security", profile = %target, "SSH unlock request for already-unlocked profile — rejected");
+                audit_secret_access("ssh-unlock", msg.sender, &target, None, "rejected-already-unlocked");
+                return send_response(
+                    ctx.client, msg,
+                    EventKind::UnlockRejected {
+                        reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
+                        profile: Some(target),
+                    },
+                    ctx.daemon_id,
+                ).await;
+            }
+
+            // Convert SensitiveBytes to SecureBytes (copy into mlock'd memory).
+            let secure_master_key = SecureBytes::new(master_key.as_bytes().to_vec());
+
+            // Verify against existing vault DB if it exists.
+            let vault_path = ctx.config_dir.join("vaults").join(format!("{target}.db"));
+            let (success, verified_store) = if vault_path.exists() {
+                let vault_key = core_crypto::derive_vault_key(secure_master_key.as_bytes(), &target);
+                let vp = vault_path;
+                match tokio::task::spawn_blocking(move || {
+                    SqlCipherStore::open(&vp, &vault_key)
+                }).await {
+                    Ok(Ok(store)) => {
+                        tracing::info!(profile = %target, ssh_fingerprint = %ssh_fingerprint, "vault key verified via SSH");
+                        (true, Some(store))
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, profile = %target, "SSH unlock vault key verification failed");
+                        (false, None)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, profile = %target, "SSH unlock spawn_blocking failed");
+                        (false, None)
+                    }
+                }
+            } else {
+                // No vault DB yet — accept the master key on faith.
+                (true, None)
+            };
+
+            if success {
+                ctx.vault_state.master_keys.insert(target.clone(), secure_master_key);
+                if let Some(store) = verified_store {
+                    let jit = JitDelivery::new(store, ctx.vault_state.ttl);
+                    ctx.vault_state.vaults.insert(target.clone(), jit);
+                }
+                tracing::info!(profile = %target, ssh_fingerprint = %ssh_fingerprint, "vault unlocked via SSH");
+            }
+
+            audit_secret_access(
+                "ssh-unlock", msg.sender, &target, None,
+                if success { "success" } else { "failed" },
+            );
+            Some(EventKind::UnlockResponse { success, profile: target })
+        }
+
         // -- Lock (per-profile or all) --
         EventKind::LockRequest { profile } => {
             let profiles_locked: Vec<TrustProfileName> = match profile {

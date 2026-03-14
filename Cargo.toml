@@ -7,6 +7,7 @@ members = [
     "core-fuzzy",
     "core-secrets",
     "core-profile",
+    "core-auth",
     "platform-linux",
     "platform-macos",
     "platform-windows",
@@ -49,6 +50,7 @@ core-crypto     = { path = "core-crypto" }
 core-fuzzy      = { path = "core-fuzzy" }
 core-secrets    = { path = "core-secrets" }
 core-profile    = { path = "core-profile" }
+core-auth       = { path = "core-auth" }
 platform-linux  = { path = "platform-linux" }
 platform-macos  = { path = "platform-macos" }
 platform-windows = { path = "platform-windows" }
@@ -72,6 +74,7 @@ bytes           = "1.11.1"                      # MANDATORY pin: RUSTSEC-2026-00
 # -- Async --
 tokio           = { version = "1", features = ["rt", "net", "io-util", "sync", "macros", "time", "signal", "fs"] }
 futures-util    = { version = "0.3", default-features = false, features = ["std"] }
+async-trait     = "0.1"
 
 # -- Crypto --
 aes-gcm         = { version = "0.10.3", features = ["zeroize"] }  # MANDATORY pin: CVE-2023-42811

@@ -1256,6 +1256,14 @@ pub enum EventKind {
         reason: UnlockRejectedReason,
         profile: Option<TrustProfileName>,
     },
+    /// Unlock a vault using a pre-derived master key (SSH-agent or future backends).
+    /// The caller performed signing, KEK derivation, and master key unwrapping.
+    SshUnlockRequest {
+        master_key: SensitiveBytes,
+        profile: TrustProfileName,
+        ssh_fingerprint: String,
+    },
+
     LockRequest {
         /// Target profile. None = lock all vaults.
         #[serde(default)]
@@ -1531,6 +1539,7 @@ impl_event_debug! {
         SecretGetResponse { key, value => REDACTED, denial },
         SecretSet { profile, key, value => REDACTED },
         UnlockRequest { password => REDACTED, profile },
+        SshUnlockRequest { master_key => REDACTED, profile, ssh_fingerprint },
     }
     transparent {
         WindowFocused { window_id, app_id, workspace_id },

@@ -769,6 +769,11 @@ async fn execute_commands(
                 // visual feedback that the action was received.
                 // (ShowLaunching was already sent by the controller before this command.)
 
+                // Capture retry context before moving into IPC request.
+                let retry_command = command.clone();
+                let retry_tags = tags.clone();
+                let retry_launch_args = launch_args.clone();
+
                 let active_profile = {
                     let cfg_guard = config_state.read().ok();
                     cfg_guard.and_then(|c| {
@@ -796,12 +801,18 @@ async fn execute_commands(
                                     success: true,
                                     error: None,
                                     denial: None,
+                                    original_command: None,
+                                    original_tags: None,
+                                    original_launch_args: None,
                                 }
                             } else {
                                 daemon_wm::controller::Event::LaunchResult {
                                     success: false,
                                     error: error.or_else(|| Some("launch failed".into())),
                                     denial,
+                                    original_command: Some(retry_command.clone()),
+                                    original_tags: Some(retry_tags.clone()),
+                                    original_launch_args: Some(retry_launch_args.clone()),
                                 }
                             }
                         }
@@ -809,6 +820,9 @@ async fn execute_commands(
                             success: false,
                             error: Some("unexpected response from launcher".into()),
                             denial: None,
+                            original_command: None,
+                            original_tags: None,
+                            original_launch_args: None,
                         },
                     },
                     Err(e) => {
@@ -817,6 +831,9 @@ async fn execute_commands(
                             success: false,
                             error: Some(format!("IPC error: {e}")),
                             denial: None,
+                            original_command: None,
+                            original_tags: None,
+                            original_launch_args: None,
                         }
                     }
                 };
@@ -881,6 +898,98 @@ async fn execute_commands(
             }
             Command::Publish(event, level) => {
                 client.publish(event, level).await.ok();
+            }
+            // Unlock flow commands — overlay UX stubs for now.
+            Command::AttemptAutoUnlock { profile } => {
+                tracing::info!(%profile, "auto-unlock attempt (stub)");
+                // TODO: wire to core-auth dispatcher auto-unlock, feed back AutoUnlockResult
+                // For now, immediately report failure (no auto backend available).
+                let win_list = windows.lock().await;
+                let cfg = wm_config.lock().await;
+                let sub_cmds = controller.handle(
+                    daemon_wm::controller::Event::AutoUnlockResult {
+                        success: false,
+                        profile,
+                        needs_touch: false,
+                    },
+                    &win_list,
+                    &cfg,
+                );
+                drop(cfg);
+                drop(win_list);
+                Box::pin(execute_commands(
+                    sub_cmds, overlay_cmd_tx, overlay_event_rx,
+                    #[cfg(target_os = "linux")] backend,
+                    client, config_state, controller, windows, wm_config,
+                    ipc_keyboard_confirmed,
+                )).await;
+            }
+            Command::ShowPasswordPrompt { profile } => {
+                tracing::debug!(%profile, "showing password prompt");
+                if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError {
+                    message: format!("Enter password for {profile}"),
+                }).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
+            }
+            Command::ShowTouchPrompt { profile } => {
+                tracing::debug!(%profile, "showing touch prompt");
+                if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError {
+                    message: format!("Touch your security key for {profile}..."),
+                }).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
+            }
+            Command::ShowAutoUnlockProgress { profile } => {
+                tracing::debug!(%profile, "showing auto-unlock progress");
+                if overlay_cmd_tx.send(OverlayCmd::ShowLaunching).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
+            }
+            Command::ShowVerifying => {
+                if overlay_cmd_tx.send(OverlayCmd::ShowLaunching).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
+            }
+            Command::PasswordChar(_) => {
+                // Overlay receives this to update dot count; forwarded as status.
+                tracing::trace!("password char received");
+            }
+            Command::PasswordBackspace => {
+                tracing::trace!("password backspace received");
+            }
+            Command::SubmitPasswordUnlock { profile } => {
+                tracing::info!(%profile, "submitting password unlock (stub)");
+                // TODO: collect SecureVec from password buffer, send UnlockRequest IPC
+                // For now, immediately report failure.
+                let win_list = windows.lock().await;
+                let cfg = wm_config.lock().await;
+                let sub_cmds = controller.handle(
+                    daemon_wm::controller::Event::UnlockResult {
+                        success: false,
+                        profile,
+                    },
+                    &win_list,
+                    &cfg,
+                );
+                drop(cfg);
+                drop(win_list);
+                Box::pin(execute_commands(
+                    sub_cmds, overlay_cmd_tx, overlay_event_rx,
+                    #[cfg(target_os = "linux")] backend,
+                    client, config_state, controller, windows, wm_config,
+                    ipc_keyboard_confirmed,
+                )).await;
+            }
+            Command::ClearPasswordBuffer => {
+                tracing::debug!("clearing password buffer");
+                // TODO: zeroize SecureVec password buffer
+            }
+            Command::ShowUnlockError { message } => {
+                tracing::warn!(message = %message, "unlock error");
+                if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError { message }).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
             }
         }
     }
