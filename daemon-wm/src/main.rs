@@ -100,8 +100,8 @@ fn map_ipc_key_to_event(keyval: u32, modifiers: u32, unicode: Option<char>) -> O
         DOWN => Some(Event::SelectionDown),
         UP => Some(Event::SelectionUp),
         BACKSPACE => Some(Event::Backspace),
-        SPACE => None,
-        _ => unicode.filter(|ch| ch.is_alphanumeric()).map(Event::Char),
+        SPACE => Some(Event::Char(' ')),
+        _ => unicode.filter(|ch| ch.is_ascii_graphic() || *ch == ' ').map(Event::Char),
     }
 }
 
@@ -1194,8 +1194,11 @@ mod tests {
     }
 
     #[test]
-    fn map_space_is_inert() {
-        assert!(map_ipc_key_to_event(0x0020, 0, Some(' ')).is_none());
+    fn map_space_is_char() {
+        assert!(matches!(
+            map_ipc_key_to_event(0x0020, 0, Some(' ')),
+            Some(Event::Char(' '))
+        ));
     }
 
     #[test]
@@ -1207,8 +1210,12 @@ mod tests {
     }
 
     #[test]
-    fn map_non_alphanumeric_ignored() {
-        assert!(map_ipc_key_to_event(0x002F, 0, Some('/')).is_none());
+    fn map_printable_non_alphanumeric_accepted() {
+        // Printable ASCII like '/' should now pass through to controller.
+        assert!(matches!(
+            map_ipc_key_to_event(0x002F, 0, Some('/')),
+            Some(Event::Char('/'))
+        ));
     }
 
     #[test]

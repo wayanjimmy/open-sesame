@@ -10,11 +10,13 @@
 //! core dumps. All unsafe blocks are documented inline with justification.
 
 mod secure_bytes;
+mod secure_vec;
 mod encryption;
 mod kdf;
 pub mod hkdf;
 
 pub use secure_bytes::SecureBytes;
+pub use secure_vec::SecureVec;
 pub use encryption::EncryptionKey;
 pub use kdf::{derive_key_argon2, derive_key_pbkdf2, derive_key_kdf};
 pub use hkdf::{

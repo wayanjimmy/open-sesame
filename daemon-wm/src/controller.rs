@@ -617,6 +617,13 @@ impl OverlayController {
     fn on_char(&mut self, ch: char) -> Vec<Command> {
         match &mut self.phase {
             Phase::Armed { input, .. } | Phase::Picking { input, .. } => {
+                // Centralised character filter: only alphanumeric chars are valid
+                // for launcher search input. All printable chars pass through the
+                // overlay/IPC layers; filtering happens here so every input path
+                // shares the same policy.
+                if !ch.is_alphanumeric() {
+                    return Vec::new();
+                }
                 if input.len() >= MAX_INPUT_LENGTH {
                     return Vec::new();
                 }

@@ -319,10 +319,10 @@ fn run_gtk4_overlay(
             gdk::Key::Down => Some(OverlayEvent::SelectionDown),
             gdk::Key::Up => Some(OverlayEvent::SelectionUp),
             gdk::Key::BackSpace => Some(OverlayEvent::Backspace),
-            gdk::Key::space => None, // inert — activation key, not navigation
+            gdk::Key::space => Some(OverlayEvent::KeyChar(' ')),
             _ => {
                 if let Some(ch) = keyval.to_unicode() {
-                    if ch.is_alphanumeric() {
+                    if ch.is_ascii_graphic() {
                         Some(OverlayEvent::KeyChar(ch))
                     } else {
                         None

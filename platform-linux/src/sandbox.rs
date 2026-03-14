@@ -169,9 +169,7 @@ pub fn apply_seccomp(profile: &SeccompProfile) -> core_types::Result<()> {
     use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 
     // Default action for disallowed syscalls.
-    // TODO(seccomp-audit): temporarily Log instead of KillProcess to collect
-    // all missing syscalls in dmesg/audit. Revert to KillProcess after audit.
-    let default_action = ScmpAction::Log;
+    let default_action = ScmpAction::KillProcess;
     let mut filter = ScmpFilterContext::new(default_action)
         .map_err(|e| core_types::Error::Platform(format!("seccomp new_filter failed: {e}")))?;
 
