@@ -53,8 +53,8 @@ enum Command {
 
     /// Unlock a vault with its password.
     Unlock {
-        /// Target profile (default: "default"). Omit to unlock the default profile,
-        /// or set SESAME_UNLOCK_PROFILES=profile1,profile2 for bulk unlock.
+        /// Target profiles (CSV: "default,work" or "org:vault,org:vault").
+        /// Falls back to SESAME_PROFILES env var, then "default".
         #[arg(short, long)]
         profile: Option<String>,
     },
@@ -126,9 +126,10 @@ enum Command {
     ///
     /// Usage: sesame env -p work -- aws s3 ls
     Env {
-        /// Profile to source secrets from.
+        /// Profiles to source secrets from (CSV: "default,work" or "org:vault").
+        /// Falls back to SESAME_PROFILES env var, then "default".
         #[arg(short, long)]
-        profile: String,
+        profile: Option<String>,
 
         /// Prefix for env var names (e.g., --prefix MYAPP: "api-key" becomes "MYAPP_API_KEY").
         #[arg(long)]
@@ -151,9 +152,10 @@ enum Command {
     ///   sesame export -p work --format dotenv > .env.secrets
     ///   sesame export -p work --format json | jq .
     Export {
-        /// Profile to source secrets from.
+        /// Profiles to source secrets from (CSV: "default,work" or "org:vault").
+        /// Falls back to SESAME_PROFILES env var, then "default".
         #[arg(short, long)]
-        profile: String,
+        profile: Option<String>,
 
         /// Output format: shell, dotenv, json.
         #[arg(short, long, default_value = "shell")]
@@ -640,10 +642,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         Command::Env { profile, prefix, command } => {
-            cmd_env(&profile, prefix.as_deref(), &command).await
+            cmd_env(profile.as_deref(), prefix.as_deref(), &command).await
         }
         Command::Export { profile, format, prefix } => {
-            cmd_export(&profile, &format, prefix.as_deref()).await
+            cmd_export(profile.as_deref(), &format, prefix.as_deref()).await
         }
         Command::Workspace(sub) => cmd_workspace(sub).await,
     }
@@ -765,38 +767,75 @@ async fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse SESAME_UNLOCK_PROFILES env var.
-/// Supports: `profile1,profile2` or `org:profile1,profile2;org2:profile3`
-fn parse_unlock_profiles(input: &str) -> Vec<String> {
-    input.split(';')
-        .flat_map(|group| {
-            let vaults = if let Some((_org, vaults)) = group.split_once(':') {
-                vaults
-            } else {
-                group
-            };
-            vaults.split(',').map(|s| s.trim().to_string())
-        })
+/// A parsed profile spec from CSV input like "org:vault" or bare "vault".
+#[derive(Debug, Clone)]
+struct ProfileSpec {
+    /// Organizational namespace (optional). Currently informational.
+    org: Option<String>,
+    /// The vault/profile name used for IPC.
+    vault: String,
+}
+
+/// Parse a CSV profile spec string.
+///
+/// Format: `vault,org:vault,org:vault`
+/// - `default` → ProfileSpec { org: None, vault: "default" }
+/// - `braincraft:operations` → ProfileSpec { org: Some("braincraft"), vault: "operations" }
+///
+/// Designed for future extension to `docker.io/project/org:vault@sha256`.
+fn parse_profile_specs(input: &str) -> Vec<ProfileSpec> {
+    input.split(',')
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
+        .map(|entry| {
+            if let Some((org, vault)) = entry.rsplit_once(':') {
+                ProfileSpec { org: Some(org.to_string()), vault: vault.to_string() }
+            } else {
+                ProfileSpec { org: None, vault: entry.to_string() }
+            }
+        })
         .collect()
+}
+
+/// Resolve profile specs from a CLI flag or SESAME_PROFILES env var.
+fn resolve_profile_specs(cli_arg: Option<&str>) -> Vec<ProfileSpec> {
+    let input = match cli_arg {
+        Some(p) => p.to_string(),
+        None => std::env::var("SESAME_PROFILES").unwrap_or_else(|_| "default".into()),
+    };
+    parse_profile_specs(&input)
+}
+
+/// Fetch secrets from multiple profiles, merging with left-wins collision resolution.
+async fn fetch_multi_profile_secrets(
+    client: &BusClient,
+    specs: &[ProfileSpec],
+    prefix: Option<&str>,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+
+    for spec in specs {
+        let profile = TrustProfileName::try_from(spec.vault.as_str())
+            .map_err(|e| anyhow::anyhow!("invalid profile/vault '{}': {e}", spec.vault))?;
+        let secrets = fetch_profile_secrets(client, &profile, prefix).await?;
+        for (key, value) in secrets {
+            if seen_keys.insert(key.clone()) {
+                merged.push((key, value));
+            }
+        }
+    }
+
+    Ok(merged)
 }
 
 async fn cmd_unlock(profile_arg: Option<String>) -> anyhow::Result<()> {
     let client = connect().await?;
 
-    // Determine which profiles to unlock.
-    let profiles: Vec<String> = match profile_arg {
-        Some(p) => vec![p],
-        None => {
-            if let Ok(env_val) = std::env::var("SESAME_UNLOCK_PROFILES") {
-                parse_unlock_profiles(&env_val)
-            } else {
-                vec!["default".to_string()]
-            }
-        }
-    };
+    let specs = resolve_profile_specs(profile_arg.as_deref());
 
-    for profile_name in &profiles {
+    for spec in &specs {
+        let profile_name = &spec.vault;
         let target_profile = TrustProfileName::try_from(profile_name.as_str())
             .map_err(|e| anyhow::anyhow!("invalid profile name '{profile_name}': {e}"))?;
 
@@ -1971,34 +2010,35 @@ fn secret_key_to_env_var(key: &str, prefix: Option<&str>) -> String {
     }
 }
 
-async fn cmd_env(profile: &str, prefix: Option<&str>, command: &[String]) -> anyhow::Result<()> {
+async fn cmd_env(profile: Option<&str>, prefix: Option<&str>, command: &[String]) -> anyhow::Result<()> {
     if command.is_empty() {
         anyhow::bail!("no command specified");
     }
 
     if command.first().is_some_and(|c| c.starts_with('-')) {
         eprintln!("hint: use '--' to separate sesame options from the command, e.g.:");
-        eprintln!("  sesame env -p {} -- {}", profile, command.join(" "));
+        eprintln!("  sesame env -p default -- {}", command.join(" "));
     }
 
-    validate_profile_in_config(profile)?;
+    let specs = resolve_profile_specs(profile);
     let client = connect().await?;
-    let profile = TrustProfileName::try_from(profile)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let env_vars = fetch_profile_secrets(&client, &profile, prefix).await?;
+    let env_vars = fetch_multi_profile_secrets(&client, &specs, prefix).await?;
 
     // Spawn child process with secrets as env vars.
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
 
-    // Inject SESAME_PROFILE so the child knows its context.
-    cmd.env("SESAME_PROFILE", profile.as_ref());
+    // Inject SESAME_PROFILES so the child knows its context.
+    let profiles_csv: String = specs.iter().map(|s| {
+        match &s.org {
+            Some(org) => format!("{org}:{}", s.vault),
+            None => s.vault.clone(),
+        }
+    }).collect::<Vec<_>>().join(",");
+    cmd.env("SESAME_PROFILES", &profiles_csv);
 
     // Inject each secret as an env var.
     for (env_name, value) in &env_vars {
-        // Best-effort UTF-8. OsStr::from_bytes would work for arbitrary bytes
-        // on Unix but env vars are conventionally UTF-8.
         let val_str = String::from_utf8_lossy(value);
         cmd.env(env_name, val_str.as_ref());
     }
@@ -2009,12 +2049,10 @@ async fn cmd_env(profile: &str, prefix: Option<&str>, command: &[String]) -> any
     let status = child.wait()
         .context("failed to wait for child process")?;
 
-    // 4. Zeroize all secret copies in our process.
     for (_, mut value) in env_vars {
         value.zeroize();
     }
 
-    // Forward the child's exit code.
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -2098,13 +2136,10 @@ fn json_escape(s: &str) -> String {
     }).collect()
 }
 
-async fn cmd_export(profile: &str, format: &ExportFormat, prefix: Option<&str>) -> anyhow::Result<()> {
-    validate_profile_in_config(profile)?;
+async fn cmd_export(profile: Option<&str>, format: &ExportFormat, prefix: Option<&str>) -> anyhow::Result<()> {
+    let specs = resolve_profile_specs(profile);
     let client = connect().await?;
-    let profile = TrustProfileName::try_from(profile)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let raw_secrets = fetch_profile_secrets(&client, &profile, prefix).await?;
+    let raw_secrets = fetch_multi_profile_secrets(&client, &specs, prefix).await?;
     if raw_secrets.is_empty() {
         return Ok(());
     }
@@ -2507,19 +2542,18 @@ async fn cmd_workspace(cmd: WorkspaceCmd) -> anyhow::Result<()> {
             let effective = sesame_workspace::config::resolve_effective_config(&config, &path, &root)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let profile = profile
+            // Profile resolution: CLI flag > effective config > SESAME_PROFILES env > "default"
+            let profile_csv = profile
                 .or(effective.profile)
-                .or_else(|| std::env::var("SESAME_PROFILE").ok())
+                .or_else(|| std::env::var("SESAME_PROFILES").ok())
                 .unwrap_or_else(|| "default".into());
 
+            let specs = parse_profile_specs(&profile_csv);
             let secret_prefix = prefix.or(effective.secret_prefix);
 
-            // Connect to IPC and fetch secrets.
+            // Connect to IPC and fetch secrets from all profiles.
             let client = connect().await?;
-            let tp = TrustProfileName::try_from(profile.as_str())
-                .map_err(|e| anyhow::anyhow!("invalid profile: {e}"))?;
-
-            let env_vars = fetch_profile_secrets(&client, &tp, secret_prefix.as_deref()).await?;
+            let env_vars = fetch_multi_profile_secrets(&client, &specs, secret_prefix.as_deref()).await?;
 
             // Determine what to spawn.
             let (bin, args, is_interactive) = if !command.is_empty() {
@@ -2534,7 +2568,7 @@ async fn cmd_workspace(cmd: WorkspaceCmd) -> anyhow::Result<()> {
             let mut cmd = std::process::Command::new(&bin);
             cmd.args(&args);
             cmd.current_dir(&path);
-            cmd.env("SESAME_PROFILE", &profile);
+            cmd.env("SESAME_PROFILES", &profile_csv);
             cmd.env("SESAME_WORKSPACE", path.display().to_string());
 
             // Inject effective env vars from .sesame.toml layers.
@@ -2550,7 +2584,7 @@ async fn cmd_workspace(cmd: WorkspaceCmd) -> anyhow::Result<()> {
 
             if is_interactive {
                 println!(
-                    "Entering workspace shell (profile: {profile}, {} secrets injected)",
+                    "Entering workspace shell (profiles: {profile_csv}, {} secrets injected)",
                     env_vars.len()
                 );
             }
@@ -2609,41 +2643,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_unlock_profiles_comma_separated() {
-        assert_eq!(parse_unlock_profiles("a,b,c"), vec!["a", "b", "c"]);
+    fn parse_specs_bare_vaults() {
+        let specs = parse_profile_specs("a,b,c");
+        assert_eq!(specs.len(), 3);
+        assert!(specs[0].org.is_none());
+        assert_eq!(specs[0].vault, "a");
+        assert_eq!(specs[1].vault, "b");
+        assert_eq!(specs[2].vault, "c");
     }
 
     #[test]
-    fn test_parse_unlock_profiles_org_vault_syntax() {
-        let result = parse_unlock_profiles("org1:a,b;org2:c");
-        assert_eq!(result, vec!["a", "b", "c"]);
+    fn parse_specs_org_vault() {
+        let specs = parse_profile_specs("braincraft:operations,braincraft:frontend,default:dev");
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].org.as_deref(), Some("braincraft"));
+        assert_eq!(specs[0].vault, "operations");
+        assert_eq!(specs[1].org.as_deref(), Some("braincraft"));
+        assert_eq!(specs[1].vault, "frontend");
+        assert_eq!(specs[2].org.as_deref(), Some("default"));
+        assert_eq!(specs[2].vault, "dev");
     }
 
     #[test]
-    fn test_parse_unlock_profiles_single() {
-        assert_eq!(parse_unlock_profiles("default"), vec!["default"]);
+    fn parse_specs_mixed() {
+        let specs = parse_profile_specs("default,braincraft:ops");
+        assert_eq!(specs.len(), 2);
+        assert!(specs[0].org.is_none());
+        assert_eq!(specs[0].vault, "default");
+        assert_eq!(specs[1].org.as_deref(), Some("braincraft"));
+        assert_eq!(specs[1].vault, "ops");
     }
 
     #[test]
-    fn test_parse_unlock_profiles_empty_segments_filtered() {
-        assert_eq!(parse_unlock_profiles("a,,b"), vec!["a", "b"]);
+    fn parse_specs_single() {
+        let specs = parse_profile_specs("default");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].vault, "default");
     }
 
     #[test]
-    fn test_parse_unlock_profiles_whitespace_trimmed() {
-        assert_eq!(parse_unlock_profiles(" a , b "), vec!["a", "b"]);
+    fn parse_specs_empty_segments_filtered() {
+        let specs = parse_profile_specs("a,,b");
+        assert_eq!(specs.len(), 2);
     }
 
     #[test]
-    fn test_parse_unlock_profiles_empty_string() {
-        let result = parse_unlock_profiles("");
-        assert!(result.is_empty());
+    fn parse_specs_whitespace_trimmed() {
+        let specs = parse_profile_specs(" a , b ");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].vault, "a");
+        assert_eq!(specs[1].vault, "b");
     }
 
     #[test]
-    fn test_parse_unlock_profiles_org_with_no_vaults() {
-        let result = parse_unlock_profiles("org:");
-        assert!(result.is_empty());
+    fn parse_specs_empty_string() {
+        assert!(parse_profile_specs("").is_empty());
+    }
+
+    #[test]
+    fn parse_specs_org_with_no_vault() {
+        let specs = parse_profile_specs("org:");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].org.as_deref(), Some("org"));
+        assert_eq!(specs[0].vault, "");
     }
 
     #[test]
