@@ -2078,4 +2078,289 @@ mod tests {
             assert_eq!(*selection, 2);
         }
     }
+
+    // ===================================================================
+    // Vault unlock flow tests
+    // ===================================================================
+
+    /// Helper: drive the controller to Phase::Launching with a staged ghostty launch.
+    /// Uses an empty window list so 'g' hits the launch binding (not a hint match).
+    fn drive_to_launching(ctrl: &mut OverlayController, _windows: &[Window], config: &WmConfig) {
+        let no_windows: Vec<Window> = vec![];
+        ctrl.handle(Event::ActivateLauncher, &no_windows, config);
+        ctrl.handle(Event::Char('g'), &no_windows, config);
+        let cmds = ctrl.handle(Event::ModifierReleased, &no_windows, config);
+        assert!(matches!(ctrl.phase, Phase::Launching),
+            "expected Phase::Launching after modifier release with staged launch, \
+             phase={:?}, cmds={cmds:?}", ctrl.phase);
+    }
+
+    /// Helper: construct a VaultsLocked LaunchResult event.
+    fn vaults_locked_event(profiles: &[&str]) -> Event {
+        Event::LaunchResult {
+            success: false,
+            error: Some("VaultsLocked".into()),
+            denial: Some(LaunchDenial::VaultsLocked {
+                locked_profiles: profiles.iter()
+                    .map(|p| TrustProfileName::try_from(*p).unwrap())
+                    .collect(),
+            }),
+            original_command: Some("ghostty".into()),
+            original_tags: Some(vec!["dev".into()]),
+            original_launch_args: Some(vec![]),
+        }
+    }
+
+    /// Helper: drive to Phase::Unlocking (Password mode) for a single profile.
+    fn drive_to_password_prompt(
+        ctrl: &mut OverlayController,
+        windows: &[Window],
+        config: &WmConfig,
+        profile: &str,
+    ) {
+        drive_to_launching(ctrl, windows, config);
+        ctrl.handle(vaults_locked_event(&[profile]), windows, config);
+        ctrl.handle(Event::AutoUnlockResult {
+            success: false,
+            profile: TrustProfileName::try_from(profile).unwrap(),
+            needs_touch: false,
+        }, windows, config);
+        assert!(matches!(ctrl.phase, Phase::Unlocking { unlock_mode: UnlockMode::Password, .. }),
+            "expected Phase::Unlocking(Password) after auto-unlock failure");
+    }
+
+    #[test]
+    fn vaults_locked_transitions_to_unlocking() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_launching(&mut ctrl, &windows, &config);
+
+        let cmds = ctrl.handle(
+            vaults_locked_event(&["default", "work"]),
+            &windows,
+            &config,
+        );
+
+        assert!(matches!(ctrl.phase, Phase::Unlocking { .. }),
+            "VaultsLocked must transition to Phase::Unlocking");
+        assert!(cmds.iter().any(|c| matches!(c, Command::AttemptAutoUnlock { .. })),
+            "VaultsLocked must emit AttemptAutoUnlock, got: {cmds:?}");
+    }
+
+    #[test]
+    fn auto_unlock_failure_falls_back_to_password() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_launching(&mut ctrl, &windows, &config);
+        ctrl.handle(vaults_locked_event(&["default"]), &windows, &config);
+
+        let cmds = ctrl.handle(Event::AutoUnlockResult {
+            success: false,
+            profile: TrustProfileName::try_from("default").unwrap(),
+            needs_touch: false,
+        }, &windows, &config);
+
+        assert!(cmds.iter().any(|c| matches!(c, Command::ShowPasswordPrompt { .. })),
+            "auto-unlock failure must fall back to password prompt, got: {cmds:?}");
+        if let Phase::Unlocking { unlock_mode, .. } = &ctrl.phase {
+            assert_eq!(*unlock_mode, UnlockMode::Password);
+        } else {
+            panic!("expected Phase::Unlocking");
+        }
+    }
+
+    #[test]
+    fn password_chars_tracked_in_unlock_phase() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_password_prompt(&mut ctrl, &windows, &config, "default");
+
+        let cmds = ctrl.handle(Event::Char('p'), &windows, &config);
+        assert!(cmds.iter().any(|c| matches!(c, Command::PasswordChar('p'))));
+
+        let cmds = ctrl.handle(Event::Char('a'), &windows, &config);
+        assert!(cmds.iter().any(|c| matches!(c, Command::PasswordChar('a'))));
+
+        if let Phase::Unlocking { password_len, .. } = &ctrl.phase {
+            assert_eq!(*password_len, 2);
+        } else {
+            panic!("expected Phase::Unlocking");
+        }
+    }
+
+    #[test]
+    fn confirm_during_password_emits_submit() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_password_prompt(&mut ctrl, &windows, &config, "default");
+        ctrl.handle(Event::Char('p'), &windows, &config);
+
+        let cmds = ctrl.handle(Event::Confirm, &windows, &config);
+        assert!(cmds.iter().any(|c| matches!(c, Command::SubmitPasswordUnlock { .. })),
+            "Confirm during password must emit SubmitPasswordUnlock, got: {cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::ShowVerifying)));
+    }
+
+    #[test]
+    fn successful_unlock_retries_launch() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_password_prompt(&mut ctrl, &windows, &config, "default");
+
+        let cmds = ctrl.handle(Event::UnlockResult {
+            success: true,
+            profile: TrustProfileName::try_from("default").unwrap(),
+        }, &windows, &config);
+
+        assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "ghostty")),
+            "successful unlock must retry original launch, got: {cmds:?}");
+        assert!(matches!(ctrl.phase, Phase::Launching));
+    }
+
+    #[test]
+    fn multi_profile_sequential_unlock() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_launching(&mut ctrl, &windows, &config);
+        ctrl.handle(vaults_locked_event(&["default", "work"]), &windows, &config);
+
+        // First profile: auto-unlock fails, password succeeds.
+        ctrl.handle(Event::AutoUnlockResult {
+            success: false,
+            profile: TrustProfileName::try_from("default").unwrap(),
+            needs_touch: false,
+        }, &windows, &config);
+        let cmds = ctrl.handle(Event::UnlockResult {
+            success: true,
+            profile: TrustProfileName::try_from("default").unwrap(),
+        }, &windows, &config);
+
+        // Must advance to second profile, NOT retry launch yet.
+        assert!(cmds.iter().any(|c| matches!(c, Command::AttemptAutoUnlock { profile }
+            if profile.as_ref() == "work")),
+            "must advance to next locked profile, got: {cmds:?}");
+        if let Phase::Unlocking { current_index, .. } = &ctrl.phase {
+            assert_eq!(*current_index, 1);
+        } else {
+            panic!("expected Phase::Unlocking at index 1");
+        }
+
+        // Second profile: auto-unlock fails, password succeeds.
+        ctrl.handle(Event::AutoUnlockResult {
+            success: false,
+            profile: TrustProfileName::try_from("work").unwrap(),
+            needs_touch: false,
+        }, &windows, &config);
+        let cmds = ctrl.handle(Event::UnlockResult {
+            success: true,
+            profile: TrustProfileName::try_from("work").unwrap(),
+        }, &windows, &config);
+
+        // NOW retry the launch.
+        assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "ghostty")),
+            "all profiles unlocked must retry launch, got: {cmds:?}");
+        assert!(matches!(ctrl.phase, Phase::Launching));
+    }
+
+    #[test]
+    fn wrong_password_resets_for_retry() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_password_prompt(&mut ctrl, &windows, &config, "default");
+        ctrl.handle(Event::Char('x'), &windows, &config);
+
+        let cmds = ctrl.handle(Event::UnlockResult {
+            success: false,
+            profile: TrustProfileName::try_from("default").unwrap(),
+        }, &windows, &config);
+
+        assert!(cmds.iter().any(|c| matches!(c, Command::ClearPasswordBuffer)));
+        assert!(cmds.iter().any(|c| matches!(c, Command::ShowPasswordPrompt { .. })));
+        assert!(cmds.iter().any(|c| matches!(c, Command::ShowUnlockError { .. })));
+
+        if let Phase::Unlocking { password_len, unlock_mode, .. } = &ctrl.phase {
+            assert_eq!(*password_len, 0);
+            assert_eq!(*unlock_mode, UnlockMode::Password);
+        } else {
+            panic!("expected Phase::Unlocking after wrong password");
+        }
+    }
+
+    #[test]
+    fn escape_during_unlock_dismisses_and_clears() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_launching(&mut ctrl, &windows, &config);
+        ctrl.handle(vaults_locked_event(&["default"]), &windows, &config);
+
+        let cmds = ctrl.handle(Event::Escape, &windows, &config);
+
+        assert!(cmds.iter().any(|c| matches!(c, Command::ClearPasswordBuffer)),
+            "escape during unlock must clear password buffer");
+        assert!(cmds.iter().any(|c| matches!(c, Command::Hide)));
+        assert!(ctrl.is_idle());
+    }
+
+    #[test]
+    fn vaults_locked_without_original_command_shows_error() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_launching(&mut ctrl, &windows, &config);
+
+        // VaultsLocked but missing original_command — can't retry.
+        let cmds = ctrl.handle(Event::LaunchResult {
+            success: false,
+            error: Some("VaultsLocked".into()),
+            denial: Some(LaunchDenial::VaultsLocked {
+                locked_profiles: vec![TrustProfileName::try_from("default").unwrap()],
+            }),
+            original_command: None,
+            original_tags: None,
+            original_launch_args: None,
+        }, &windows, &config);
+
+        // Must fall through to error display, not unlock flow.
+        assert!(cmds.iter().any(|c| matches!(c, Command::ShowLaunchError { .. })),
+            "VaultsLocked without retry context must show error, got: {cmds:?}");
+    }
+
+    #[test]
+    fn launch_result_in_wrong_phase_is_noop() {
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        // Controller is Idle — LaunchResult should be ignored.
+        let cmds = ctrl.handle(Event::LaunchResult {
+            success: false,
+            error: None,
+            denial: Some(LaunchDenial::VaultsLocked {
+                locked_profiles: vec![TrustProfileName::try_from("default").unwrap()],
+            }),
+            original_command: Some("ghostty".into()),
+            original_tags: Some(vec![]),
+            original_launch_args: Some(vec![]),
+        }, &windows, &config);
+
+        assert!(cmds.is_empty());
+        assert!(ctrl.is_idle());
+    }
 }

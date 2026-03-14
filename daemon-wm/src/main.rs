@@ -858,38 +858,17 @@ async fn execute_commands(
                 let result_cmds = controller.handle(launch_event, &win_list, &cfg);
                 drop(cfg);
                 drop(win_list);
-                // Process launch result commands. On success the controller
-                // returns Hide — dismiss the overlay now that the app is launching.
-                // On failure it returns ShowLaunchError to display the error toast.
-                for result_cmd in result_cmds {
-                    match result_cmd {
-                        Command::Hide => {
-                            if overlay_cmd_tx.send(OverlayCmd::Hide).is_err() {
-                                tracing::error!("overlay thread has exited unexpectedly");
-                            }
-                        }
-                        Command::HideAndSync => {
-                            if overlay_cmd_tx.send(OverlayCmd::HideAndSync).is_err() {
-                                tracing::error!("overlay thread has exited unexpectedly");
-                                continue;
-                            }
-                            while let Some(ev) = overlay_event_rx.recv().await {
-                                if matches!(ev, OverlayEvent::SurfaceUnmapped) {
-                                    break;
-                                }
-                            }
-                        }
-                        Command::ShowLaunchError { message, .. } => {
-                            if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError { message }).is_err() {
-                                tracing::error!("overlay thread has exited unexpectedly");
-                            }
-                        }
-                        Command::Publish(event, level) => {
-                            client.publish(event, level).await.ok();
-                        }
-                        _ => {}
-                    }
-                }
+                // Process launch result commands via the full command executor.
+                // This handles all command variants including unlock flow
+                // commands (AttemptAutoUnlock, ShowPasswordPrompt, etc.)
+                // emitted when the launcher returns VaultsLocked denial.
+                Box::pin(execute_commands(
+                    result_cmds, overlay_cmd_tx, overlay_event_rx,
+                    #[cfg(target_os = "linux")] backend,
+                    client, config_state, controller, windows, wm_config,
+                    ipc_keyboard_confirmed,
+                    password_buffer,
+                )).await;
             }
             Command::ShowLaunchStaged { command } => {
                 if overlay_cmd_tx.send(OverlayCmd::ShowLaunchStaged { command }).is_err() {
@@ -916,7 +895,12 @@ async fn execute_commands(
             }
             // -- Unlock flow commands --
             Command::AttemptAutoUnlock { profile } => {
-                tracing::info!(%profile, "attempting auto-unlock");
+                tracing::info!(
+                    audit = "unlock-flow",
+                    event_type = "auto-unlock-attempt",
+                    %profile,
+                    "attempting auto-unlock for vault"
+                );
                 // AuthDispatcher probes non-interactive backends (SSH-agent, future TPM).
                 // Currently all return false (SshAgentBackend.can_unlock() is not yet
                 // wired to agent socket communication), so this always falls through
@@ -943,7 +927,20 @@ async fn execute_commands(
                 )).await;
             }
             Command::ShowPasswordPrompt { profile } => {
-                tracing::debug!(%profile, "showing password prompt");
+                tracing::info!(
+                    audit = "unlock-flow",
+                    event_type = "password-prompt-shown",
+                    %profile,
+                    "showing password prompt for vault unlock"
+                );
+                // Re-acquire keyboard grab for password input. The LaunchApp
+                // handler releases the grab before the IPC request, but the
+                // VaultsLocked fallback needs keyboard input for password entry.
+                *ipc_keyboard_confirmed = false;
+                client.publish(
+                    EventKind::InputGrabRequest { requester: client.daemon_id() },
+                    SecurityLevel::Internal,
+                ).await.ok();
                 if overlay_cmd_tx.send(OverlayCmd::ShowUnlockPrompt {
                     profile: profile.to_string(),
                     password_len: 0,
@@ -953,7 +950,12 @@ async fn execute_commands(
                 }
             }
             Command::ShowTouchPrompt { profile } => {
-                tracing::debug!(%profile, "showing touch prompt");
+                tracing::info!(
+                    audit = "unlock-flow",
+                    event_type = "touch-prompt-shown",
+                    %profile,
+                    "showing touch prompt for vault unlock"
+                );
                 if overlay_cmd_tx.send(OverlayCmd::ShowUnlockProgress {
                     profile: profile.to_string(),
                     message: format!("Touch your security key for \u{201C}{profile}\u{201D}\u{2026}"),
@@ -962,7 +964,12 @@ async fn execute_commands(
                 }
             }
             Command::ShowAutoUnlockProgress { profile } => {
-                tracing::debug!(%profile, "showing auto-unlock progress");
+                tracing::info!(
+                    audit = "unlock-flow",
+                    event_type = "auto-unlock-progress",
+                    %profile,
+                    "showing auto-unlock progress"
+                );
                 if overlay_cmd_tx.send(OverlayCmd::ShowUnlockProgress {
                     profile: profile.to_string(),
                     message: format!("Authenticating \u{201C}{profile}\u{201D}\u{2026}"),
@@ -971,6 +978,11 @@ async fn execute_commands(
                 }
             }
             Command::ShowVerifying => {
+                tracing::info!(
+                    audit = "unlock-flow",
+                    event_type = "verifying",
+                    "showing verification progress for vault unlock"
+                );
                 let profile = controller.current_unlock_profile()
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "vault".into());
@@ -1008,7 +1020,12 @@ async fn execute_commands(
                 }
             }
             Command::SubmitPasswordUnlock { profile } => {
-                tracing::info!(%profile, "submitting password unlock");
+                tracing::info!(
+                    audit = "unlock-flow",
+                    event_type = "password-unlock-submit",
+                    %profile,
+                    "submitting password unlock for vault"
+                );
 
                 let password_bytes = password_buffer.take();
 
@@ -1096,10 +1113,19 @@ async fn execute_commands(
             }
             Command::ClearPasswordBuffer => {
                 password_buffer.clear();
-                tracing::debug!("password buffer cleared and zeroized");
+                tracing::info!(
+                    audit = "unlock-flow",
+                    event_type = "password-buffer-cleared",
+                    "password buffer cleared and zeroized"
+                );
             }
             Command::ShowUnlockError { message } => {
-                tracing::warn!(message = %message, "unlock error");
+                tracing::warn!(
+                    audit = "unlock-flow",
+                    event_type = "unlock-error",
+                    %message,
+                    "unlock error displayed to user"
+                );
                 let profile = controller.current_unlock_profile()
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "vault".into());
