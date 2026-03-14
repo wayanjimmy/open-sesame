@@ -393,6 +393,15 @@ impl OverlayController {
         matches!(self.phase, Phase::Idle)
     }
 
+    /// Return the profile currently being unlocked, if in the unlocking phase.
+    pub fn current_unlock_profile(&self) -> Option<&TrustProfileName> {
+        if let Phase::Unlocking { profiles_to_unlock, current_index, .. } = &self.phase {
+            profiles_to_unlock.get(*current_index)
+        } else {
+            None
+        }
+    }
+
     /// Test-only: enter Armed phase with a pre-built snapshot.
     #[cfg(test)]
     fn arm_with_snapshot(&mut self, snap: Snapshot, dwell_ms: u32) {

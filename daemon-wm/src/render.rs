@@ -794,6 +794,91 @@ pub fn draw_error_toast(
 }
 
 // ---------------------------------------------------------------------------
+// Vault unlock prompt
+// ---------------------------------------------------------------------------
+
+/// Draw a vault unlock password prompt with dot-masked field.
+///
+/// Defense in depth: this function receives only the CHARACTER COUNT
+/// (`password_len`), never the actual password bytes. The render thread
+/// cannot leak what it does not have.
+pub fn draw_unlock_prompt(
+    cr: &gtk4::cairo::Context,
+    width: f64,
+    height: f64,
+    profile: &str,
+    password_len: usize,
+    error: Option<&str>,
+    theme: &OverlayTheme,
+) {
+    let layout = Layout::new(1.0);
+    let unlock_border = Color::rgba(250, 204, 21, 255); // amber-400
+
+    cr.set_operator(gtk4::cairo::Operator::Source);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+    let _ = cr.paint();
+    cr.set_operator(gtk4::cairo::Operator::Over);
+
+    // Screen border — amber to indicate auth required.
+    let bw = theme.border_width * 2.0;
+    let half = bw / 2.0;
+    rounded_rect(cr, half, half, width - bw, height - bw, theme.corner_radius);
+    unlock_border.set_source(cr);
+    cr.set_line_width(bw);
+    let _ = cr.stroke();
+
+    // Build display text: header + dot field + optional error.
+    let mut display = format!("Unlock \u{201C}{profile}\u{201D}\n\n");
+    if password_len > 0 {
+        // Render dots for each character, capped at 32 for display sanity.
+        let dot_count = password_len.min(32);
+        for i in 0..dot_count {
+            display.push('\u{25CF}');
+            if i < dot_count - 1 {
+                display.push(' ');
+            }
+        }
+    } else {
+        display.push_str("Enter password");
+    }
+    if let Some(err) = error {
+        display.push_str("\n\n");
+        display.push_str(err);
+    }
+
+    let pango_layout = pangocairo::functions::create_layout(cr);
+    let mut font = gtk4::pango::FontDescription::new();
+    font.set_family("Sans");
+    font.set_absolute_size(layout.text_size * 1.2 * gtk4::pango::SCALE as f64);
+    pango_layout.set_font_description(Some(&font));
+    pango_layout.set_text(&display);
+    pango_layout.set_alignment(gtk4::pango::Alignment::Center);
+    let max_width = (width * 0.6).min(500.0);
+    pango_layout.set_width((max_width * gtk4::pango::SCALE as f64) as i32);
+    pango_layout.set_wrap(gtk4::pango::WrapMode::WordChar);
+    let (tw, th) = pango_layout.pixel_size();
+
+    let pad = layout.padding * 2.0;
+    let cw = tw as f64 + pad * 2.0;
+    let ch = th as f64 + pad * 2.0;
+    let cx = (width - cw) / 2.0;
+    let cy = (height - ch) / 2.0;
+
+    rounded_rect(cr, cx, cy, cw, ch, layout.corner_radius);
+    theme.card_background.set_source(cr);
+    let _ = cr.fill();
+
+    rounded_rect(cr, cx, cy, cw, ch, layout.corner_radius);
+    unlock_border.set_source(cr);
+    cr.set_line_width(layout.border_width * 1.5);
+    let _ = cr.stroke();
+
+    cr.move_to(cx + pad, cy + pad);
+    theme.text_primary.set_source(cr);
+    pangocairo::functions::show_layout(cr, &pango_layout);
+}
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 

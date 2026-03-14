@@ -10,6 +10,7 @@
 
 use anyhow::Context;
 use clap::Parser;
+use core_crypto::SecureVec;
 use core_ipc::{BusClient, Message};
 use core_types::{DaemonId, EventKind, SecurityLevel, Window};
 use daemon_wm::controller::{Command, Event, OverlayController};
@@ -307,6 +308,12 @@ async fn main() -> anyhow::Result<()> {
         overlay::spawn_overlay(theme, show_app_id, show_title)
     };
 
+    // Password buffer for inline vault unlock. Pre-allocated and mlock'd
+    // to prevent password bytes from being swapped to disk or included in
+    // core dumps. Lives in the tokio executor context — never crosses thread
+    // boundaries to the render thread (which receives only dot counts).
+    let mut password_buffer = SecureVec::with_capacity(128);
+
     // Platform readiness.
     #[cfg(target_os = "linux")]
     platform_linux::systemd::notify_ready();
@@ -401,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut client, &config_state,
                         &mut controller, &windows, &wm_config,
                         &mut ipc_keyboard_confirmed,
+                        &mut password_buffer,
                     ).await;
                 }
             }
@@ -423,6 +431,7 @@ async fn main() -> anyhow::Result<()> {
                     &mut client, &config_state,
                     &mut controller, &windows, &wm_config,
                     &mut ipc_keyboard_confirmed,
+                    &mut password_buffer,
                 ).await;
             }
 
@@ -482,6 +491,7 @@ async fn main() -> anyhow::Result<()> {
                             &mut client, &config_state,
                             &mut controller, &windows, &wm_config,
                             &mut ipc_keyboard_confirmed,
+                            &mut password_buffer,
                         ).await;
                         None
                     }
@@ -499,6 +509,7 @@ async fn main() -> anyhow::Result<()> {
                             &mut client, &config_state,
                             &mut controller, &windows, &wm_config,
                             &mut ipc_keyboard_confirmed,
+                            &mut password_buffer,
                         ).await;
                         None
                     }
@@ -516,6 +527,7 @@ async fn main() -> anyhow::Result<()> {
                             &mut client, &config_state,
                             &mut controller, &windows, &wm_config,
                             &mut ipc_keyboard_confirmed,
+                            &mut password_buffer,
                         ).await;
                         None
                     }
@@ -563,6 +575,7 @@ async fn main() -> anyhow::Result<()> {
                                         &mut client, &config_state,
                                         &mut controller, &windows, &wm_config,
                                         &mut ipc_keyboard_confirmed,
+                                        &mut password_buffer,
                                     ).await;
                                 }
                             } else {
@@ -583,6 +596,7 @@ async fn main() -> anyhow::Result<()> {
                                         &mut client, &config_state,
                                         &mut controller, &windows, &wm_config,
                                         &mut ipc_keyboard_confirmed,
+                                        &mut password_buffer,
                                     ).await;
                                 }
                             }
@@ -678,6 +692,7 @@ async fn execute_commands(
     windows: &Arc<Mutex<Vec<core_types::Window>>>,
     wm_config: &Arc<Mutex<core_config::WmConfig>>,
     ipc_keyboard_confirmed: &mut bool,
+    password_buffer: &mut SecureVec,
 ) {
     for cmd in commands {
         match cmd {
@@ -899,11 +914,13 @@ async fn execute_commands(
             Command::Publish(event, level) => {
                 client.publish(event, level).await.ok();
             }
-            // Unlock flow commands — overlay UX stubs for now.
+            // -- Unlock flow commands --
             Command::AttemptAutoUnlock { profile } => {
-                tracing::info!(%profile, "auto-unlock attempt (stub)");
-                // TODO: wire to core-auth dispatcher auto-unlock, feed back AutoUnlockResult
-                // For now, immediately report failure (no auto backend available).
+                tracing::info!(%profile, "attempting auto-unlock");
+                // AuthDispatcher probes non-interactive backends (SSH-agent, future TPM).
+                // Currently all return false (SshAgentBackend.can_unlock() is not yet
+                // wired to agent socket communication), so this always falls through
+                // to password entry. The controller state machine handles the transition.
                 let win_list = windows.lock().await;
                 let cfg = wm_config.lock().await;
                 let sub_cmds = controller.handle(
@@ -922,56 +939,151 @@ async fn execute_commands(
                     #[cfg(target_os = "linux")] backend,
                     client, config_state, controller, windows, wm_config,
                     ipc_keyboard_confirmed,
+                    password_buffer,
                 )).await;
             }
             Command::ShowPasswordPrompt { profile } => {
                 tracing::debug!(%profile, "showing password prompt");
-                if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError {
-                    message: format!("Enter password for {profile}"),
+                if overlay_cmd_tx.send(OverlayCmd::ShowUnlockPrompt {
+                    profile: profile.to_string(),
+                    password_len: 0,
+                    error: None,
                 }).is_err() {
                     tracing::error!("overlay thread has exited unexpectedly");
                 }
             }
             Command::ShowTouchPrompt { profile } => {
                 tracing::debug!(%profile, "showing touch prompt");
-                if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError {
-                    message: format!("Touch your security key for {profile}..."),
+                if overlay_cmd_tx.send(OverlayCmd::ShowUnlockProgress {
+                    profile: profile.to_string(),
+                    message: format!("Touch your security key for \u{201C}{profile}\u{201D}\u{2026}"),
                 }).is_err() {
                     tracing::error!("overlay thread has exited unexpectedly");
                 }
             }
             Command::ShowAutoUnlockProgress { profile } => {
                 tracing::debug!(%profile, "showing auto-unlock progress");
-                if overlay_cmd_tx.send(OverlayCmd::ShowLaunching).is_err() {
+                if overlay_cmd_tx.send(OverlayCmd::ShowUnlockProgress {
+                    profile: profile.to_string(),
+                    message: format!("Authenticating \u{201C}{profile}\u{201D}\u{2026}"),
+                }).is_err() {
                     tracing::error!("overlay thread has exited unexpectedly");
                 }
             }
             Command::ShowVerifying => {
-                if overlay_cmd_tx.send(OverlayCmd::ShowLaunching).is_err() {
+                let profile = controller.current_unlock_profile()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "vault".into());
+                if overlay_cmd_tx.send(OverlayCmd::ShowUnlockProgress {
+                    profile,
+                    message: "Verifying\u{2026}".into(),
+                }).is_err() {
                     tracing::error!("overlay thread has exited unexpectedly");
                 }
             }
-            Command::PasswordChar(_) => {
-                // Overlay receives this to update dot count; forwarded as status.
-                tracing::trace!("password char received");
+            Command::PasswordChar(ch) => {
+                password_buffer.push_char(ch);
+                let profile = controller.current_unlock_profile()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "vault".into());
+                if overlay_cmd_tx.send(OverlayCmd::ShowUnlockPrompt {
+                    profile,
+                    password_len: password_buffer.char_count(),
+                    error: None,
+                }).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
             }
             Command::PasswordBackspace => {
-                tracing::trace!("password backspace received");
+                password_buffer.pop_char();
+                let profile = controller.current_unlock_profile()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "vault".into());
+                if overlay_cmd_tx.send(OverlayCmd::ShowUnlockPrompt {
+                    profile,
+                    password_len: password_buffer.char_count(),
+                    error: None,
+                }).is_err() {
+                    tracing::error!("overlay thread has exited unexpectedly");
+                }
             }
             Command::SubmitPasswordUnlock { profile } => {
-                tracing::info!(%profile, "submitting password unlock (stub)");
-                // TODO: collect SecureVec from password buffer, send UnlockRequest IPC
-                // For now, immediately report failure.
+                tracing::info!(%profile, "submitting password unlock");
+
+                let password_bytes = password_buffer.take();
+
+                if password_bytes.is_empty() {
+                    tracing::warn!(%profile, "empty password buffer on submit");
+                    let win_list = windows.lock().await;
+                    let cfg = wm_config.lock().await;
+                    let sub_cmds = controller.handle(
+                        daemon_wm::controller::Event::UnlockResult {
+                            success: false,
+                            profile,
+                        },
+                        &win_list,
+                        &cfg,
+                    );
+                    drop(cfg);
+                    drop(win_list);
+                    Box::pin(execute_commands(
+                        sub_cmds, overlay_cmd_tx, overlay_event_rx,
+                        #[cfg(target_os = "linux")] backend,
+                        client, config_state, controller, windows, wm_config,
+                        ipc_keyboard_confirmed,
+                        password_buffer,
+                    )).await;
+                    continue;
+                }
+
+                // SensitiveBytes wraps the password and zeroizes on drop.
+                let unlock_event = EventKind::UnlockRequest {
+                    password: core_types::SensitiveBytes::new(password_bytes),
+                    profile: Some(profile.clone()),
+                };
+
+                // 30s timeout accommodates Argon2id KDF with high memory parameters.
+                let result = client.request(
+                    unlock_event,
+                    SecurityLevel::Internal,
+                    std::time::Duration::from_secs(30),
+                ).await;
+
+                let unlock_result = match result {
+                    Ok(msg) => match msg.payload {
+                        EventKind::UnlockResponse { success, profile: resp_profile } => {
+                            daemon_wm::controller::Event::UnlockResult {
+                                success,
+                                profile: resp_profile,
+                            }
+                        }
+                        EventKind::UnlockRejected { reason, profile: resp_profile } => {
+                            tracing::info!(?reason, ?resp_profile, "unlock rejected");
+                            daemon_wm::controller::Event::UnlockResult {
+                                success: false,
+                                profile: resp_profile.unwrap_or(profile),
+                            }
+                        }
+                        other => {
+                            tracing::warn!(?other, "unexpected response to UnlockRequest");
+                            daemon_wm::controller::Event::UnlockResult {
+                                success: false,
+                                profile,
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!(error = %e, "unlock request failed");
+                        daemon_wm::controller::Event::UnlockResult {
+                            success: false,
+                            profile,
+                        }
+                    }
+                };
+
                 let win_list = windows.lock().await;
                 let cfg = wm_config.lock().await;
-                let sub_cmds = controller.handle(
-                    daemon_wm::controller::Event::UnlockResult {
-                        success: false,
-                        profile,
-                    },
-                    &win_list,
-                    &cfg,
-                );
+                let sub_cmds = controller.handle(unlock_result, &win_list, &cfg);
                 drop(cfg);
                 drop(win_list);
                 Box::pin(execute_commands(
@@ -979,15 +1091,23 @@ async fn execute_commands(
                     #[cfg(target_os = "linux")] backend,
                     client, config_state, controller, windows, wm_config,
                     ipc_keyboard_confirmed,
+                    password_buffer,
                 )).await;
             }
             Command::ClearPasswordBuffer => {
-                tracing::debug!("clearing password buffer");
-                // TODO: zeroize SecureVec password buffer
+                password_buffer.clear();
+                tracing::debug!("password buffer cleared and zeroized");
             }
             Command::ShowUnlockError { message } => {
                 tracing::warn!(message = %message, "unlock error");
-                if overlay_cmd_tx.send(OverlayCmd::ShowLaunchError { message }).is_err() {
+                let profile = controller.current_unlock_profile()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "vault".into());
+                if overlay_cmd_tx.send(OverlayCmd::ShowUnlockPrompt {
+                    profile,
+                    password_len: password_buffer.char_count(),
+                    error: Some(message),
+                }).is_err() {
                     tracing::error!("overlay thread has exited unexpectedly");
                 }
             }

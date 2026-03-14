@@ -1378,6 +1378,7 @@ dependencies = [
  "anyhow",
  "clap",
  "core-config",
+ "core-crypto",
  "core-ipc",
  "core-profile",
  "core-types",

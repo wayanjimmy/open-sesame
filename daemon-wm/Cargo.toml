@@ -10,6 +10,7 @@ repository.workspace = true
 core-types   = { workspace = true }
 core-config  = { workspace = true }
 core-ipc     = { workspace = true }
+core-crypto  = { workspace = true }
 core-profile = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }

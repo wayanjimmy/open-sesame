@@ -51,6 +51,18 @@ pub enum OverlayCmd {
     ShowLaunchError {
         message: String,
     },
+    /// Show vault unlock password prompt with dot-masked field.
+    /// Defense in depth: only the character count is sent, never password bytes.
+    ShowUnlockPrompt {
+        profile: String,
+        password_len: usize,
+        error: Option<String>,
+    },
+    /// Show unlock progress indicator (auto-unlock, verifying, etc.).
+    ShowUnlockProgress {
+        profile: String,
+        message: String,
+    },
     /// Reset the modifier-poll grace timer. Proves Alt is still held
     /// (an IPC re-activation wouldn't fire otherwise).
     ResetGrace,
@@ -106,6 +118,10 @@ enum OverlayPhase {
     Full,
     Launching,
     LaunchError,
+    /// Vault unlock password entry — dot-masked field with profile name.
+    UnlockPrompt,
+    /// Vault unlock progress — status message (authenticating, verifying).
+    UnlockProgress,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +153,13 @@ struct OverlayState {
     error_message: String,
     /// Staged launch command — shown in picker instead of "no matches".
     staged_launch: Option<String>,
+    /// Profile name for unlock prompt display.
+    unlock_profile: String,
+    /// Number of password dots to render. Defense in depth: render thread
+    /// receives only this integer count, never actual password bytes.
+    unlock_password_len: usize,
+    /// Unlock progress message (e.g. "Verifying...", "Authenticating...").
+    unlock_message: String,
 }
 
 /// Grace period (ms) after activation before modifier polling begins.
@@ -164,6 +187,9 @@ impl OverlayState {
             error_message: String::new(),
             staged_launch: None,
             ipc_keyboard_active: false,
+            unlock_profile: String::new(),
+            unlock_password_len: 0,
+            unlock_message: String::new(),
         }
     }
 }
@@ -294,6 +320,21 @@ fn run_gtk4_overlay(
                 render::draw_error_toast(
                     cr, width as f64, height as f64,
                     &st.error_message, &st.theme,
+                );
+            }
+            OverlayPhase::UnlockPrompt => {
+                render::draw_unlock_prompt(
+                    cr, width as f64, height as f64,
+                    &st.unlock_profile,
+                    st.unlock_password_len,
+                    if st.error_message.is_empty() { None } else { Some(&st.error_message) },
+                    &st.theme,
+                );
+            }
+            OverlayPhase::UnlockProgress => {
+                render::draw_status_toast(
+                    cr, width as f64, height as f64,
+                    &st.unlock_message, &st.theme,
                 );
             }
         }
@@ -537,6 +578,41 @@ fn run_gtk4_overlay(
                         let mut st = state_cmd.borrow_mut();
                         st.phase = OverlayPhase::LaunchError;
                         st.error_message = message;
+                    }
+                    window_cmd.set_keyboard_mode(KeyboardMode::Exclusive);
+                    if let Some(surface) = window_cmd.surface() {
+                        surface.set_input_region(&gtk4::cairo::Region::create_rectangle(
+                            &gtk4::cairo::RectangleInt::new(0, 0, i32::MAX, i32::MAX),
+                        ));
+                    }
+                    da_cmd.queue_draw();
+                }
+                OverlayCmd::ShowUnlockPrompt { profile, password_len, error } => {
+                    {
+                        let mut st = state_cmd.borrow_mut();
+                        st.phase = OverlayPhase::UnlockPrompt;
+                        st.unlock_profile = profile;
+                        st.unlock_password_len = password_len;
+                        if let Some(err) = error {
+                            st.error_message = err;
+                        } else {
+                            st.error_message.clear();
+                        }
+                    }
+                    window_cmd.set_keyboard_mode(KeyboardMode::Exclusive);
+                    if let Some(surface) = window_cmd.surface() {
+                        surface.set_input_region(&gtk4::cairo::Region::create_rectangle(
+                            &gtk4::cairo::RectangleInt::new(0, 0, i32::MAX, i32::MAX),
+                        ));
+                    }
+                    da_cmd.queue_draw();
+                }
+                OverlayCmd::ShowUnlockProgress { profile, message } => {
+                    {
+                        let mut st = state_cmd.borrow_mut();
+                        st.phase = OverlayPhase::UnlockProgress;
+                        st.unlock_profile = profile;
+                        st.unlock_message = message;
                     }
                     window_cmd.set_keyboard_mode(KeyboardMode::Exclusive);
                     if let Some(surface) = window_cmd.surface() {
