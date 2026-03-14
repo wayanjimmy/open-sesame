@@ -199,10 +199,11 @@
                 PartOf = [ "open-sesame.target" ];
               };
               Service = {
-                Type = "simple";
+                Type = "notify";
                 ExecStart = "${cfg.package}/bin/daemon-secrets";
                 Restart = "on-failure";
                 RestartSec = 5;
+                WatchdogSec = 30;
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };
               Install = {

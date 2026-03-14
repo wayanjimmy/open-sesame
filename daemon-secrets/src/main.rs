@@ -1215,7 +1215,7 @@ fn apply_sandbox() {
     let pds_dir = PathBuf::from(&runtime_dir).join("pds");
     let keys_dir = pds_dir.join("keys");
 
-    let rules = vec![
+    let mut rules = vec![
         // Config dir: vault DBs + salt stored here.
         LandlockRule {
             path: config_dir,
@@ -1242,6 +1242,21 @@ fn apply_sandbox() {
             access: FsAccess::ReadWriteFile,
         },
     ];
+
+    // systemd notify socket: sd_notify(READY=1) and watchdog keepalives
+    // need connect+sendto access to $NOTIFY_SOCKET after Landlock is applied.
+    // Abstract sockets (prefixed '@') bypass Landlock AccessFs rules.
+    if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET")
+        && !notify_socket.starts_with('@')
+    {
+        let path = PathBuf::from(&notify_socket);
+        if path.exists() {
+            rules.push(LandlockRule {
+                path,
+                access: FsAccess::ReadWriteFile,
+            });
+        }
+    }
 
     let seccomp = SeccompProfile {
         daemon_name: "daemon-secrets".into(),

@@ -226,11 +226,40 @@ pub(crate) async fn confirmed_rpc(
     // Register confirmation route — guard deregisters on drop.
     let _guard = bus.register_confirmation(msg_id, confirm_tx.clone()).await;
 
-    // Encode and unicast to daemon-secrets.
+    // Encode and unicast to daemon-secrets with retry. daemon-secrets may not
+    // yet be in name_to_conn if it is still completing its Noise IK handshake
+    // and DaemonStarted announcement after a concurrent restart.
     let frame = core_ipc::encode_frame(&msg).map_err(|e| format!("encode failed: {e}"))?;
-    bus.send_to_named("daemon-secrets", &frame)
-        .await
-        .map_err(|e| format!("send_to_named failed: {e}"))?;
+    {
+        let max_attempts: u32 = 5;
+        let mut backoff = Duration::from_millis(100);
+        let mut last_err = String::new();
+        let mut sent = false;
+        for attempt in 1..=max_attempts {
+            match bus.send_to_named("daemon-secrets", &frame).await {
+                Ok(()) => { sent = true; break; }
+                Err(e) => {
+                    last_err = e;
+                    if attempt < max_attempts {
+                        tracing::warn!(
+                            attempt,
+                            max_attempts,
+                            backoff_ms = backoff.as_millis() as u64,
+                            error = %last_err,
+                            "daemon-secrets not yet connected, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                    }
+                }
+            }
+        }
+        if !sent {
+            return Err(format!(
+                "send_to_named failed after {max_attempts} attempts: {last_err}"
+            ));
+        }
+    }
 
     // Wait for confirmed response with timeout.
     match tokio::time::timeout(CONFIRM_TIMEOUT, confirm_rx.recv()).await {

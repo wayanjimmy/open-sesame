@@ -1271,7 +1271,7 @@ fn apply_sandbox() -> anyhow::Result<()> {
         }
     }
 
-    let rules = vec![
+    let mut rules = vec![
         LandlockRule {
             path: config_dir,
             access: FsAccess::ReadWrite, // audit log writes here
@@ -1281,6 +1281,21 @@ fn apply_sandbox() -> anyhow::Result<()> {
             access: FsAccess::ReadWrite,
         },
     ];
+
+    // systemd notify socket: sd_notify(READY=1) and watchdog keepalives
+    // need connect+sendto access to $NOTIFY_SOCKET after Landlock is applied.
+    // Abstract sockets (prefixed '@') bypass Landlock AccessFs rules.
+    if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET")
+        && !notify_socket.starts_with('@')
+    {
+        let path = PathBuf::from(&notify_socket);
+        if path.exists() {
+            rules.push(LandlockRule {
+                path,
+                access: FsAccess::ReadWriteFile,
+            });
+        }
+    }
 
     let seccomp = SeccompProfile {
         daemon_name: "daemon-profile".into(),
