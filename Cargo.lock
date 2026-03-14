@@ -3117,6 +3117,7 @@ dependencies = [
  "predicates",
  "serde",
  "serde_json",
+ "sesame-workspace",
  "tempfile",
  "tokio",
  "toml 1.0.3+spec-1.1.0",
@@ -3981,6 +3982,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8bbf91e5a4d6315eee45e704372590b30e260ee83af6639d64557f51b067776"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "sesame-workspace"
+version = "0.1.0"
+dependencies = [
+ "core-config",
+ "core-types",
+ "dirs",
+ "rustix 1.1.2",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.17",
+ "toml 1.0.3+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

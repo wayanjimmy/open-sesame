@@ -165,64 +165,137 @@ enum Command {
     },
 
     /// Workspace management (directory-scoped project environments).
-    #[command(subcommand)]
+    #[command(subcommand, alias = "ws")]
     Workspace(WorkspaceCmd),
+}
+
+/// Resolve the workspace root from `SESAME_WORKSPACE_ROOT` or fall back to `/workspace`.
+fn default_workspace_root() -> std::path::PathBuf {
+    std::env::var("SESAME_WORKSPACE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/workspace"))
+}
+
+/// Resolve the workspace path argument, defaulting to the current directory.
+///
+/// Fails explicitly if the current directory cannot be determined — a security
+/// tool must never silently fall back to `"."`.
+fn resolve_workspace_path(path: Option<std::path::PathBuf>) -> anyhow::Result<std::path::PathBuf> {
+    match path {
+        Some(p) => Ok(p),
+        None => std::env::current_dir()
+            .context("failed to determine current directory"),
+    }
 }
 
 #[derive(Subcommand)]
 enum WorkspaceCmd {
-    /// Initialize a new workspace directory with sesame configuration.
+    /// Create the workspace root and user directory.
     Init {
-        /// Path to the workspace root directory.
+        /// Override the workspace root directory (default: $SESAME_WORKSPACE_ROOT or /workspace).
+        #[arg(long, default_value_os_t = default_workspace_root())]
+        root: std::path::PathBuf,
+
+        /// Override username detection.
         #[arg(long)]
-        path: Option<std::path::PathBuf>,
+        user: Option<String>,
     },
 
-    /// Clone a git repository into the workspace tree.
+    /// Clone a repository to its canonical workspace path.
     Clone {
-        /// Git repository URL.
+        /// Git remote URL (HTTPS or SSH).
         url: String,
 
-        /// Override the target directory within the workspace root.
+        /// Shallow clone depth.
         #[arg(long)]
-        path: Option<std::path::PathBuf>,
+        depth: Option<u32>,
+
+        /// Link to a profile after cloning.
+        #[arg(short, long)]
+        profile: Option<String>,
     },
 
-    /// List registered workspaces.
+    /// List all discovered workspaces.
     List {
+        /// Filter by git server hostname.
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Filter by organization/user.
+        #[arg(long)]
+        org: Option<String>,
+
+        /// Filter by linked profile name.
+        #[arg(short, long)]
+        profile: Option<String>,
+
         /// Output format.
         #[arg(short, long, default_value = "table")]
         format: WorkspaceListFormat,
     },
 
-    /// Show workspace status (active links, profile bindings).
+    /// Show workspace status and metadata.
     Status {
         /// Workspace path (default: current directory).
-        #[arg(long)]
         path: Option<std::path::PathBuf>,
+
+        /// Show detailed convention breakdown and disk usage.
+        #[arg(short, long)]
+        verbose: bool,
     },
 
-    /// Link a workspace directory to a launch profile.
+    /// Associate a workspace directory with a sesame profile.
     Link {
-        /// Workspace path to link.
-        path: std::path::PathBuf,
+        /// Profile to link.
+        #[arg(short, long)]
+        profile: String,
 
-        /// Launch profile tag(s) to bind.
-        #[arg(short, long, required = true)]
-        tags: Vec<String>,
-    },
-
-    /// Open a shell in a workspace with its linked profile environment.
-    Shell {
         /// Workspace path (default: current directory).
-        #[arg(long)]
         path: Option<std::path::PathBuf>,
     },
 
-    /// Show detailed information about a workspace.
-    Info {
+    /// Remove a workspace-to-profile association.
+    Unlink {
         /// Workspace path (default: current directory).
+        path: Option<std::path::PathBuf>,
+    },
+
+    /// Open an interactive shell with vault secrets injected.
+    ///
+    /// Secrets are injected as environment variables and are visible in
+    /// `/proc/<pid>/environ` to processes running as the same user. All
+    /// child processes inherit the secret environment.
+    Shell {
+        /// Override the linked profile.
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Workspace path (default: current directory).
+        path: Option<std::path::PathBuf>,
+
+        /// Shell binary (default: $SHELL).
         #[arg(long)]
+        shell: Option<String>,
+
+        /// Prefix for env var names (e.g., --prefix MYAPP).
+        #[arg(long)]
+        prefix: Option<String>,
+
+        /// Command to run instead of interactive shell.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Show or inspect workspace configuration.
+    #[command(subcommand)]
+    Config(WorkspaceConfigCmd),
+}
+
+#[derive(Subcommand)]
+enum WorkspaceConfigCmd {
+    /// Show resolved configuration with provenance for the current workspace.
+    Show {
+        /// Workspace path (default: current directory).
         path: Option<std::path::PathBuf>,
     },
 }
@@ -567,43 +640,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Export { profile, format, prefix } => {
             cmd_export(&profile, &format, prefix.as_deref()).await
         }
-        Command::Workspace(sub) => match sub {
-            WorkspaceCmd::Init { path } => {
-                let _ = path;
-                eprintln!("workspace init: not yet implemented (sesame-workspace crate pending)");
-                Ok(())
-            }
-            WorkspaceCmd::Clone { url, path } => {
-                let _ = (url, path);
-                eprintln!("workspace clone: not yet implemented (sesame-workspace crate pending)");
-                Ok(())
-            }
-            WorkspaceCmd::List { format } => {
-                let _ = format;
-                eprintln!("workspace list: not yet implemented (sesame-workspace crate pending)");
-                Ok(())
-            }
-            WorkspaceCmd::Status { path } => {
-                let _ = path;
-                eprintln!("workspace status: not yet implemented (sesame-workspace crate pending)");
-                Ok(())
-            }
-            WorkspaceCmd::Link { path, tags } => {
-                let _ = (path, tags);
-                eprintln!("workspace link: not yet implemented (sesame-workspace crate pending)");
-                Ok(())
-            }
-            WorkspaceCmd::Shell { path } => {
-                let _ = path;
-                eprintln!("workspace shell: not yet implemented (sesame-workspace crate pending)");
-                Ok(())
-            }
-            WorkspaceCmd::Info { path } => {
-                let _ = path;
-                eprintln!("workspace info: not yet implemented (sesame-workspace crate pending)");
-                Ok(())
-            }
-        },
+        Command::Workspace(sub) => cmd_workspace(sub).await,
     }
 }
 
@@ -1826,6 +1863,86 @@ fn format_denial_reason(reason: &core_types::SecretDenialReason, key: &str, prof
 }
 
 // ============================================================================
+// Shared secret fetch — used by env, export, and workspace shell
+// ============================================================================
+
+/// Fetch all secrets for a profile from the vault via IPC.
+///
+/// Returns sanitized env var name/value pairs. Secrets that map to denied
+/// env var names are skipped with a warning on stderr.
+async fn fetch_profile_secrets(
+    client: &BusClient,
+    profile: &TrustProfileName,
+    prefix: Option<&str>,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    // 1. List all secret keys in this profile.
+    let keys = match rpc(
+        client,
+        EventKind::SecretList { profile: profile.clone() },
+        SecurityLevel::SecretsOnly,
+    ).await? {
+        EventKind::SecretListResponse { keys, denial } => {
+            if let Some(reason) = denial {
+                anyhow::bail!("{}", format_denial_reason(&reason, "", profile));
+            }
+            keys
+        }
+        other => anyhow::bail!("unexpected response to SecretList: {other:?}"),
+    };
+
+    if keys.is_empty() {
+        eprintln!(
+            "{}: profile '{}' has no secrets",
+            "warning".yellow().bold(),
+            profile,
+        );
+        return Ok(Vec::new());
+    }
+
+    // 2. Fetch each secret value, apply env var mapping and denylist.
+    let mut env_vars: Vec<(String, Vec<u8>)> = Vec::with_capacity(keys.len());
+
+    for key in &keys {
+        let event = EventKind::SecretGet {
+            profile: profile.clone(),
+            key: key.clone(),
+        };
+
+        match rpc(client, event, SecurityLevel::SecretsOnly).await? {
+            EventKind::SecretGetResponse { value, denial, .. } if denial.is_none() && !value.is_empty() => {
+                let env_name = secret_key_to_env_var(key, prefix);
+                if is_denied_env_var(&env_name) {
+                    eprintln!(
+                        "{}: secret '{}' maps to denied env var '{}', skipping (security policy)",
+                        "error".red().bold(),
+                        key,
+                        env_name,
+                    );
+                    continue;
+                }
+                env_vars.push((env_name, value.as_bytes().to_vec()));
+            }
+            EventKind::SecretGetResponse { denial: Some(reason), key: k, .. } => {
+                eprintln!(
+                    "{}: {}",
+                    "warning".yellow().bold(),
+                    format_denial_reason(&reason, &k, profile),
+                );
+            }
+            _ => {
+                eprintln!(
+                    "{}: failed to resolve secret '{}', skipping",
+                    "warning".yellow().bold(),
+                    key,
+                );
+            }
+        }
+    }
+
+    Ok(env_vars)
+}
+
+// ============================================================================
 // Env command — run a command with secrets as environment variables
 // ============================================================================
 
@@ -1864,63 +1981,9 @@ async fn cmd_env(profile: &str, prefix: Option<&str>, command: &[String]) -> any
     let profile = TrustProfileName::try_from(profile)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // 1. List all secret keys in this profile.
-    let keys = match rpc(
-        &client,
-        EventKind::SecretList { profile: profile.clone() },
-        SecurityLevel::SecretsOnly,
-    ).await? {
-        EventKind::SecretListResponse { keys, denial } => {
-            if let Some(reason) = denial {
-                anyhow::bail!("{}", format_denial_reason(&reason, "", &profile));
-            }
-            keys
-        }
-        other => anyhow::bail!("unexpected response to SecretList: {other:?}"),
-    };
+    let env_vars = fetch_profile_secrets(&client, &profile, prefix).await?;
 
-    if keys.is_empty() {
-        eprintln!(
-            "{}: profile '{}' has no secrets — running command without secret injection",
-            "warning".yellow().bold(),
-            profile,
-        );
-    }
-
-    // 2. Fetch each secret value.
-    let mut env_vars: Vec<(String, Vec<u8>)> = Vec::with_capacity(keys.len());
-
-    for key in &keys {
-        let event = EventKind::SecretGet {
-            profile: profile.clone(),
-            key: key.clone(),
-        };
-
-        match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-            EventKind::SecretGetResponse { value, denial, .. } if denial.is_none() && !value.is_empty() => {
-                let env_name = secret_key_to_env_var(key, prefix);
-                if is_denied_env_var(&env_name) {
-                    eprintln!(
-                        "{}: secret '{}' maps to denied env var '{}', skipping (security policy)",
-                        "error".red().bold(),
-                        key,
-                        env_name,
-                    );
-                    continue;
-                }
-                env_vars.push((env_name, value.as_bytes().to_vec()));
-            }
-            _ => {
-                eprintln!(
-                    "{}: failed to resolve secret '{}', skipping",
-                    "warning".yellow().bold(),
-                    key,
-                );
-            }
-        }
-    }
-
-    // 3. Spawn child process with secrets as env vars.
+    // Spawn child process with secrets as env vars.
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
 
@@ -2036,65 +2099,21 @@ async fn cmd_export(profile: &str, format: &ExportFormat, prefix: Option<&str>) 
     let profile = TrustProfileName::try_from(profile)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // 1. List all secret keys in this profile.
-    let keys = match rpc(
-        &client,
-        EventKind::SecretList { profile: profile.clone() },
-        SecurityLevel::SecretsOnly,
-    ).await? {
-        EventKind::SecretListResponse { keys, denial } => {
-            if let Some(reason) = denial {
-                anyhow::bail!("{}", format_denial_reason(&reason, "", &profile));
-            }
-            keys
-        }
-        other => anyhow::bail!("unexpected response to SecretList: {other:?}"),
-    };
-
-    if keys.is_empty() {
-        eprintln!(
-            "{}: profile '{}' has no secrets",
-            "warning".yellow().bold(),
-            profile,
-        );
+    let raw_secrets = fetch_profile_secrets(&client, &profile, prefix).await?;
+    if raw_secrets.is_empty() {
         return Ok(());
     }
 
-    // 2. Fetch each secret value.
-    let mut entries: Vec<(String, String)> = Vec::with_capacity(keys.len());
+    // Convert byte values to strings for text output formats.
+    let entries: Vec<(String, String)> = raw_secrets
+        .into_iter()
+        .map(|(k, v)| {
+            let val_str = String::from_utf8_lossy(&v).into_owned();
+            (k, val_str)
+        })
+        .collect();
 
-    for key in &keys {
-        let event = EventKind::SecretGet {
-            profile: profile.clone(),
-            key: key.clone(),
-        };
-
-        match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-            EventKind::SecretGetResponse { value, denial, .. } if denial.is_none() && !value.is_empty() => {
-                let env_name = secret_key_to_env_var(key, prefix);
-                if is_denied_env_var(&env_name) {
-                    eprintln!(
-                        "{}: secret '{}' maps to denied env var '{}', skipping (security policy)",
-                        "error".red().bold(),
-                        key,
-                        env_name,
-                    );
-                    continue;
-                }
-                let val_str = String::from_utf8_lossy(value.as_bytes()).into_owned();
-                entries.push((env_name, val_str));
-            }
-            _ => {
-                eprintln!(
-                    "{}: failed to resolve secret '{}', skipping",
-                    "warning".yellow().bold(),
-                    key,
-                );
-            }
-        }
-    }
-
-    // 3. Output in requested format.
+    // Output in requested format.
     match format {
         ExportFormat::Shell => {
             for (k, v) in &entries {
@@ -2122,6 +2141,415 @@ async fn cmd_export(profile: &str, format: &ExportFormat, prefix: Option<&str>) 
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Workspace command
+// ============================================================================
+
+/// Check if creating a path requires privilege escalation.
+///
+/// Walks up the directory tree to find the first existing ancestor and
+/// checks if it is owned by the current user.
+#[cfg(target_os = "linux")]
+fn needs_privilege(path: &std::path::Path) -> bool {
+    let uid = unsafe { libc::getuid() };
+    let mut check = path.to_path_buf();
+    loop {
+        if check.exists() {
+            return std::fs::metadata(&check)
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.uid() != uid
+                })
+                .unwrap_or(true);
+        }
+        if !check.pop() {
+            return true;
+        }
+    }
+}
+
+async fn cmd_workspace(cmd: WorkspaceCmd) -> anyhow::Result<()> {
+    match cmd {
+        WorkspaceCmd::Init { root, user } => {
+            let user = user.unwrap_or_else(|| {
+                std::env::var("USER").unwrap_or_else(|_| "user".into())
+            });
+
+            #[cfg(target_os = "linux")]
+            {
+                // Confirm before privilege escalation.
+                if !root.exists() && needs_privilege(&root) {
+                    eprintln!(
+                        "Workspace root '{}' does not exist and requires elevated privileges to create.",
+                        root.display()
+                    );
+                    eprint!("Continue? [y/N] ");
+                    use std::io::Write;
+                    std::io::stderr().flush()?;
+                    let mut answer = String::new();
+                    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)
+                        .context("failed to read confirmation")?;
+                    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+
+                use sesame_workspace::platform::WorkspacePlatform;
+                let platform = sesame_workspace::platform::linux::LinuxPlatform;
+                platform
+                    .ensure_root(&root)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                std::fs::create_dir_all(&root)
+                    .context("failed to create workspace root")?;
+            }
+
+            let user_dir = root.join(&user);
+            std::fs::create_dir_all(&user_dir)
+                .context("failed to create user directory")?;
+
+            let mut config = core_config::load_workspace_config().unwrap_or_default();
+            config.settings.root = root.clone();
+            config.settings.user = user.clone();
+            core_config::save_workspace_config(&config)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            println!("Workspace initialized: {}", user_dir.display());
+            println!(
+                "Config written: {}",
+                core_config::config_dir().join("workspaces.toml").display()
+            );
+            Ok(())
+        }
+
+        WorkspaceCmd::Clone { url, depth, profile } => {
+            let config = core_config::load_workspace_config().unwrap_or_default();
+            let root = sesame_workspace::config::resolve_root(&config);
+            let user = sesame_workspace::config::resolve_user(&config);
+
+            let conv = sesame_workspace::convention::parse_url(&url)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let target = sesame_workspace::convention::canonical_path(&root, &user, &conv);
+
+            let result_path = sesame_workspace::git::clone_repo(&url, &target, depth)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            // Contextual output based on clone target type.
+            match &target {
+                sesame_workspace::CloneTarget::WorkspaceGit(_) => {
+                    println!("Cloned workspace.git to org directory: {}", result_path.display());
+                    println!("  Peer repos will be cloned as siblings inside this directory.");
+                }
+                sesame_workspace::CloneTarget::Regular(_) => {
+                    println!("Cloned to: {}", result_path.display());
+                }
+            }
+
+            // Link to profile if requested.
+            if let Some(ref profile_name) = profile {
+                let _validated = TrustProfileName::try_from(profile_name.as_str())
+                    .map_err(|e| anyhow::anyhow!("invalid profile name: {e}"))?;
+                let mut ws_config = core_config::load_workspace_config().unwrap_or_default();
+                sesame_workspace::config::add_link(
+                    &mut ws_config,
+                    &result_path.display().to_string(),
+                    profile_name,
+                );
+                core_config::save_workspace_config(&ws_config)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("Linked -> profile \"{}\"", profile_name);
+            }
+
+            Ok(())
+        }
+
+        WorkspaceCmd::List {
+            server,
+            org,
+            profile,
+            format,
+        } => {
+            let config = core_config::load_workspace_config().unwrap_or_default();
+            let mut workspaces = sesame_workspace::discover::discover_workspaces(&config)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if let Some(ref s) = server {
+                workspaces.retain(|w| w.convention.server == *s);
+            }
+            if let Some(ref o) = org {
+                workspaces.retain(|w| w.convention.org == *o);
+            }
+            if let Some(ref p) = profile {
+                workspaces.retain(|w| w.linked_profile.as_deref() == Some(p.as_str()));
+            }
+
+            match format {
+                WorkspaceListFormat::Table => {
+                    if workspaces.is_empty() {
+                        println!("No workspaces found.");
+                        return Ok(());
+                    }
+                    let mut table = Table::new();
+                    table.load_preset(UTF8_FULL);
+                    table.set_header(vec!["SERVER", "ORG", "REPO", "PROFILE", "PATH"]);
+                    for ws in &workspaces {
+                        let repo = ws
+                            .convention
+                            .repo
+                            .as_deref()
+                            .unwrap_or("(workspace)");
+                        let ws_profile = ws.linked_profile.as_deref().unwrap_or("-");
+                        table.add_row(vec![
+                            &ws.convention.server,
+                            &ws.convention.org,
+                            repo,
+                            ws_profile,
+                            &ws.path.display().to_string(),
+                        ]);
+                    }
+                    println!("{table}");
+                }
+                WorkspaceListFormat::Json => {
+                    let json: Vec<serde_json::Value> = workspaces
+                        .iter()
+                        .map(|ws| {
+                            serde_json::json!({
+                                "server": ws.convention.server,
+                                "org": ws.convention.org,
+                                "repo": ws.convention.repo,
+                                "profile": ws.linked_profile,
+                                "path": ws.path.display().to_string(),
+                                "is_workspace_git": ws.is_workspace_git,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+            }
+            Ok(())
+        }
+
+        WorkspaceCmd::Status { path, verbose } => {
+            let path = resolve_workspace_path(path)?;
+            let config = core_config::load_workspace_config().unwrap_or_default();
+            let root = sesame_workspace::config::resolve_root(&config);
+
+            let conv = sesame_workspace::convention::parse_path(&root, &path)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let remote = sesame_workspace::git::remote_url(&path)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "unknown".into());
+            let branch = sesame_workspace::git::current_branch(&path)
+                .unwrap_or_else(|_| "unknown".into());
+            let clean = sesame_workspace::git::is_clean(&path).unwrap_or(false);
+
+            // Use effective config for profile resolution.
+            let effective = sesame_workspace::config::resolve_effective_config(&config, &path, &root)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let in_ws_git = sesame_workspace::convention::is_inside_workspace_git(&path);
+
+            println!("Workspace:  {}", path.display());
+            println!("Remote:     {remote}");
+            println!("Branch:     {branch}");
+
+            // Color-coded status.
+            let status_str = if clean {
+                "clean".green().to_string()
+            } else {
+                "dirty".yellow().to_string()
+            };
+            println!("Status:     {status_str}");
+            println!(
+                "Profile:    {}",
+                effective.profile.as_deref().unwrap_or("(none)")
+            );
+            println!(
+                "Namespace:  {} ({})",
+                conv.org,
+                if in_ws_git {
+                    "workspace.git"
+                } else {
+                    "no workspace.git"
+                }
+            );
+
+            if verbose {
+                println!(
+                    "Convention: {} / {} / {} / {} / {}",
+                    root.display(),
+                    config.settings.user,
+                    conv.server,
+                    conv.org,
+                    conv.repo.as_deref().unwrap_or("(workspace.git)")
+                );
+
+                // Disk usage.
+                if let Ok(output) = std::process::Command::new("du")
+                    .arg("-sh")
+                    .arg("--")
+                    .arg(&path)
+                    .output()
+                    && let Ok(s) = String::from_utf8(output.stdout)
+                    && let Some(size) = s.split_whitespace().next()
+                {
+                    println!("Disk:       {size}");
+                }
+            }
+            Ok(())
+        }
+
+        WorkspaceCmd::Link {
+            profile,
+            path,
+        } => {
+            let _validated = TrustProfileName::try_from(profile.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid profile name: {e}"))?;
+
+            let path = resolve_workspace_path(path)?;
+
+            let mut config = core_config::load_workspace_config().unwrap_or_default();
+            sesame_workspace::config::add_link(
+                &mut config,
+                &path.display().to_string(),
+                &profile,
+            );
+            core_config::save_workspace_config(&config)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Linked {} -> profile \"{}\"", path.display(), profile);
+            Ok(())
+        }
+
+        WorkspaceCmd::Unlink { path } => {
+            let path = resolve_workspace_path(path)?;
+            let mut config = core_config::load_workspace_config().unwrap_or_default();
+            let path_str = path.display().to_string();
+            if sesame_workspace::config::remove_link(&mut config, &path_str) {
+                core_config::save_workspace_config(&config)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("Unlinked {}", path.display());
+            } else {
+                println!("No link found for {}", path.display());
+            }
+            Ok(())
+        }
+
+        WorkspaceCmd::Shell {
+            profile,
+            path,
+            shell,
+            prefix,
+            command,
+        } => {
+            let path = resolve_workspace_path(path)?;
+            let config = core_config::load_workspace_config().unwrap_or_default();
+            let root = sesame_workspace::config::resolve_root(&config);
+
+            // Use effective config for profile resolution.
+            let effective = sesame_workspace::config::resolve_effective_config(&config, &path, &root)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let profile = profile
+                .or(effective.profile)
+                .or_else(|| std::env::var("SESAME_PROFILE").ok())
+                .unwrap_or_else(|| "default".into());
+
+            let secret_prefix = prefix.or(effective.secret_prefix);
+
+            // Connect to IPC and fetch secrets.
+            let client = connect().await?;
+            let tp = TrustProfileName::try_from(profile.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid profile: {e}"))?;
+
+            let env_vars = fetch_profile_secrets(&client, &tp, secret_prefix.as_deref()).await?;
+
+            // Determine what to spawn.
+            let (bin, args, is_interactive) = if !command.is_empty() {
+                (command[0].clone(), command[1..].to_vec(), false)
+            } else {
+                let shell_bin = shell
+                    .or_else(|| std::env::var("SHELL").ok())
+                    .unwrap_or_else(|| "/bin/sh".into());
+                (shell_bin, Vec::new(), true)
+            };
+
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.args(&args);
+            cmd.current_dir(&path);
+            cmd.env("SESAME_PROFILE", &profile);
+            cmd.env("SESAME_WORKSPACE", path.display().to_string());
+
+            // Inject effective env vars from .sesame.toml layers.
+            for (k, v) in &effective.env {
+                cmd.env(k, v);
+            }
+
+            // Inject secrets.
+            for (k, v) in &env_vars {
+                let val_str = String::from_utf8_lossy(v);
+                cmd.env(k, val_str.as_ref());
+            }
+
+            if is_interactive {
+                println!(
+                    "Entering workspace shell (profile: {profile}, {} secrets injected)",
+                    env_vars.len()
+                );
+            }
+            let status = cmd.status().context("failed to spawn command")?;
+
+            // Zeroize secrets.
+            for (_, mut v) in env_vars {
+                v.zeroize();
+            }
+
+            std::process::exit(status.code().unwrap_or(1));
+        }
+
+        WorkspaceCmd::Config(sub) => match sub {
+            WorkspaceConfigCmd::Show { path } => {
+                let path = resolve_workspace_path(path)?;
+                let config = core_config::load_workspace_config().unwrap_or_default();
+                let root = sesame_workspace::config::resolve_root(&config);
+
+                let effective = sesame_workspace::config::resolve_effective_config(&config, &path, &root)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                println!("Workspace:      {}", path.display());
+                println!(
+                    "Profile:        {} (source: {})",
+                    effective.profile.as_deref().unwrap_or("(none)"),
+                    if effective.provenance.profile_source.is_empty() {
+                        "default"
+                    } else {
+                        effective.provenance.profile_source
+                    }
+                );
+                if let Some(ref prefix) = effective.secret_prefix {
+                    println!(
+                        "Secret prefix:  {prefix} (source: {})",
+                        effective.provenance.secret_prefix_source
+                    );
+                }
+                if !effective.env.is_empty() {
+                    println!("Environment:");
+                    for (k, v) in &effective.env {
+                        println!("  {k}={v}");
+                    }
+                }
+                if !effective.tags.is_empty() {
+                    println!("Tags:           {}", effective.tags.join(", "));
+                }
+                Ok(())
+            }
+        },
+    }
 }
 
 #[cfg(test)]

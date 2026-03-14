@@ -18,6 +18,7 @@ members = [
     "daemon-profile",
     "daemon-secrets",
     "open-sesame",
+    "sesame-workspace",
     "extension-host",
     "extension-sdk",
 ]
@@ -51,6 +52,7 @@ core-profile    = { path = "core-profile" }
 platform-linux  = { path = "platform-linux" }
 platform-macos  = { path = "platform-macos" }
 platform-windows = { path = "platform-windows" }
+sesame-workspace = { path = "sesame-workspace" }
 extension-host  = { path = "extension-host" }
 extension-sdk   = { path = "extension-sdk" }
 
