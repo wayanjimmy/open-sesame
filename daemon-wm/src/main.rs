@@ -12,7 +12,7 @@ use anyhow::Context;
 use clap::Parser;
 use core_crypto::SecureVec;
 use core_ipc::{BusClient, Message};
-use core_types::{DaemonId, EventKind, SecurityLevel, Window};
+use core_types::{DaemonId, EventKind, SecurityLevel, UnlockRejectedReason, Window};
 use daemon_wm::controller::{Command, Event, OverlayController};
 use daemon_wm::mru;
 use daemon_wm::overlay::{self, OverlayCmd, OverlayEvent};
@@ -1088,7 +1088,7 @@ async fn execute_commands(
                             }
                         }
                         EventKind::UnlockRejected { reason, profile: resp_profile } => {
-                            let already = reason == core_types::UnlockRejectedReason::AlreadyUnlocked;
+                            let already = reason == UnlockRejectedReason::AlreadyUnlocked;
                             if already {
                                 tracing::info!(?resp_profile, "vault already unlocked, treating as success");
                             } else {
