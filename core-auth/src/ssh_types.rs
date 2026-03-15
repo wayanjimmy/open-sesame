@@ -37,6 +37,23 @@ impl SshKeyType {
         }
     }
 
+    /// Convert from `ssh_key::Algorithm`, rejecting non-deterministic types.
+    ///
+    /// Only Ed25519 and RSA (PKCS#1 v1.5) are accepted. ECDSA and other
+    /// non-deterministic signature schemes are rejected because they would
+    /// produce different KEKs on each unlock attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError::UnsupportedKeyType` for non-deterministic key types.
+    pub fn from_algorithm(algo: &ssh_key::Algorithm) -> Result<Self, AuthError> {
+        match algo {
+            ssh_key::Algorithm::Ed25519 => Ok(Self::Ed25519),
+            ssh_key::Algorithm::Rsa { .. } => Ok(Self::Rsa),
+            other => Err(AuthError::UnsupportedKeyType(format!("{other:?}"))),
+        }
+    }
+
     /// SSH wire format key type string.
     #[must_use]
     pub fn wire_name(&self) -> &'static str {

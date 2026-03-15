@@ -36,6 +36,10 @@ toml         = { workspace = true }
 uuid         = { workspace = true }
 blake3       = { workspace = true }
 libc         = { workspace = true }
+core-auth    = { workspace = true }
+core-crypto  = { workspace = true }
+ssh-key      = { workspace = true }
+ssh-agent-client-rs = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux   = { workspace = true }

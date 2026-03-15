@@ -35,6 +35,10 @@ pub enum AuthError {
     UnwrapFailed,
     #[error("enrollment blob invalid: {0}")]
     InvalidBlob(String),
+    #[error("no eligible SSH key found in agent")]
+    NoEligibleKey,
+    #[error("SSH agent protocol error: {0}")]
+    AgentProtocolError(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

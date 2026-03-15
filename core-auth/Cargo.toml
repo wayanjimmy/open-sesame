@@ -17,6 +17,9 @@ tokio = { workspace = true, features = ["net", "io-util", "time"] }
 thiserror.workspace = true
 tracing.workspace = true
 async-trait = { workspace = true }
+ssh-key.workspace = true
+ssh-agent-client-rs.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true

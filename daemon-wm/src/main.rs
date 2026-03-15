@@ -901,17 +901,48 @@ async fn execute_commands(
                     %profile,
                     "attempting auto-unlock for vault"
                 );
-                // AuthDispatcher probes non-interactive backends (SSH-agent, future TPM).
-                // Currently all return false (SshAgentBackend.can_unlock() is not yet
-                // wired to agent socket communication), so this always falls through
-                // to password entry. The controller state machine handles the transition.
+
+                let config_dir = core_config::config_dir();
+                let salt_path = config_dir.join("vaults").join(format!("{profile}.salt"));
+                let salt = tokio::fs::read(&salt_path).await.ok();
+
+                let (success, needs_touch) = if let Some(salt_bytes) = &salt {
+                    let auth = core_auth::AuthDispatcher::new();
+                    if let Some(auto_backend) = auth.find_auto_backend(&profile, &config_dir).await {
+                        match auto_backend.unlock(&profile, &config_dir, salt_bytes).await {
+                            Ok(outcome) => {
+                                let fp = outcome.audit_metadata.get("ssh_fingerprint")
+                                    .cloned().unwrap_or_default();
+                                let event = core_types::EventKind::SshUnlockRequest {
+                                    master_key: core_types::SensitiveBytes::new(
+                                        outcome.master_key.as_bytes().to_vec()
+                                    ),
+                                    profile: profile.clone(),
+                                    ssh_fingerprint: fp,
+                                };
+                                client.publish(event, core_types::SecurityLevel::SecretsOnly).await.ok();
+                                (true, false)
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, %profile, "auto-unlock failed, falling back to password");
+                                (false, false)
+                            }
+                        }
+                    } else {
+                        (false, false)
+                    }
+                } else {
+                    tracing::debug!(%profile, "no salt file found, cannot attempt auto-unlock");
+                    (false, false)
+                };
+
                 let win_list = windows.lock().await;
                 let cfg = wm_config.lock().await;
                 let sub_cmds = controller.handle(
                     daemon_wm::controller::Event::AutoUnlockResult {
-                        success: false,
+                        success,
                         profile,
-                        needs_touch: false,
+                        needs_touch,
                     },
                     &win_list,
                     &cfg,

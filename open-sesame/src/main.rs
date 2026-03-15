@@ -70,6 +70,10 @@ enum Command {
     #[command(subcommand)]
     Profile(ProfileCmd),
 
+    /// SSH agent key management for passwordless vault unlock.
+    #[command(subcommand)]
+    Ssh(SshCmd),
+
     /// Secret management (profile-scoped).
     #[command(subcommand)]
     Secret(SecretCmd),
@@ -356,6 +360,37 @@ enum ProfileCmd {
 }
 
 #[derive(Subcommand)]
+enum SshCmd {
+    /// Enroll an SSH key for passwordless vault unlock.
+    ///
+    /// Requires the vault to be unlockable with a password (the master key
+    /// is derived via Argon2id, then wrapped under an SSH-derived KEK).
+    /// Only Ed25519 and RSA keys are supported (deterministic signatures).
+    Enroll {
+        /// Target profiles (CSV: "default,work").
+        /// Falls back to SESAME_PROFILES env var, then "default".
+        #[arg(short, long)]
+        profile: Option<String>,
+    },
+
+    /// List SSH key enrollments for profiles.
+    List {
+        /// Target profiles (CSV: "default,work").
+        /// Falls back to SESAME_PROFILES env var, then "default".
+        #[arg(short, long)]
+        profile: Option<String>,
+    },
+
+    /// Revoke SSH key enrollment for a profile.
+    Revoke {
+        /// Target profiles (CSV: "default,work").
+        /// Falls back to SESAME_PROFILES env var, then "default".
+        #[arg(short, long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SecretCmd {
     /// Store a secret (prompts for value).
     Set {
@@ -584,6 +619,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             ProfileCmd::Deactivate { name } => cmd_profile_deactivate(&name).await,
             ProfileCmd::Default { name } => cmd_profile_default(&name).await,
             ProfileCmd::Show { name } => cmd_profile_show(&name),
+        },
+        Command::Ssh(sub) => match sub {
+            SshCmd::Enroll { profile } => cmd_ssh_enroll(profile).await,
+            SshCmd::List { profile } => cmd_ssh_list(profile).await,
+            SshCmd::Revoke { profile } => cmd_ssh_revoke(profile).await,
         },
         Command::Secret(sub) => match sub {
             SecretCmd::Set { profile, key } => cmd_secret_set(&profile, &key).await,
@@ -833,12 +873,81 @@ async fn cmd_unlock(profile_arg: Option<String>) -> anyhow::Result<()> {
     let client = connect().await?;
 
     let specs = resolve_profile_specs(profile_arg.as_deref());
+    let config_dir = core_config::config_dir();
 
     for spec in &specs {
         let profile_name = &spec.vault;
         let target_profile = TrustProfileName::try_from(profile_name.as_str())
             .map_err(|e| anyhow::anyhow!("invalid profile name '{profile_name}': {e}"))?;
 
+        // Try SSH-agent auto-unlock first
+        let salt_path = config_dir.join("vaults").join(format!("{target_profile}.salt"));
+        if let Ok(salt) = std::fs::read(&salt_path) {
+            let dispatcher = core_auth::AuthDispatcher::new();
+            if let Some(backend) = dispatcher
+                .find_auto_backend(&target_profile, &config_dir)
+                .await
+            {
+                match backend.unlock(&target_profile, &config_dir, &salt).await {
+                    Ok(outcome) => {
+                        let fp = outcome
+                            .audit_metadata
+                            .get("ssh_fingerprint")
+                            .cloned()
+                            .unwrap_or_default();
+                        let event = EventKind::SshUnlockRequest {
+                            master_key: SensitiveBytes::new(
+                                outcome.master_key.as_bytes().to_vec(),
+                            ),
+                            profile: target_profile.clone(),
+                            ssh_fingerprint: fp,
+                        };
+                        match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
+                            EventKind::UnlockResponse {
+                                success: true,
+                                profile,
+                            } => {
+                                println!(
+                                    "{}",
+                                    format!("Vault '{profile}' unlocked via SSH agent.").green()
+                                );
+                                continue;
+                            }
+                            EventKind::UnlockRejected {
+                                reason:
+                                    core_types::UnlockRejectedReason::AlreadyUnlocked,
+                                profile,
+                            } => {
+                                println!(
+                                    "{}",
+                                    format!(
+                                        "Vault '{}' already unlocked.",
+                                        profile
+                                            .as_ref()
+                                            .map_or("unknown", |p| p.as_ref())
+                                    )
+                                    .yellow()
+                                );
+                                continue;
+                            }
+                            EventKind::UnlockResponse {
+                                success: false, ..
+                            } => {
+                                tracing::debug!("SSH unlock rejected by daemon-secrets, falling back to password");
+                            }
+                            _ => {
+                                tracing::debug!("unexpected SSH unlock response, falling back to password");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "SSH auto-unlock failed, falling back to password");
+                    }
+                }
+            }
+        }
+
+        // Fall through to password prompt
         let mut password = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
             dialoguer::Password::new()
                 .with_prompt(format!("Password for vault '{profile_name}'"))
@@ -881,6 +990,181 @@ async fn cmd_unlock(profile_arg: Option<String>) -> anyhow::Result<()> {
             }
             other => anyhow::bail!("unexpected response: {other:?}"),
         }
+    }
+
+    Ok(())
+}
+
+async fn cmd_ssh_enroll(profile_arg: Option<String>) -> anyhow::Result<()> {
+    let specs = resolve_profile_specs(profile_arg.as_deref());
+    let config_dir = core_config::config_dir();
+
+    for spec in &specs {
+        let profile_name = &spec.vault;
+        let target = TrustProfileName::try_from(profile_name.as_str())
+            .map_err(|e| anyhow::anyhow!("invalid profile name '{profile_name}': {e}"))?;
+
+        // Vault must have a salt (must be initialized)
+        let salt_path = config_dir.join("vaults").join(format!("{target}.salt"));
+        let salt = std::fs::read(&salt_path)
+            .context("failed to read vault salt — is the vault created?")?;
+
+        // Need password to derive master key for wrapping
+        println!("SSH enrollment requires your vault password to derive the master key.");
+        let password = dialoguer::Password::new()
+            .with_prompt(format!("Password for vault '{profile_name}'"))
+            .interact()
+            .context("failed to read password")?;
+
+        let salt_array: [u8; 16] = salt
+            .as_slice()
+            .try_into()
+            .context("vault salt must be exactly 16 bytes")?;
+        let master_key = core_crypto::derive_key_argon2(password.as_bytes(), &salt_array)
+            .context("failed to derive master key from password")?;
+
+        // List SSH agent keys for user selection
+        let sock_path = std::env::var("SSH_AUTH_SOCK")
+            .context("SSH_AUTH_SOCK not set — is ssh-agent running?")?;
+        let mut agent =
+            ssh_agent_client_rs::Client::connect(std::path::Path::new(&sock_path))
+                .context("failed to connect to SSH agent")?;
+        let identities = agent
+            .list_all_identities()
+            .context("failed to list SSH agent keys")?;
+
+        let eligible: Vec<_> = identities
+            .into_iter()
+            .filter(|id| {
+                let algo = match id {
+                    ssh_agent_client_rs::Identity::PublicKey(cow) => cow.algorithm(),
+                    ssh_agent_client_rs::Identity::Certificate(cow) => cow.algorithm(),
+                };
+                core_auth::SshKeyType::from_algorithm(&algo).is_ok()
+            })
+            .collect();
+
+        if eligible.is_empty() {
+            anyhow::bail!(
+                "no eligible SSH keys found in agent.\n\
+                 Only Ed25519 and RSA keys are supported (ECDSA uses non-deterministic signatures).\n\
+                 Add a key with: ssh-add ~/.ssh/id_ed25519"
+            );
+        }
+
+        let key_labels: Vec<String> = eligible
+            .iter()
+            .map(|id| match id {
+                ssh_agent_client_rs::Identity::PublicKey(cow) => {
+                    let fp = cow.fingerprint(ssh_key::HashAlg::Sha256);
+                    let algo = cow.algorithm();
+                    format!("{fp} ({algo:?})")
+                }
+                ssh_agent_client_rs::Identity::Certificate(cow) => {
+                    let algo = cow.algorithm();
+                    format!("<certificate> ({algo:?})")
+                }
+            })
+            .collect();
+
+        let _selection = if key_labels.len() == 1 {
+            println!("Using key: {}", key_labels[0]);
+            0
+        } else {
+            dialoguer::Select::new()
+                .with_prompt("Select SSH key for enrollment")
+                .items(&key_labels)
+                .default(0)
+                .interact()?
+        };
+
+        let backend = core_auth::SshAgentBackend::new();
+        core_auth::VaultAuthBackend::enroll(&backend, &target, &master_key, &config_dir, &salt)
+            .await?;
+
+        println!(
+            "{}",
+            format!("SSH enrollment created for vault '{profile_name}'.").green()
+        );
+        println!("Future unlocks will use your SSH key automatically when the agent is loaded.");
+    }
+
+    Ok(())
+}
+
+async fn cmd_ssh_list(profile_arg: Option<String>) -> anyhow::Result<()> {
+    let specs = resolve_profile_specs(profile_arg.as_deref());
+    let config_dir = core_config::config_dir();
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec!["Profile", "SSH Enrolled", "Key Fingerprint", "Key Type", "Agent Available"]);
+
+    for spec in &specs {
+        let profile_name = &spec.vault;
+        let target = TrustProfileName::try_from(profile_name.as_str())
+            .map_err(|e| anyhow::anyhow!("invalid profile name '{profile_name}': {e}"))?;
+
+        let backend = core_auth::SshAgentBackend::new();
+        let enrolled = core_auth::VaultAuthBackend::is_enrolled(&backend, &target, &config_dir);
+
+        if enrolled {
+            let blob_path = config_dir
+                .join("vaults")
+                .join(format!("{target}.ssh-enrollment"));
+            let (fp, kt) = std::fs::read(&blob_path)
+                .ok()
+                .and_then(|data| core_auth::EnrollmentBlob::deserialize(&data).ok())
+                .map(|blob| (blob.key_fingerprint, blob.key_type.wire_name().to_string()))
+                .unwrap_or_else(|| ("<unreadable>".into(), "<unknown>".into()));
+
+            let available = core_auth::VaultAuthBackend::can_unlock(&backend, &target, &config_dir).await;
+
+            table.add_row(vec![
+                profile_name.clone(),
+                "yes".into(),
+                fp,
+                kt,
+                if available { "yes" } else { "no" }.into(),
+            ]);
+        } else {
+            table.add_row(vec![
+                profile_name.clone(),
+                "no".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+            ]);
+        }
+    }
+
+    println!("{table}");
+    Ok(())
+}
+
+async fn cmd_ssh_revoke(profile_arg: Option<String>) -> anyhow::Result<()> {
+    let specs = resolve_profile_specs(profile_arg.as_deref());
+    let config_dir = core_config::config_dir();
+
+    for spec in &specs {
+        let profile_name = &spec.vault;
+        let target = TrustProfileName::try_from(profile_name.as_str())
+            .map_err(|e| anyhow::anyhow!("invalid profile name '{profile_name}': {e}"))?;
+
+        let backend = core_auth::SshAgentBackend::new();
+        if !core_auth::VaultAuthBackend::is_enrolled(&backend, &target, &config_dir) {
+            println!(
+                "{}",
+                format!("No SSH enrollment found for vault '{profile_name}'.").yellow()
+            );
+            continue;
+        }
+
+        core_auth::VaultAuthBackend::revoke(&backend, &target, &config_dir).await?;
+        println!(
+            "{}",
+            format!("SSH enrollment revoked for vault '{profile_name}'.").green()
+        );
     }
 
     Ok(())
