@@ -937,7 +937,7 @@ async fn execute_commands(
                                 // 30s timeout accommodates Argon2id KDF parameters.
                                 match client.request(
                                     event,
-                                    core_types::SecurityLevel::SecretsOnly,
+                                    core_types::SecurityLevel::Internal,
                                     std::time::Duration::from_secs(30),
                                 ).await {
                                     Ok(msg) => match msg.payload {
