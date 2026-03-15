@@ -96,6 +96,8 @@ pub enum Command {
     ClearPasswordBuffer,
     /// Show error message in unlock overlay.
     ShowUnlockError { message: String },
+    /// Activate profiles via IPC before retrying a launch.
+    ActivateProfiles { profiles: Vec<TrustProfileName> },
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,9 +1139,12 @@ impl OverlayController {
                     };
                     cmds.push(Command::AttemptAutoUnlock { profile });
                 } else {
-                    // All profiles unlocked — retry the launch.
+                    // All profiles unlocked — activate them, then retry the launch.
                     self.phase = Phase::Launching;
                     cmds.push(Command::ShowLaunching);
+                    cmds.push(Command::ActivateProfiles {
+                        profiles: profiles_to_unlock,
+                    });
                     cmds.push(Command::LaunchApp {
                         command: retry_command,
                         tags: retry_tags,
@@ -2228,6 +2233,8 @@ mod tests {
             profile: TrustProfileName::try_from("default").unwrap(),
         }, &windows, &config);
 
+        assert!(cmds.iter().any(|c| matches!(c, Command::ActivateProfiles { .. })),
+            "successful unlock must activate profiles before retry, got: {cmds:?}");
         assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "ghostty")),
             "successful unlock must retry original launch, got: {cmds:?}");
         assert!(matches!(ctrl.phase, Phase::Launching));
@@ -2274,7 +2281,9 @@ mod tests {
             profile: TrustProfileName::try_from("work").unwrap(),
         }, &windows, &config);
 
-        // NOW retry the launch.
+        // NOW activate profiles and retry the launch.
+        assert!(cmds.iter().any(|c| matches!(c, Command::ActivateProfiles { .. })),
+            "all profiles unlocked must activate profiles before retry, got: {cmds:?}");
         assert!(cmds.iter().any(|c| matches!(c, Command::LaunchApp { command, .. } if command == "ghostty")),
             "all profiles unlocked must retry launch, got: {cmds:?}");
         assert!(matches!(ctrl.phase, Phase::Launching));
@@ -2368,5 +2377,56 @@ mod tests {
 
         assert!(cmds.is_empty());
         assert!(ctrl.is_idle());
+    }
+
+    #[test]
+    fn profiles_activated_before_retry_launch_after_unlock() {
+        // Regression: after unlocking all vaults, the retry launch would fail
+        // with "denied-profile-not-active" because profiles were never activated.
+        // The controller must emit ActivateProfiles BEFORE LaunchApp.
+        let mut ctrl = OverlayController::new();
+        let windows = test_windows();
+        let config = test_config();
+
+        drive_to_launching(&mut ctrl, &windows, &config);
+        ctrl.handle(vaults_locked_event(&["alpha", "beta"]), &windows, &config);
+
+        // Unlock both profiles.
+        ctrl.handle(Event::AutoUnlockResult {
+            success: false,
+            profile: TrustProfileName::try_from("alpha").unwrap(),
+            needs_touch: false,
+        }, &windows, &config);
+        ctrl.handle(Event::UnlockResult {
+            success: true,
+            profile: TrustProfileName::try_from("alpha").unwrap(),
+        }, &windows, &config);
+        ctrl.handle(Event::AutoUnlockResult {
+            success: false,
+            profile: TrustProfileName::try_from("beta").unwrap(),
+            needs_touch: false,
+        }, &windows, &config);
+        let cmds = ctrl.handle(Event::UnlockResult {
+            success: true,
+            profile: TrustProfileName::try_from("beta").unwrap(),
+        }, &windows, &config);
+
+        // Find positions to verify ordering.
+        let activate_pos = cmds.iter().position(|c| matches!(c, Command::ActivateProfiles { .. }));
+        let launch_pos = cmds.iter().position(|c| matches!(c, Command::LaunchApp { .. }));
+
+        assert!(activate_pos.is_some(),
+            "ActivateProfiles must be emitted before launch retry, got: {cmds:?}");
+        assert!(launch_pos.is_some(),
+            "LaunchApp must be emitted for retry, got: {cmds:?}");
+        assert!(activate_pos.unwrap() < launch_pos.unwrap(),
+            "ActivateProfiles must come before LaunchApp, got: {cmds:?}");
+
+        // Verify the profiles list contains both unlocked profiles.
+        if let Some(Command::ActivateProfiles { profiles }) = cmds.iter().find(|c| matches!(c, Command::ActivateProfiles { .. })) {
+            assert_eq!(profiles.len(), 2);
+            assert!(profiles.iter().any(|p| p.as_ref() == "alpha"));
+            assert!(profiles.iter().any(|p| p.as_ref() == "beta"));
+        }
     }
 }

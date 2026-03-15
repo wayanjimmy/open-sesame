@@ -12,7 +12,7 @@ use anyhow::Context;
 use clap::Parser;
 use core_crypto::SecureVec;
 use core_ipc::{BusClient, Message};
-use core_types::{DaemonId, EventKind, SecurityLevel, UnlockRejectedReason, Window};
+use core_types::{DaemonId, EventKind, ProfileId, SecurityLevel, UnlockRejectedReason, Window};
 use daemon_wm::controller::{Command, Event, OverlayController};
 use daemon_wm::mru;
 use daemon_wm::overlay::{self, OverlayCmd, OverlayEvent};
@@ -1136,6 +1136,55 @@ async fn execute_commands(
                     event_type = "password-buffer-cleared",
                     "password buffer cleared and zeroized"
                 );
+            }
+            Command::ActivateProfiles { profiles } => {
+                for profile_name in &profiles {
+                    let target = ProfileId::new();
+                    let activate_event = EventKind::ProfileActivate {
+                        target,
+                        profile_name: profile_name.clone(),
+                    };
+                    tracing::info!(
+                        audit = "unlock-flow",
+                        event_type = "profile-activate",
+                        %profile_name,
+                        "activating profile after vault unlock"
+                    );
+                    match client.request(
+                        activate_event,
+                        SecurityLevel::Internal,
+                        std::time::Duration::from_secs(10),
+                    ).await {
+                        Ok(msg) => match msg.payload {
+                            EventKind::ProfileActivateResponse { success: true } => {
+                                tracing::info!(
+                                    audit = "unlock-flow",
+                                    event_type = "profile-activated",
+                                    %profile_name,
+                                    "profile activated successfully"
+                                );
+                            }
+                            EventKind::ProfileActivateResponse { success: false } => {
+                                tracing::error!(
+                                    audit = "unlock-flow",
+                                    event_type = "profile-activate-failed",
+                                    %profile_name,
+                                    "profile activation rejected by daemon-profile"
+                                );
+                            }
+                            other => {
+                                tracing::warn!(?other, %profile_name, "unexpected response to ProfileActivate");
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                %profile_name,
+                                "profile activation IPC failed"
+                            );
+                        }
+                    }
+                }
             }
             Command::ShowUnlockError { message } => {
                 tracing::warn!(
