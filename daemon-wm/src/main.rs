@@ -967,15 +967,16 @@ async fn execute_commands(
                                 }
                             }
                             Err(e) => {
-                                tracing::debug!(error = %e, %profile, "auto-unlock failed, falling back to password");
+                                tracing::warn!(error = %e, %profile, audit = "unlock-flow", "auto-unlock backend failed, falling back to password");
                                 (false, false)
                             }
                         }
                     } else {
+                        tracing::info!(%profile, audit = "unlock-flow", "no auto-unlock backend available (not enrolled or agent unavailable)");
                         (false, false)
                     }
                 } else {
-                    tracing::debug!(%profile, "no salt file found, cannot attempt auto-unlock");
+                    tracing::warn!(%profile, audit = "unlock-flow", "no salt file found, cannot attempt auto-unlock");
                     (false, false)
                 };
 
