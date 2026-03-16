@@ -254,7 +254,7 @@ pub async fn deactivate<W: std::io::Write>(
 /// 4. Wait for the confirmed response with timeout
 /// 5. Decode and return the response Message
 ///
-/// The [`ConfirmationGuard`] automatically deregisters the route on drop,
+/// The `ConfirmationGuard` automatically deregisters the route on drop,
 /// even on timeout or error paths.
 pub(crate) async fn confirmed_rpc(
     bus: &BusServer,

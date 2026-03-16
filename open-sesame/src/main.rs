@@ -111,7 +111,7 @@ enum Command {
     /// Configures Alt+Tab (switch), Alt+Shift+Tab (switch backward),
     /// and a launcher key (default: alt+space) in COSMIC's shortcuts.ron.
     ///
-    /// Usage: sesame setup-keybinding [KEY_COMBO]
+    /// Usage: `sesame setup-keybinding [KEY_COMBO]`
     #[cfg(all(target_os = "linux", feature = "desktop"))]
     SetupKeybinding {
         /// Launcher key combo (default: "alt+space"). Examples: "super+space", "alt+space".

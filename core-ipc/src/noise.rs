@@ -514,7 +514,7 @@ fn build_prologue(local: &PeerCredentials, remote: &PeerCredentials) -> Vec<u8> 
 /// Encrypted IPC transport wrapping a completed Noise session.
 ///
 /// Provides chunked encrypted frame I/O over the Noise transport state.
-/// Application frames are split into chunks of at most [`MAX_NOISE_PLAINTEXT`]
+/// Application frames are split into chunks of at most `MAX_NOISE_PLAINTEXT`
 /// bytes, each encrypted as a separate Noise transport message.
 ///
 /// The `TransportState` requires `&mut self` for both encrypt and decrypt,
@@ -528,13 +528,13 @@ impl NoiseTransport {
     /// Write an encrypted application frame.
     ///
     /// The payload is chunked into Noise transport messages of at most
-    /// [`MAX_NOISE_PLAINTEXT`] bytes each. Wire format per frame:
+    /// `MAX_NOISE_PLAINTEXT` bytes each. Wire format per frame:
     ///
     /// ```text
     /// [4-byte BE chunk_count][chunk_1][chunk_2]...[chunk_n]
     /// ```
     ///
-    /// Each chunk is written as a length-prefixed frame via [`write_frame`].
+    /// Each chunk is written as a length-prefixed frame via `write_frame`.
     ///
     /// # Errors
     ///
