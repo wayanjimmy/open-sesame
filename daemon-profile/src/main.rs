@@ -1579,7 +1579,11 @@ fn apply_sandbox() -> anyhow::Result<()> {
         ],
     };
 
-    match platform_linux::sandbox::apply_sandbox_with_scope(&rules, &seccomp, LandlockScope::SignalOnly) {
+    match platform_linux::sandbox::apply_sandbox_with_scope(
+        &rules,
+        &seccomp,
+        LandlockScope::SignalOnly,
+    ) {
         Ok(status) => {
             tracing::info!(?status, "sandbox applied");
             Ok(())

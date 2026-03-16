@@ -1575,6 +1575,21 @@ fn apply_sandbox() {
         },
     ];
 
+    // systemd notify socket: sd_notify(READY=1) and watchdog keepalives
+    // need connect+sendto access to $NOTIFY_SOCKET after Landlock is applied.
+    // Abstract sockets (prefixed '@') bypass Landlock AccessFs rules.
+    if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET")
+        && !notify_socket.starts_with('@')
+    {
+        let path = std::path::PathBuf::from(&notify_socket);
+        if path.exists() {
+            rules.push(LandlockRule {
+                path,
+                access: FsAccess::ReadWriteFile,
+            });
+        }
+    }
+
     // SSH agent socket: needed for SSH-agent auto-unlock (can_unlock + sign).
     //
     // Forwarded SSH agent sockets live at random /tmp/ssh-XXXX/agent.PID

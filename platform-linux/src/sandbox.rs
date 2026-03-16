@@ -166,11 +166,7 @@ fn install_sigsys_handler() {
     /// on Linux x86_64. The `si_syscall` field is at byte offset 16 within
     /// the `si_fields` union (offset 0x18 from siginfo_t base on glibc/musl).
     #[allow(unsafe_code)]
-    extern "C" fn handler(
-        _sig: libc::c_int,
-        info: *mut libc::siginfo_t,
-        _ctx: *mut libc::c_void,
-    ) {
+    extern "C" fn handler(_sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
         // SAFETY: signal handler context — only async-signal-safe calls.
         #[allow(unsafe_code)]
         let syscall_nr = unsafe {
