@@ -10,7 +10,7 @@ mod validation;
 mod watcher;
 
 pub use loader::{
-    atomic_write, config_dir, installation_path, load_config, load_installation,
+    atomic_write, bootstrap_dirs, config_dir, installation_path, load_config, load_installation,
     load_workspace_config, resolve_config_paths, resolve_config_real_dirs, save_workspace_config,
     write_installation,
 };

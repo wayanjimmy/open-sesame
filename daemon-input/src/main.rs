@@ -32,6 +32,15 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     platform_linux::security::harden_process();
 
+    #[cfg(target_os = "linux")]
+    platform_linux::security::apply_resource_limits(&platform_linux::security::ResourceLimits {
+        nofile: 4096,
+        memlock_bytes: 0,
+    });
+
+    // -- Directory bootstrap --
+    core_config::bootstrap_dirs();
+
     let config = core_config::load_config(None).context("failed to load config")?;
 
     let config_paths = core_config::resolve_config_paths(None);

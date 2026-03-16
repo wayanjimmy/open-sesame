@@ -134,11 +134,18 @@ impl VaultState {
 
             // Wrap synchronous SQLCipher open in spawn_blocking to avoid blocking
             // the event loop during PRAGMA key + schema migration.
+            // Defensive timeout: if the blocking thread is killed (e.g. seccomp
+            // SIGSYS), the JoinHandle hangs forever. The timeout ensures the
+            // event loop recovers instead of freezing until watchdog kills us.
             let db_path_clone = db_path.clone();
-            let store = tokio::task::spawn_blocking(move || {
-                SqlCipherStore::open(&db_path_clone, &vault_key)
-            })
+            let store = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::task::spawn_blocking(move || {
+                    SqlCipherStore::open(&db_path_clone, &vault_key)
+                }),
+            )
             .await
+            .map_err(|_| core_types::Error::Secrets("vault open timed out (10s) — possible seccomp violation on blocking thread".into()))?
             .map_err(|e| core_types::Error::Secrets(format!("spawn_blocking join error: {e}")))??;
 
             let jit = JitDelivery::new(store, self.ttl);
@@ -335,6 +342,15 @@ async fn main() -> anyhow::Result<()> {
     // -- Process hardening --
     #[cfg(target_os = "linux")]
     platform_linux::security::harden_process();
+
+    #[cfg(target_os = "linux")]
+    platform_linux::security::apply_resource_limits(&platform_linux::security::ResourceLimits {
+        nofile: 1024,
+        memlock_bytes: 64 * 1024 * 1024, // 64M
+    });
+
+    // -- Directory bootstrap --
+    core_config::bootstrap_dirs();
 
     // -- Config --
     let mut config = core_config::load_config(None).context("failed to load config")?;
@@ -708,19 +724,26 @@ async fn handle_message(
                 let vault_key =
                     core_crypto::derive_vault_key(secure_master_key.as_bytes(), &target);
                 let vp = vault_path;
-                match tokio::task::spawn_blocking(move || SqlCipherStore::open(&vp, &vault_key))
-                    .await
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || SqlCipherStore::open(&vp, &vault_key)),
+                )
+                .await
                 {
-                    Ok(Ok(store)) => {
+                    Ok(Ok(Ok(store))) => {
                         tracing::info!(profile = %target, ssh_fingerprint = %ssh_fingerprint, "vault key verified via SSH");
                         (true, Some(store))
                     }
-                    Ok(Err(e)) => {
+                    Ok(Ok(Err(e))) => {
                         tracing::warn!(error = %e, profile = %target, "SSH unlock vault key verification failed");
                         (false, None)
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!(error = %e, profile = %target, "SSH unlock spawn_blocking failed");
+                        (false, None)
+                    }
+                    Err(_) => {
+                        tracing::error!(profile = %target, "SSH unlock vault open timed out (10s) — possible seccomp violation");
                         (false, None)
                     }
                 }
@@ -1779,9 +1802,13 @@ async fn unlock_profile(
     let verified_store = if vault_path.exists() {
         let vault_key = core_crypto::derive_vault_key(master_key.as_bytes(), profile);
         let vp = vault_path;
-        let result = tokio::task::spawn_blocking(move || SqlCipherStore::open(&vp, &vault_key))
-            .await
-            .map_err(|e| core_types::Error::Secrets(format!("spawn_blocking: {e}")))?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || SqlCipherStore::open(&vp, &vault_key)),
+        )
+        .await
+        .map_err(|_| core_types::Error::Secrets("vault open timed out (10s) — possible seccomp violation on blocking thread".into()))?
+        .map_err(|e| core_types::Error::Secrets(format!("spawn_blocking: {e}")))?;
 
         match result {
             Ok(store) => {
@@ -1906,9 +1933,13 @@ fn apply_sandbox() {
             "unlink".into(),
             "fcntl".into(),
             "flock".into(),
+            "pwrite64".into(),
+            "ftruncate".into(),
+            "fallocate".into(),
             "fdatasync".into(),
             "mkdir".into(),
             "getdents64".into(),
+            "rename".into(),
             // Memory (secrets needs mlock/munlock/madvise for zeroization)
             "mmap".into(),
             "mprotect".into(),

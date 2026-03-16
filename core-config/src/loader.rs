@@ -199,6 +199,34 @@ pub fn resolve_config_real_dirs(profile_name: Option<&str>) -> Vec<PathBuf> {
     real_dirs.into_iter().collect()
 }
 
+/// Bootstrap required directories for PDS daemons.
+///
+/// Creates the config dir, runtime dir, and cache dir if they don't exist.
+/// This makes directory creation application-owned rather than solely relying
+/// on systemd tmpfiles.d or other init-system-specific mechanisms.
+///
+/// Should be called early in daemon startup, before config loading.
+pub fn bootstrap_dirs() {
+    let config = config_dir();
+    let cache = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.cache"))
+        .join("open-sesame");
+
+    for dir in [&config, &cache] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(path = %dir.display(), error = %e, "failed to create directory");
+        }
+    }
+
+    // Runtime dir (%t/pds) — only on Linux where XDG_RUNTIME_DIR is set.
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        let pds_runtime = PathBuf::from(runtime).join("pds");
+        if let Err(e) = std::fs::create_dir_all(&pds_runtime) {
+            tracing::warn!(path = %pds_runtime.display(), error = %e, "failed to create runtime directory");
+        }
+    }
+}
+
 /// Path to the installation identity file.
 #[must_use]
 pub fn installation_path() -> PathBuf {
