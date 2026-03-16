@@ -599,7 +599,7 @@ for dist in $DISTS; do
       if [[ -f "$deb" ]]; then
         DEB_NAME=$(basename "$deb")
 
-        dpkg-deb --info "$deb" | grep -E "^ (Package|Version|Architecture|Maintainer|Description|Section|Priority|Homepage):" | sed 's/^ //' >> "$PACKAGES_FILE"
+        dpkg-deb -f "$deb" >> "$PACKAGES_FILE"
 
         SIZE=$(stat -c%s "$deb")
         SHA256=$(sha256sum "$deb" | cut -d' ' -f1)

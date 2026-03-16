@@ -5,14 +5,14 @@
 # No jumping between sections to configure one app - everything in one place.
 #
 # Config locations (XDG inheritance, later overrides earlier):
-#   /etc/open-sesame/config.toml         # System defaults
-#   ~/.config/open-sesame/config.toml    # User config
-#   ~/.config/open-sesame/config.d/*.toml # Overrides (alphabetical)
+#   /etc/pds/config.toml                 # System defaults
+#   ~/.config/pds/config.toml            # User config
+#   ~/.config/pds/config.d/*.toml        # Overrides (alphabetical)
 #
 # Commands:
 #   sesame              # Launch interactive switcher
-#   sesame --list       # Show windows with assigned hints
-#   sesame --view       # Output composed config as TOML
+#   sesame wm list      # Show windows with assigned hints
+#   sesame status       # Show daemon and config status
 #   sesame --help       # Full usage info
 
 # =============================================================================
@@ -56,7 +56,7 @@ border_color = "#b4a0ffb4"
 # Multiple windows of the same app use repeated keys: g, gg, ggg
 # You can also type g1, g2, g3 as alternative input
 #
-# Find your app_ids: sesame --list
+# Find your app_ids: sesame wm list
 
 # --- Terminals ---
 
@@ -171,7 +171,7 @@ launch = "spotify"
 # =============================================================================
 #
 # 1. Find your app_id:
-#    sesame --list
+#    sesame wm list
 #
 # 2. Add a new section:
 #    [keys.x]
@@ -179,4 +179,4 @@ launch = "spotify"
 #    launch = "your-app-command"
 #
 # 3. Verify:
-#    sesame --view
+#    sesame status

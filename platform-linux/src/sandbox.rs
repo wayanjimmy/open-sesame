@@ -173,11 +173,7 @@ pub struct SeccompProfile {
 pub fn apply_seccomp(profile: &SeccompProfile) -> core_types::Result<()> {
     use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 
-    // SECCOMP-AUDIT: Log mode until allowlists are complete.
-    // To resolve: rebuild with Log, run all daemons, collect violations
-    // from `dmesg | grep seccomp`, add missing syscalls to each daemon's
-    // SeccompProfile.allowed_syscalls, then change back to KillProcess.
-    let default_action = ScmpAction::Log;
+    let default_action = ScmpAction::KillProcess;
     let mut filter = ScmpFilterContext::new(default_action)
         .map_err(|e| core_types::Error::Platform(format!("seccomp new_filter failed: {e}")))?;
 

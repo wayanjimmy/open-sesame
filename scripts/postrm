@@ -5,8 +5,8 @@ set -e
 case "$1" in
     remove|purge)
         echo "open-sesame removed."
-        echo "User configuration remains at ~/.config/open-sesame/"
-        echo "To remove: rm -rf ~/.config/open-sesame/"
+        echo "User configuration remains at ~/.config/pds/"
+        echo "To remove: rm -rf ~/.config/pds/"
         #DEBHELPER#
         ;;
 esac
