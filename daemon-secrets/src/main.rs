@@ -1945,6 +1945,7 @@ fn apply_sandbox() {
             "pwrite64".into(),
             "ftruncate".into(),
             "fallocate".into(),
+            "fsync".into(),
             "fdatasync".into(),
             "mkdir".into(),
             "getdents64".into(),

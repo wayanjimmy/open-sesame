@@ -332,6 +332,7 @@ fn apply_sandbox() {
             "flock".into(),
             "mkdir".into(),
             "getdents64".into(),
+            "fsync".into(),
             "fdatasync".into(),
             "ioctl".into(),
             // Memory
