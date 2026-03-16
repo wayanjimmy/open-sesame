@@ -248,6 +248,18 @@ async fn init_services() -> anyhow::Result<()> {
         }
     }
 
+    // Ensure runtime directory exists before starting services.
+    // systemd's mount namespace (ProtectSystem=strict + ReadWritePaths=%t/pds)
+    // requires the directory to exist on the host filesystem BEFORE the service
+    // starts. tmpfiles.d creates it at login, but after a wipe or first boot
+    // it may not exist yet.
+    core_config::bootstrap_dirs();
+
+    // Also run tmpfiles to create any other dirs we declared.
+    let _ = std::process::Command::new("systemd-tmpfiles")
+        .args(["--user", "--create"])
+        .status();
+
     // daemon-reload to pick up any new/changed unit files.
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
