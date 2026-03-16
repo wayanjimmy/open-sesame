@@ -197,6 +197,7 @@
                 NoNewPrivileges = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
+                RuntimeDirectory = "pds";
                 ReadWritePaths = [ "%t/pds" "%h/.config/pds" ];
                 LimitNOFILE = 4096;
                 MemoryMax = "128M";
@@ -230,6 +231,7 @@
                 PrivateNetwork = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
+                RuntimeDirectory = "pds";
                 ReadWritePaths = [ "%t/pds" "%h/.config/pds" ];
                 LimitNOFILE = 1024;
                 LimitMEMLOCK = "64M";
@@ -260,6 +262,7 @@
                 NoNewPrivileges = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
+                RuntimeDirectory = "pds";
                 ReadWritePaths = [ "%t/pds" "%h/.config/pds" ];
                 LimitNOFILE = 4096;
                 MemoryMax = "128M";
@@ -289,6 +292,7 @@
                 NoNewPrivileges = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
+                RuntimeDirectory = "pds";
                 ReadWritePaths = [ "%t/pds" "%h/.cache/open-sesame" ];
                 LimitNOFILE = 4096;
                 MemoryMax = "128M";
@@ -320,6 +324,7 @@
                 NoNewPrivileges = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
+                RuntimeDirectory = "pds";
                 ReadWritePaths = [ "%t/pds" ];
                 LimitNOFILE = 4096;
                 MemoryMax = "128M";
@@ -350,6 +355,7 @@
                 NoNewPrivileges = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
+                RuntimeDirectory = "pds";
                 ReadWritePaths = [ "%t/pds" ];
                 LimitNOFILE = 4096;
                 MemoryMax = "128M";
@@ -379,6 +385,7 @@
                 NoNewPrivileges = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
+                RuntimeDirectory = "pds";
                 ReadWritePaths = [ "%t/pds" ];
                 LimitNOFILE = 4096;
                 MemoryMax = "128M";
