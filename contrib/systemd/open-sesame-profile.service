@@ -9,15 +9,15 @@ Type=notify
 ExecStart=/usr/bin/daemon-profile
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=5
 WatchdogSec=30
 NoNewPrivileges=yes
 
 # Security hardening
-PrivateNetwork=no
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=%t/open-sesame
-ReadWritePaths=%h/.config/open-sesame
+ReadWritePaths=%t/pds
+ReadWritePaths=%h/.config/pds
 
 # Resource limits
 LimitNOFILE=4096
@@ -25,6 +25,7 @@ MemoryMax=128M
 
 # Environment
 Environment=RUST_LOG=info
+EnvironmentFile=-%h/.config/pds/ssh-agent.env
 
 [Install]
 WantedBy=open-sesame.target

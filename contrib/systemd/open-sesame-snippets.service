@@ -6,17 +6,18 @@ After=open-sesame-profile.service
 PartOf=open-sesame.target
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/daemon-snippets
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=5
+WatchdogSec=30
 NoNewPrivileges=yes
 
 # Security hardening
-PrivateNetwork=no
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=%t/open-sesame
+ReadWritePaths=%t/pds
 
 # Resource limits
 LimitNOFILE=4096
