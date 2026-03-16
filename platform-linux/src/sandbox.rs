@@ -152,6 +152,85 @@ pub fn apply_landlock(
     }
 }
 
+/// Install a SIGSYS signal handler that logs the blocked syscall number.
+///
+/// When seccomp uses `KillThread` (SECCOMP_RET_KILL_THREAD), the kernel
+/// sends SIGSYS to the offending thread with `si_syscall` set to the
+/// syscall number. This handler writes the number to stderr before the
+/// thread dies, giving operators visibility into which syscall to add.
+#[allow(unsafe_code)]
+fn install_sigsys_handler() {
+    /// SIGSYS handler: async-signal-safe only, no allocator.
+    ///
+    /// Extracts the syscall number from `siginfo_t._sifields._sigsys.si_syscall`
+    /// on Linux x86_64. The `si_syscall` field is at byte offset 16 within
+    /// the `si_fields` union (offset 0x18 from siginfo_t base on glibc/musl).
+    #[allow(unsafe_code)]
+    extern "C" fn handler(
+        _sig: libc::c_int,
+        info: *mut libc::siginfo_t,
+        _ctx: *mut libc::c_void,
+    ) {
+        // SAFETY: signal handler context — only async-signal-safe calls.
+        #[allow(unsafe_code)]
+        let syscall_nr = unsafe {
+            if info.is_null() {
+                -1_i32
+            } else {
+                // On Linux x86_64, si_syscall is at offset 8 within si_value
+                // area of siginfo_t. The portable way: cast to bytes and read
+                // at the known ABI offset. glibc/musl both place si_syscall
+                // at siginfo_t byte offset 0x10 (16) into the union area,
+                // which starts at field offset 0x10 from the struct base.
+                // Total offset from struct base: 0x20 (32 bytes) on x86_64.
+                let base = info.cast::<u8>();
+                // si_syscall offset: confirmed by `offsetof(siginfo_t, _sifields._sigsys._syscall)`
+                // = 16 (union start) + 8 (after si_call_addr pointer) = 24 from union start
+                // = 0x10 (si_fields offset) + 0x18 = 0x28 = 40 bytes from struct start.
+                // But actually on glibc x86_64: fields before union are 16 bytes
+                // (si_signo:4 + si_errno:4 + si_code:4 + padding:4), union starts at 16.
+                // Inside _sigsys: si_call_addr(ptr, 8 bytes) + si_syscall(int, 4 bytes).
+                // So si_syscall is at 16 + 8 = 24 bytes from struct start.
+                base.add(24).cast::<libc::c_int>().read_unaligned()
+            }
+        };
+
+        // Format: "SECCOMP VIOLATION: syscall=NNN\n"
+        let mut buf = *b"SECCOMP VIOLATION: syscall=          \n";
+        let mut n = syscall_nr as u64;
+        let mut pos = buf.len() - 2; // before the newline
+        if n == 0 {
+            buf[pos] = b'0';
+        } else {
+            while n > 0 {
+                buf[pos] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if pos == 0 {
+                    break;
+                }
+                pos -= 1;
+            }
+        }
+        let start = pos;
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = libc::write(2, buf[..27].as_ptr().cast(), 27);
+            let _ = libc::write(2, buf[start..].as_ptr().cast(), buf.len() - start);
+            libc::signal(libc::SIGSYS, libc::SIG_DFL);
+            libc::raise(libc::SIGSYS);
+        }
+    }
+
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut());
+    }
+}
+
 /// Predefined seccomp-bpf profile for a daemon.
 ///
 /// Each daemon declares its required syscall set. The profile is translated
@@ -173,7 +252,13 @@ pub struct SeccompProfile {
 pub fn apply_seccomp(profile: &SeccompProfile) -> core_types::Result<()> {
     use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 
-    let default_action = ScmpAction::KillProcess;
+    // Install a SIGSYS handler that logs the offending syscall number before
+    // the process terminates. KillThread (SECCOMP_RET_KILL_THREAD) sends
+    // SIGSYS to the violating thread, allowing the handler to fire.
+    // KillProcess would skip the handler entirely.
+    install_sigsys_handler();
+
+    let default_action = ScmpAction::KillThread;
     let mut filter = ScmpFilterContext::new(default_action)
         .map_err(|e| core_types::Error::Platform(format!("seccomp new_filter failed: {e}")))?;
 
