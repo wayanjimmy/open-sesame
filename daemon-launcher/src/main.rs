@@ -327,6 +327,7 @@ fn apply_sandbox() {
             "newfstatat".into(),
             "statx".into(),
             "access".into(),
+            "readlink".into(),
             "fcntl".into(),
             "flock".into(),
             "mkdir".into(),

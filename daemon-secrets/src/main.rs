@@ -145,7 +145,12 @@ impl VaultState {
                 }),
             )
             .await
-            .map_err(|_| core_types::Error::Secrets("vault open timed out (10s) — possible seccomp violation on blocking thread".into()))?
+            .map_err(|_| {
+                core_types::Error::Secrets(
+                    "vault open timed out (10s) — possible seccomp violation on blocking thread"
+                        .into(),
+                )
+            })?
             .map_err(|e| core_types::Error::Secrets(format!("spawn_blocking join error: {e}")))??;
 
             let jit = JitDelivery::new(store, self.ttl);
@@ -1807,7 +1812,11 @@ async fn unlock_profile(
             tokio::task::spawn_blocking(move || SqlCipherStore::open(&vp, &vault_key)),
         )
         .await
-        .map_err(|_| core_types::Error::Secrets("vault open timed out (10s) — possible seccomp violation on blocking thread".into()))?
+        .map_err(|_| {
+            core_types::Error::Secrets(
+                "vault open timed out (10s) — possible seccomp violation on blocking thread".into(),
+            )
+        })?
         .map_err(|e| core_types::Error::Secrets(format!("spawn_blocking: {e}")))?;
 
         match result {
