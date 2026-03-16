@@ -6,7 +6,7 @@ PartOf=open-sesame.target
 
 [Service]
 Type=notify
-ExecStart=%h/.cargo/bin/daemon-profile
+ExecStart=/usr/bin/daemon-profile
 Restart=on-failure
 RestartSec=5
 WatchdogSec=30

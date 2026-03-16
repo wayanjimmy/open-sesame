@@ -7,7 +7,7 @@ PartOf=open-sesame.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/daemon-clipboard
+ExecStart=/usr/bin/daemon-clipboard
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes

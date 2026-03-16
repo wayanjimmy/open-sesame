@@ -41,7 +41,7 @@ dir_cfg = ".config/open-sesame"
 dir_cache = ".cache/open-sesame"
 arch_amd64 = "x86_64-unknown-linux-gnu"
 arch_arm64 = "aarch64-unknown-linux-gnu"
-apt_deps = "liblzma-dev libxkbcommon-dev libfontconfig1-dev pkg-config"
+apt_deps = "pkg-config libgtk-4-dev libglib2.0-dev libcairo2-dev libpango1.0-dev libpangocairo-1.0-dev libgraphene-1.0-dev libgdk-pixbuf-2.0-dev libgtk4-layer-shell-dev libwayland-dev libxkbcommon-dev libseccomp-dev libfontconfig1-dev gettext"
 
 [env]
 RUST_BACKTRACE = "1"
@@ -90,12 +90,12 @@ run = "cross build --release --target ${TARGET}"
 
 [tasks."cargo:deb"]
 hide = true
-run = "cargo deb --no-build"
+run = "cargo deb -p open-sesame --no-build"
 
 [tasks."cargo:deb:arm64"]
 hide = true
 env.TARGET = "{{vars.arch_arm64}}"
-run = "cargo deb --no-build --target ${TARGET}"
+run = "cargo deb -p open-sesame --no-build --target ${TARGET}"
 
 [tasks."cargo:clean"]
 hide = true
@@ -152,7 +152,7 @@ mise run test
 mise run cargo:build
 mise run docs:man
 mise run docs:completions
-mise run cargo:deb
+cargo deb -p open-sesame --no-build
 """
 
 [tasks."build:deb:debug"]
@@ -496,7 +496,7 @@ mise run ci:setup
 cargo build --release --target ${TARGET}
 mise run docs:man
 mise run docs:completions
-cargo deb --no-build --target ${TARGET}
+cargo deb -p open-sesame --no-build --target ${TARGET}
 """
 
 [tasks."ci:build:deb:arm64"]
@@ -509,7 +509,7 @@ mise run ci:setup
 cargo build --release --target ${TARGET}
 mise run docs:man
 mise run docs:completions
-cargo deb --no-build --target ${TARGET}
+cargo deb -p open-sesame --no-build --target ${TARGET}
 """
 
 [tasks."ci:docs:all"]

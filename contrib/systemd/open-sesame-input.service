@@ -7,7 +7,7 @@ PartOf=open-sesame.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/daemon-input
+ExecStart=/usr/bin/daemon-input
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes

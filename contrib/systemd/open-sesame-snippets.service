@@ -7,7 +7,7 @@ PartOf=open-sesame.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/daemon-snippets
+ExecStart=/usr/bin/daemon-snippets
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes

@@ -7,7 +7,7 @@ PartOf=open-sesame.target
 
 [Service]
 Type=notify
-ExecStart=%h/.cargo/bin/daemon-wm
+ExecStart=/usr/bin/daemon-wm
 Restart=on-failure
 RestartSec=5
 WatchdogSec=30
