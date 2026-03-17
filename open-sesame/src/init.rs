@@ -511,56 +511,65 @@ async fn init_vault(
             "Vault metadata written (auth policy: {policy_label})"
         ));
 
-        // Unlock: prefer SSH if available and Any mode (faster than Argon2id),
-        // otherwise send master key directly.
-        if has_ssh && matches!(combine_mode, core_types::AuthCombineMode::Any) {
-            // Original master_key no longer needed — SSH unlock recovers it
-            // from the enrolled blob. Drop early to minimize key residence time.
+        // Compute the unlock key that daemon-secrets will use for this vault.
+        // In All mode, daemon-secrets combines factor pieces via BLAKE3 derive_key,
+        // so we must create the vault with that same derived key.
+        let unlock_key = if matches!(combine_mode, core_types::AuthCombineMode::All) {
+            // Replicate daemon-secrets All-mode combination:
+            // sort factor pieces by AuthFactorId, concatenate, BLAKE3 derive_key.
+            let mut pieces: Vec<(core_types::AuthFactorId, &[u8])> = Vec::new();
+            if has_password {
+                pieces.push((core_types::AuthFactorId::Password, master_key.as_bytes()));
+            }
+            if ssh_fingerprint.is_some() {
+                pieces.push((core_types::AuthFactorId::SshAgent, master_key.as_bytes()));
+            }
+            pieces.sort_by_key(|(id, _)| *id);
+            let mut combined = Vec::new();
+            for (_id, piece) in &pieces {
+                combined.extend_from_slice(piece);
+            }
+            let ctx_str = format!("pds v2 combined-master-key {profile}");
+            let derived: [u8; 32] = blake3::derive_key(&ctx_str, &combined);
+            combined.zeroize();
+            drop(master_key);
+            core_crypto::SecureBytes::new(derived.to_vec())
+        } else if has_ssh {
+            // Any mode with SSH: unlock via SSH to verify the enrollment round-trips.
+            // Drop raw master_key early — SSH unlock recovers it from the enrolled blob.
             drop(master_key);
             let unlock_backend = core_auth::SshAgentBackend::new();
             let outcome =
                 core_auth::VaultAuthBackend::unlock(&unlock_backend, &profile, &config_dir, &salt)
                     .await
                     .map_err(|e| anyhow::anyhow!("SSH unlock failed: {e}"))?;
-
-            let fp = outcome
-                .audit_metadata
-                .get("ssh_fingerprint")
-                .cloned()
-                .unwrap_or_default();
-            let event = EventKind::SshUnlockRequest {
-                master_key: SensitiveBytes::new(outcome.master_key.into_vec()),
-                profile: profile.clone(),
-                ssh_fingerprint: fp,
-            };
-            match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-                EventKind::UnlockResponse { success: true, .. } => {
-                    step_done("Vault unlocked via SSH key");
-                }
-                other => anyhow::bail!("unexpected unlock response: {other:?}"),
-            }
+            step_done("SSH enrollment verified");
+            outcome.master_key
         } else {
-            // Send master key directly (works for any init mode).
-            let event = EventKind::SshUnlockRequest {
-                master_key: SensitiveBytes::new(master_key.into_vec()),
-                profile: profile.clone(),
-                ssh_fingerprint: "direct-init".to_string(),
-            };
-            match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-                EventKind::UnlockResponse { success: true, .. } => {
-                    step_done("Secrets vault unlocked");
-                }
-                EventKind::UnlockResponse { success: false, .. } => {
-                    anyhow::bail!("unlock failed — key rejected by daemon-secrets");
-                }
-                EventKind::UnlockRejected {
-                    reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
-                    ..
-                } => {
-                    step_skip("Secrets already unlocked");
-                }
-                other => anyhow::bail!("unexpected response: {other:?}"),
+            // Password-only or Any mode without SSH: use raw master key.
+            master_key
+        };
+
+        // Send unlock key to daemon-secrets to create/open the vault.
+        let event = EventKind::SshUnlockRequest {
+            master_key: SensitiveBytes::new(unlock_key.into_vec()),
+            profile: profile.clone(),
+            ssh_fingerprint: "direct-init".to_string(),
+        };
+        match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
+            EventKind::UnlockResponse { success: true, .. } => {
+                step_done("Secrets vault unlocked");
             }
+            EventKind::UnlockResponse { success: false, .. } => {
+                anyhow::bail!("unlock failed — key rejected by daemon-secrets");
+            }
+            EventKind::UnlockRejected {
+                reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
+                ..
+            } => {
+                step_skip("Secrets already unlocked");
+            }
+            other => anyhow::bail!("unexpected response: {other:?}"),
         }
     }
 
