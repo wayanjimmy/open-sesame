@@ -64,6 +64,12 @@ enum Command {
         /// Without --key, this is the default behavior.
         #[arg(long)]
         password: bool,
+
+        /// Auth policy for multi-factor vaults: "any" (either factor unlocks),
+        /// "all" (every factor required), or policy expression.
+        /// Default: "any" for dual-factor, ignored for single-factor.
+        #[arg(long, default_value = "any")]
+        auth_policy: String,
     },
 
     /// Show daemon status, active profiles, and lock state.
@@ -634,11 +640,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             org,
             key,
             password,
+            auth_policy,
         } => {
             if wipe_reset_destroy_all_data {
                 init::cmd_wipe()
             } else {
-                init::cmd_init(no_keybinding, org, key, password).await
+                init::cmd_init(no_keybinding, org, key, password, auth_policy).await
             }
         }
         Command::Status => cmd_status().await,
@@ -967,7 +974,8 @@ fn parse_profile_specs(input: &str) -> Vec<ProfileSpec> {
 fn resolve_profile_specs(cli_arg: Option<&str>) -> Vec<ProfileSpec> {
     let input = match cli_arg {
         Some(p) => p.to_string(),
-        None => std::env::var("SESAME_PROFILES").unwrap_or_else(|_| "default".into()),
+        None => std::env::var("SESAME_PROFILES")
+            .unwrap_or_else(|_| core_types::DEFAULT_PROFILE_NAME.into()),
     };
     parse_profile_specs(&input)
 }
@@ -3349,7 +3357,7 @@ async fn cmd_workspace(cmd: WorkspaceCmd) -> anyhow::Result<()> {
             let profile_csv = profile
                 .or(effective.profile)
                 .or_else(|| std::env::var("SESAME_PROFILES").ok())
-                .unwrap_or_else(|| "default".into());
+                .unwrap_or_else(|| core_types::DEFAULT_PROFILE_NAME.into());
 
             let specs = parse_profile_specs(&profile_csv);
             let secret_prefix = prefix.or(effective.secret_prefix);

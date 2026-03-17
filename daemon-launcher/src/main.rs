@@ -21,7 +21,7 @@ mod scanner;
 #[command(name = "daemon-launcher")]
 struct Cli {
     /// Profile to scope the launcher to.
-    #[arg(long, default_value = "default")]
+    #[arg(long, default_value = core_types::DEFAULT_PROFILE_NAME)]
     profile: String,
 }
 
@@ -494,7 +494,7 @@ async fn launch_entry(
     }
 
     // Resolve launch profiles from config (passed from hot-reload watcher)
-    let default_profile = profile.unwrap_or("default");
+    let default_profile = profile.unwrap_or(core_types::DEFAULT_PROFILE_NAME);
     let config = config_state
         .read()
         .unwrap_or_else(|e| e.into_inner())

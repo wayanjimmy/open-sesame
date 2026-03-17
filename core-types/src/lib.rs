@@ -14,6 +14,25 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 // ============================================================================
+// Shared constants — single source of truth for cross-crate values
+// ============================================================================
+
+/// Level-0 namespace seed for deterministic profile-ID derivation.
+///
+/// Used as the root UUID v5 namespace from which installation namespaces,
+/// org namespaces, and ultimately `ProfileId` values are derived.
+/// **Never use directly for `ProfileId` derivation** — derive an `install_ns` first.
+pub const PROFILE_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x4c, 0x45, 0xa6, 0x4f, 0xab, 0xcd, 0x59, 0x77, 0xbc, 0x73, 0x99, 0xd4, 0xc9, 0x3d, 0x66, 0x8b,
+]);
+
+/// Canonical name for the default profile created during `sesame init`.
+///
+/// All crates that need to reference the default profile should use this constant
+/// rather than hardcoding `"default"` to prevent silent divergence.
+pub const DEFAULT_PROFILE_NAME: &str = "default";
+
+// ============================================================================
 // SensitiveBytes — zeroize-on-drop wrapper for secret byte fields
 // ============================================================================
 
@@ -3058,10 +3077,7 @@ mod tests {
 
     #[test]
     fn namespace_derivation_determinism() {
-        let ns1 = uuid::Uuid::from_bytes([
-            0x4c, 0x45, 0xa6, 0x4f, 0xab, 0xcd, 0x59, 0x77, 0xbc, 0x73, 0x99, 0xd4, 0xc9, 0x3d,
-            0x66, 0x8b,
-        ]);
+        let ns1 = PROFILE_NAMESPACE;
         let ns2 = uuid::Uuid::from_bytes([0xaa; 16]);
 
         // Same namespace + same name = same ID across 100 iterations

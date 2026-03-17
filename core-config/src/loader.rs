@@ -152,7 +152,7 @@ fn merge_profile(base: &mut crate::schema::ProfileConfig, overlay: &crate::schem
 /// Helpers for detecting default values.
 struct GlobalConfigDefaults;
 impl GlobalConfigDefaults {
-    const DEFAULT_PROFILE: &str = "default";
+    const DEFAULT_PROFILE: &str = core_types::DEFAULT_PROFILE_NAME;
 }
 
 /// Resolve all config file symlinks to their real filesystem paths.

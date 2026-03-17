@@ -38,6 +38,17 @@ fn step_skip(msg: &str) {
     println!("        {msg} ... {}", "(already done)".dimmed());
 }
 
+fn parse_auth_policy(s: &str) -> anyhow::Result<core_types::AuthCombineMode> {
+    match s.to_lowercase().as_str() {
+        "any" => Ok(core_types::AuthCombineMode::Any),
+        "all" => Ok(core_types::AuthCombineMode::All),
+        _ => anyhow::bail!(
+            "unknown auth policy '{s}'. Valid values: \"any\" (either factor unlocks), \
+             \"all\" (every enrolled factor required)"
+        ),
+    }
+}
+
 // ============================================================================
 // sesame init
 // ============================================================================
@@ -47,6 +58,7 @@ pub async fn cmd_init(
     org: Option<String>,
     key: Option<String>,
     password: bool,
+    auth_policy: String,
 ) -> anyhow::Result<()> {
     let do_keybinding = keybinding_applicable(no_keybinding);
     let total_steps: u32 = if do_keybinding { 5 } else { 4 };
@@ -66,20 +78,9 @@ pub async fn cmd_init(
     init_services().await?;
 
     // Step 4: Vault initialization
-    match (&key, password) {
-        (Some(fingerprint), false) => {
-            step_header(4, total_steps, "SSH-Key-Only Vault");
-            init_ssh_only(fingerprint).await?;
-        }
-        (Some(fingerprint), true) => {
-            step_header(4, total_steps, "Dual-Factor Vault (SSH + Password)");
-            init_dual_factor(fingerprint).await?;
-        }
-        _ => {
-            step_header(4, total_steps, "Master Password");
-            init_unlock().await?;
-        }
-    }
+    let combine_mode = parse_auth_policy(&auth_policy)?;
+    step_header(4, total_steps, "Vault");
+    init_vault(key.as_deref(), password, combine_mode).await?;
 
     // Step 5: Keybinding (conditional)
     if do_keybinding {
@@ -114,9 +115,10 @@ fn init_config() -> anyhow::Result<()> {
     std::fs::create_dir_all(&config_dir).context("failed to create config directory")?;
 
     let mut config = core_config::Config::default();
-    config
-        .profiles
-        .insert("default".into(), core_config::ProfileConfig::default());
+    config.profiles.insert(
+        core_types::DEFAULT_PROFILE_NAME.into(),
+        core_config::ProfileConfig::default(),
+    );
 
     let toml_str = toml::to_string_pretty(&config).context("failed to serialize default config")?;
     core_config::atomic_write(&config_path, toml_str.as_bytes())
@@ -141,10 +143,7 @@ fn init_installation(org: Option<&str>) -> anyhow::Result<()> {
     let id = uuid::Uuid::new_v4();
 
     // Deterministic namespace for profile IDs — matches daemon-profile.
-    let profile_ns = uuid::Uuid::from_bytes([
-        0x4c, 0x45, 0xa6, 0x4f, 0xab, 0xcd, 0x59, 0x77, 0xbc, 0x73, 0x99, 0xd4, 0xc9, 0x3d, 0x66,
-        0x8b,
-    ]);
+    let profile_ns = core_types::PROFILE_NAMESPACE;
 
     let (install_ns, org_config) = if let Some(domain) = org {
         let org_ns = uuid::Uuid::new_v5(&profile_ns, format!("org:{domain}").as_bytes());
@@ -190,6 +189,12 @@ fn init_installation(org: Option<&str>) -> anyhow::Result<()> {
             .append(true)
             .open(&audit_path)
             .context("failed to open audit log for installation event")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o600))
+                .context("failed to set audit file permissions")?;
+        }
         let audit_writer = std::io::BufWriter::new(audit_file);
 
         let (last_hash, sequence) = if audit_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
@@ -215,13 +220,24 @@ fn init_installation(org: Option<&str>) -> anyhow::Result<()> {
             core_types::AuditHash::Blake3,
             None,
         );
+        let audit_org_ns = org.map(|domain| core_types::OrganizationNamespace {
+            domain: domain.to_string(),
+            namespace: uuid::Uuid::new_v5(&profile_ns, format!("org:{domain}").as_bytes()),
+        });
+        let audit_machine_binding = machine_binding.as_ref().and_then(|mb| {
+            let hash = blake3::Hash::from_hex(&mb.binding_hash).ok()?;
+            Some(core_types::MachineBinding {
+                binding_hash: *hash.as_bytes(),
+                binding_type: core_types::MachineBindingType::MachineId,
+            })
+        });
         audit
             .append(core_profile::AuditAction::InstallationCreated {
                 id: core_types::InstallationId {
                     id,
-                    org_ns: None,
+                    org_ns: audit_org_ns,
                     namespace: install_ns,
-                    machine_binding: None,
+                    machine_binding: audit_machine_binding,
                 },
                 org: org.map(|s| s.to_string()),
                 machine_binding_present: machine_binding.is_some(),
@@ -266,10 +282,6 @@ async fn init_services() -> anyhow::Result<()> {
     }
 
     // Ensure runtime directory exists before starting services.
-    // systemd's mount namespace (ProtectSystem=strict + ReadWritePaths=%t/pds)
-    // requires the directory to exist on the host filesystem BEFORE the service
-    // starts. tmpfiles.d creates it at login, but after a wipe or first boot
-    // it may not exist yet.
     core_config::bootstrap_dirs();
 
     // Also run tmpfiles to create any other dirs we declared.
@@ -282,9 +294,7 @@ async fn init_services() -> anyhow::Result<()> {
         .args(["--user", "daemon-reload"])
         .status();
 
-    // Reset any failed units from prior crash-loops (e.g. daemon-profile
-    // crashed before config dir existed). Without this, `start` is a no-op
-    // on failed units and the daemon never retries.
+    // Reset any failed units from prior crash-loops.
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "reset-failed", "open-sesame.target"])
         .status();
@@ -337,12 +347,22 @@ async fn init_services() -> anyhow::Result<()> {
     }
 }
 
-// ── Step 3: Unlock + activate ───────────────────────────────────────────────
+// ── Step 4: Vault initialization (unified) ──────────────────────────────────
 
-async fn init_unlock() -> anyhow::Result<()> {
+async fn init_vault(
+    ssh_fingerprint: Option<&str>,
+    use_password: bool,
+    combine_mode: core_types::AuthCombineMode,
+) -> anyhow::Result<()> {
     let config_dir = core_config::config_dir();
-    let profile = TrustProfileName::try_from("default").expect("hardcoded valid name");
+    let profile =
+        TrustProfileName::try_from(core_types::DEFAULT_PROFILE_NAME).expect("hardcoded valid name");
     let client = crate::connect().await?;
+
+    // Determine which factors to enroll.
+    // Default: password-only if no --key provided.
+    let has_password = use_password || ssh_fingerprint.is_none();
+    let has_ssh = ssh_fingerprint.is_some();
 
     // Check current state.
     let already_unlocked = matches!(
@@ -353,40 +373,6 @@ async fn init_unlock() -> anyhow::Result<()> {
     if already_unlocked {
         step_skip("Secrets already unlocked");
     } else {
-        println!("        This password encrypts your secrets vault.");
-        println!("        Choose something strong — you'll need it to unlock after reboot.");
-        println!();
-
-        let mut password_str = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            dialoguer::Password::new()
-                .with_prompt("        Master password")
-                .with_confirmation(
-                    "        Confirm",
-                    "        Passwords don't match, try again",
-                )
-                .interact()
-                .context("failed to read password")?
-        } else {
-            let mut buf = String::new();
-            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
-                .context("failed to read password from stdin")?;
-            if buf.ends_with('\n') {
-                buf.pop();
-                if buf.ends_with('\r') {
-                    buf.pop();
-                }
-            }
-            if buf.is_empty() {
-                anyhow::bail!(
-                    "empty password from stdin — refusing to create vault with no password"
-                );
-            }
-            buf
-        };
-
-        let mut password_bytes = password_str.as_bytes().to_vec();
-        password_str.zeroize();
-
         // Generate random master key.
         let mut master_key_bytes = [0u8; 32];
         getrandom::getrandom(&mut master_key_bytes)
@@ -399,9 +385,15 @@ async fn init_unlock() -> anyhow::Result<()> {
         getrandom::getrandom(&mut salt)
             .map_err(|e| anyhow::anyhow!("failed to generate salt: {e}"))?;
         let salt_path = config_dir.join("vaults").join(format!("{profile}.salt"));
-        std::fs::create_dir_all(config_dir.join("vaults"))
-            .context("failed to create vaults dir")?;
-        std::fs::write(&salt_path, salt).context("failed to write salt")?;
+        let vaults_dir = config_dir.join("vaults");
+        std::fs::create_dir_all(&vaults_dir).context("failed to create vaults dir")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&vaults_dir, std::fs::Permissions::from_mode(0o700))
+                .context("failed to set vaults directory permissions")?;
+        }
+        core_config::atomic_write(&salt_path, &salt).context("failed to write salt")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -409,151 +401,167 @@ async fn init_unlock() -> anyhow::Result<()> {
                 .context("failed to set salt file permissions")?;
         }
 
-        // Create password-wrap blob (Argon2id KEK wrapping random master key).
-        let mut password_sv = core_crypto::SecureVec::new();
-        let mut password_str_validated = String::from_utf8(password_bytes.clone())
-            .map_err(|_| anyhow::anyhow!("password contains invalid UTF-8"))?;
-        for ch in password_str_validated.chars() {
-            password_sv.push_char(ch);
+        // Track enrolled factors for metadata.
+        let mut enrolled_factors = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Enroll password factor.
+        if has_password {
+            if has_ssh {
+                println!("        Password is one of the enrolled factors.");
+            } else {
+                println!("        This password encrypts your secrets vault.");
+                println!(
+                    "        Choose something strong — you'll need it to unlock after reboot."
+                );
+            }
+            println!();
+
+            let mut password_str = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                dialoguer::Password::new()
+                    .with_prompt("        Master password")
+                    .with_confirmation(
+                        "        Confirm",
+                        "        Passwords don't match, try again",
+                    )
+                    .interact()
+                    .context("failed to read password")?
+            } else {
+                let mut buf = String::new();
+                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+                    .context("failed to read password from stdin")?;
+                if buf.ends_with('\n') {
+                    buf.pop();
+                    if buf.ends_with('\r') {
+                        buf.pop();
+                    }
+                }
+                if buf.is_empty() {
+                    anyhow::bail!(
+                        "empty password from stdin — refusing to create vault with no password"
+                    );
+                }
+                buf
+            };
+
+            let mut password_sv = core_crypto::SecureVec::new();
+            for ch in password_str.chars() {
+                password_sv.push_char(ch);
+            }
+            password_str.zeroize();
+
+            let pw_backend = core_auth::PasswordBackend::new().with_password(password_sv);
+            core_auth::VaultAuthBackend::enroll(
+                &pw_backend,
+                &profile,
+                &master_key,
+                &config_dir,
+                &salt,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("password enrollment failed: {e}"))?;
+
+            enrolled_factors.push(core_auth::EnrolledFactor {
+                factor_id: core_types::AuthFactorId::Password,
+                label: "master password".into(),
+                enrolled_at: now,
+            });
+            step_done("Password factor enrolled");
         }
-        password_str_validated.zeroize();
-        password_bytes.zeroize();
-        let pw_backend = core_auth::PasswordBackend::new().with_password(password_sv);
-        core_auth::VaultAuthBackend::enroll(
-            &pw_backend,
-            &profile,
-            &master_key,
-            &config_dir,
-            &salt,
-            None,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("password enrollment failed: {e}"))?;
+
+        // Enroll SSH factor.
+        if let Some(fingerprint) = ssh_fingerprint {
+            let key_index = crate::find_ssh_key_index(fingerprint).await?;
+            let ssh_backend = core_auth::SshAgentBackend::new();
+            core_auth::VaultAuthBackend::enroll(
+                &ssh_backend,
+                &profile,
+                &master_key,
+                &config_dir,
+                &salt,
+                Some(key_index),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("SSH enrollment failed: {e}"))?;
+
+            enrolled_factors.push(core_auth::EnrolledFactor {
+                factor_id: core_types::AuthFactorId::SshAgent,
+                label: fingerprint.to_string(),
+                enrolled_at: now,
+            });
+            step_done(&format!("SSH factor enrolled ({})", fingerprint));
+        }
 
         // Write vault metadata.
-        let meta = core_auth::VaultMetadata::new_password(core_types::AuthCombineMode::Any);
+        let meta =
+            core_auth::VaultMetadata::new_multi_factor(enrolled_factors, combine_mode.clone());
         meta.save(&config_dir, &profile)
             .map_err(|e| anyhow::anyhow!("failed to write vault metadata: {e}"))?;
 
-        // Send master key directly to daemon-secrets via SshUnlockRequest
-        // (which accepts pre-derived master keys regardless of source).
-        let event = EventKind::SshUnlockRequest {
-            master_key: SensitiveBytes::new(master_key.into_vec()),
-            profile: profile.clone(),
-            ssh_fingerprint: String::new(),
+        let policy_label = match &combine_mode {
+            core_types::AuthCombineMode::Any => "any",
+            core_types::AuthCombineMode::All => "all",
+            core_types::AuthCombineMode::Policy(_) => "policy",
         };
+        step_done(&format!(
+            "Vault metadata written (auth policy: {policy_label})"
+        ));
 
-        match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-            EventKind::UnlockResponse { success: true, .. } => {
-                step_done("Secrets vault unlocked");
+        // Unlock: prefer SSH if available and Any mode (faster than Argon2id),
+        // otherwise send master key directly.
+        if has_ssh && matches!(combine_mode, core_types::AuthCombineMode::Any) {
+            // Original master_key no longer needed — SSH unlock recovers it
+            // from the enrolled blob. Drop early to minimize key residence time.
+            drop(master_key);
+            let unlock_backend = core_auth::SshAgentBackend::new();
+            let outcome =
+                core_auth::VaultAuthBackend::unlock(&unlock_backend, &profile, &config_dir, &salt)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("SSH unlock failed: {e}"))?;
+
+            let fp = outcome
+                .audit_metadata
+                .get("ssh_fingerprint")
+                .cloned()
+                .unwrap_or_default();
+            let event = EventKind::SshUnlockRequest {
+                master_key: SensitiveBytes::new(outcome.master_key.into_vec()),
+                profile: profile.clone(),
+                ssh_fingerprint: fp,
+            };
+            match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
+                EventKind::UnlockResponse { success: true, .. } => {
+                    step_done("Vault unlocked via SSH key");
+                }
+                other => anyhow::bail!("unexpected unlock response: {other:?}"),
             }
-            EventKind::UnlockResponse { success: false, .. } => {
-                anyhow::bail!("unlock failed — key rejected by daemon-secrets");
+        } else {
+            // Send master key directly (works for any init mode).
+            let event = EventKind::SshUnlockRequest {
+                master_key: SensitiveBytes::new(master_key.into_vec()),
+                profile: profile.clone(),
+                ssh_fingerprint: "direct-init".to_string(),
+            };
+            match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
+                EventKind::UnlockResponse { success: true, .. } => {
+                    step_done("Secrets vault unlocked");
+                }
+                EventKind::UnlockResponse { success: false, .. } => {
+                    anyhow::bail!("unlock failed — key rejected by daemon-secrets");
+                }
+                EventKind::UnlockRejected {
+                    reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
+                    ..
+                } => {
+                    step_skip("Secrets already unlocked");
+                }
+                other => anyhow::bail!("unexpected response: {other:?}"),
             }
-            EventKind::UnlockRejected {
-                reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
-                ..
-            } => {
-                step_skip("Secrets already unlocked");
-            }
-            other => anyhow::bail!("unexpected response: {other:?}"),
         }
-    }
-
-    // Activate default profile.
-    let event = EventKind::ProfileActivate {
-        target: ProfileId::new(),
-        profile_name: profile,
-    };
-
-    match crate::rpc(&client, event, SecurityLevel::Internal).await? {
-        EventKind::ProfileActivateResponse { success: true } => {
-            step_done("Default profile activated");
-        }
-        EventKind::ProfileActivateResponse { success: false } => {
-            println!("        Default profile: {}", "(already active)".dimmed());
-        }
-        other => anyhow::bail!("unexpected response: {other:?}"),
-    }
-
-    Ok(())
-}
-
-// ── Step 3b: SSH-key-only init ──────────────────────────────────────────────
-
-async fn init_ssh_only(fingerprint: &str) -> anyhow::Result<()> {
-    let config_dir = core_config::config_dir();
-    let profile = TrustProfileName::try_from("default").expect("hardcoded valid name");
-
-    // Generate random master key.
-    let mut master_key_bytes = [0u8; 32];
-    getrandom::getrandom(&mut master_key_bytes)
-        .map_err(|e| anyhow::anyhow!("failed to generate random master key: {e}"))?;
-    let master_key = core_crypto::SecureBytes::new(master_key_bytes.to_vec());
-    master_key_bytes.zeroize();
-
-    // Generate salt.
-    let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt).map_err(|e| anyhow::anyhow!("failed to generate salt: {e}"))?;
-    let salt_path = config_dir.join("vaults").join(format!("{profile}.salt"));
-    std::fs::create_dir_all(config_dir.join("vaults")).context("failed to create vaults dir")?;
-    std::fs::write(&salt_path, salt).context("failed to write salt")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&salt_path, std::fs::Permissions::from_mode(0o600))
-            .context("failed to set salt file permissions")?;
-    }
-
-    // Find the key index matching the fingerprint.
-    let key_index = crate::find_ssh_key_index(fingerprint).await?;
-
-    // Enroll SSH key.
-    let backend = core_auth::SshAgentBackend::new();
-    core_auth::VaultAuthBackend::enroll(
-        &backend,
-        &profile,
-        &master_key,
-        &config_dir,
-        &salt,
-        Some(key_index),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("SSH enrollment failed: {e}"))?;
-
-    // Write vault metadata.
-    let meta =
-        core_auth::VaultMetadata::new_ssh_only(fingerprint, core_types::AuthCombineMode::Any);
-    meta.save(&config_dir, &profile)
-        .map_err(|e| anyhow::anyhow!("failed to write vault metadata: {e}"))?;
-
-    step_done("SSH-key-only vault created (no password)");
-    println!("        SSH key: {}", fingerprint.green());
-
-    // Send SshUnlockRequest to daemon-secrets.
-    let client = crate::connect().await?;
-
-    let unlock_backend = core_auth::SshAgentBackend::new();
-    let outcome =
-        core_auth::VaultAuthBackend::unlock(&unlock_backend, &profile, &config_dir, &salt)
-            .await
-            .map_err(|e| anyhow::anyhow!("SSH unlock failed: {e}"))?;
-
-    let fp = outcome
-        .audit_metadata
-        .get("ssh_fingerprint")
-        .cloned()
-        .unwrap_or_default();
-    let event = EventKind::SshUnlockRequest {
-        master_key: SensitiveBytes::new(outcome.master_key.into_vec()),
-        profile: profile.clone(),
-        ssh_fingerprint: fp,
-    };
-    match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-        EventKind::UnlockResponse { success: true, .. } => {
-            step_done("Vault unlocked via SSH key");
-        }
-        other => anyhow::bail!("unexpected unlock response: {other:?}"),
     }
 
     // Activate default profile.
@@ -574,183 +582,13 @@ async fn init_ssh_only(fingerprint: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Step 3c: Dual-factor init (SSH + Password) ────────────────────────────
-
-async fn init_dual_factor(fingerprint: &str) -> anyhow::Result<()> {
-    let config_dir = core_config::config_dir();
-    let profile = TrustProfileName::try_from("default").expect("hardcoded valid name");
-
-    // Collect password.
-    println!("        This password is one of two factors for your vault.");
-    println!("        The SSH key is the other factor. Either alone can unlock.");
-    println!();
-
-    let mut password_str = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        dialoguer::Password::new()
-            .with_prompt("        Master password")
-            .with_confirmation(
-                "        Confirm",
-                "        Passwords don't match, try again",
-            )
-            .interact()
-            .context("failed to read password")?
-    } else {
-        let mut buf = String::new();
-        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
-            .context("failed to read password from stdin")?;
-        if buf.ends_with('\n') {
-            buf.pop();
-            if buf.ends_with('\r') {
-                buf.pop();
-            }
-        }
-        if buf.is_empty() {
-            anyhow::bail!("empty password from stdin — refusing to create vault with no password");
-        }
-        buf
-    };
-
-    let mut password_bytes = password_str.as_bytes().to_vec();
-    password_str.zeroize();
-
-    // Generate random master key.
-    let mut master_key_bytes = [0u8; 32];
-    getrandom::getrandom(&mut master_key_bytes)
-        .map_err(|e| anyhow::anyhow!("failed to generate random master key: {e}"))?;
-    let master_key = core_crypto::SecureBytes::new(master_key_bytes.to_vec());
-    master_key_bytes.zeroize();
-
-    // Generate salt.
-    let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt).map_err(|e| anyhow::anyhow!("failed to generate salt: {e}"))?;
-    let salt_path = config_dir.join("vaults").join(format!("{profile}.salt"));
-    std::fs::create_dir_all(config_dir.join("vaults")).context("failed to create vaults dir")?;
-    std::fs::write(&salt_path, salt).context("failed to write salt")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&salt_path, std::fs::Permissions::from_mode(0o600))
-            .context("failed to set salt file permissions")?;
-    }
-
-    // Enroll password factor.
-    let mut password_sv = core_crypto::SecureVec::new();
-    let mut password_str_validated = String::from_utf8(password_bytes.clone())
-        .map_err(|_| anyhow::anyhow!("password contains invalid UTF-8"))?;
-    for ch in password_str_validated.chars() {
-        password_sv.push_char(ch);
-    }
-    password_str_validated.zeroize();
-    password_bytes.zeroize();
-    let pw_backend = core_auth::PasswordBackend::new().with_password(password_sv);
-    core_auth::VaultAuthBackend::enroll(
-        &pw_backend,
-        &profile,
-        &master_key,
-        &config_dir,
-        &salt,
-        None,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("password enrollment failed: {e}"))?;
-
-    step_done("Password factor enrolled");
-
-    // Find the key index matching the fingerprint.
-    let key_index = crate::find_ssh_key_index(fingerprint).await?;
-
-    // Enroll SSH factor.
-    let ssh_backend = core_auth::SshAgentBackend::new();
-    core_auth::VaultAuthBackend::enroll(
-        &ssh_backend,
-        &profile,
-        &master_key,
-        &config_dir,
-        &salt,
-        Some(key_index),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("SSH enrollment failed: {e}"))?;
-
-    step_done("SSH factor enrolled");
-    println!("        SSH key: {}", fingerprint.green());
-
-    // Write vault metadata.
-    let factors = vec![
-        core_auth::EnrolledFactor {
-            factor_id: core_types::AuthFactorId::Password,
-            label: "master password".into(),
-            enrolled_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        },
-        core_auth::EnrolledFactor {
-            factor_id: core_types::AuthFactorId::SshAgent,
-            label: fingerprint.to_string(),
-            enrolled_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        },
-    ];
-    let meta =
-        core_auth::VaultMetadata::new_multi_factor(factors, core_types::AuthCombineMode::Any);
-    meta.save(&config_dir, &profile)
-        .map_err(|e| anyhow::anyhow!("failed to write vault metadata: {e}"))?;
-
-    step_done("Vault metadata written (dual-factor, any mode)");
-
-    // Unlock via SSH (faster than re-entering password for Argon2id).
-    let client = crate::connect().await?;
-    let unlock_backend = core_auth::SshAgentBackend::new();
-    let outcome =
-        core_auth::VaultAuthBackend::unlock(&unlock_backend, &profile, &config_dir, &salt)
-            .await
-            .map_err(|e| anyhow::anyhow!("SSH unlock failed: {e}"))?;
-
-    let fp = outcome
-        .audit_metadata
-        .get("ssh_fingerprint")
-        .cloned()
-        .unwrap_or_default();
-    let event = EventKind::SshUnlockRequest {
-        master_key: SensitiveBytes::new(outcome.master_key.into_vec()),
-        profile: profile.clone(),
-        ssh_fingerprint: fp,
-    };
-    match crate::rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-        EventKind::UnlockResponse { success: true, .. } => {
-            step_done("Vault unlocked via SSH key");
-        }
-        other => anyhow::bail!("unexpected unlock response: {other:?}"),
-    }
-
-    // Activate default profile.
-    let event = EventKind::ProfileActivate {
-        target: ProfileId::new(),
-        profile_name: profile,
-    };
-    match crate::rpc(&client, event, SecurityLevel::Internal).await? {
-        EventKind::ProfileActivateResponse { success: true } => {
-            step_done("Default profile activated");
-        }
-        EventKind::ProfileActivateResponse { success: false } => {
-            println!("        Default profile: {}", "(already active)".dimmed());
-        }
-        other => anyhow::bail!("unexpected response: {other:?}"),
-    }
-
-    Ok(())
-}
-
-// ── Step 4: Keybinding ─────────────────────────────────────────────────────
+// ── Step 5: Keybinding ─────────────────────────────────────────────────────
 
 #[cfg(all(target_os = "linux", feature = "desktop"))]
 fn init_keybinding() -> anyhow::Result<()> {
     platform_linux::cosmic_keys::setup_keybinding("alt+space")
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    step_done("Alt+Tab window switching configured");
+    step_done("Alt+Space launcher keybinding configured");
     Ok(())
 }
 
@@ -817,8 +655,41 @@ pub fn cmd_wipe() -> anyhow::Result<()> {
         .status();
     println!("  Stopping daemons ... {}", "done".green());
 
-    // Remove config directory.
+    // Overwrite sensitive files with zeros before unlinking.
+    // This ensures key material and vault data don't linger on disk.
     if config_dir.exists() {
+        let vaults_dir = config_dir.join("vaults");
+        if vaults_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&vaults_dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && let Ok(meta) = path.metadata()
+                {
+                    let len = meta.len() as usize;
+                    if len > 0 {
+                        let zeros = vec![0u8; len];
+                        let _ = std::fs::write(&path, &zeros);
+                    }
+                }
+            }
+        }
+        // Also zeroize salt and audit files at the top level.
+        for name in ["secrets.salt", "audit.jsonl"] {
+            let path = config_dir.join(name);
+            if path.is_file()
+                && let Ok(meta) = path.metadata()
+            {
+                let len = meta.len() as usize;
+                if len > 0 {
+                    let zeros = vec![0u8; len];
+                    let _ = std::fs::write(&path, &zeros);
+                }
+            }
+        }
+        println!("  Zeroizing sensitive files ... {}", "done".green());
+
         std::fs::remove_dir_all(&config_dir).context("failed to remove config directory")?;
         println!("  Removing {} ... {}", config_dir.display(), "done".green());
     }

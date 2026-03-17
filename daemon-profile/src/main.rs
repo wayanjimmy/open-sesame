@@ -47,9 +47,7 @@ const KEY_ROTATION_GRACE: u32 = 30;
 
 /// Level 0 namespace seed. Never use directly for ProfileId derivation — use install_ns instead.
 #[allow(dead_code)]
-const PROFILE_NS: uuid::Uuid = uuid::Uuid::from_bytes([
-    0x4c, 0x45, 0xa6, 0x4f, 0xab, 0xcd, 0x59, 0x77, 0xbc, 0x73, 0x99, 0xd4, 0xc9, 0x3d, 0x66, 0x8b,
-]);
+const PROFILE_NS: uuid::Uuid = core_types::PROFILE_NAMESPACE;
 
 /// Tracks which `DaemonId` is associated with each daemon name.
 /// Detects crash-restarts when a new `DaemonStarted` arrives for an already-registered name.

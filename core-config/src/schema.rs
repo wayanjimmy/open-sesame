@@ -63,8 +63,10 @@ pub struct GlobalConfig {
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
-            default_profile: core_types::TrustProfileName::try_from("default")
-                .expect("hardcoded valid name"),
+            default_profile: core_types::TrustProfileName::try_from(
+                core_types::DEFAULT_PROFILE_NAME,
+            )
+            .expect("hardcoded valid name"),
             ipc: IpcConfig::default(),
             logging: LogConfig::default(),
         }
@@ -148,7 +150,8 @@ pub struct ProfileConfig {
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
-            name: core_types::TrustProfileName::try_from("default").expect("hardcoded valid name"),
+            name: core_types::TrustProfileName::try_from(core_types::DEFAULT_PROFILE_NAME)
+                .expect("hardcoded valid name"),
             extends: None,
             color: None,
             icon: None,
