@@ -34,6 +34,68 @@ gh attestation verify "open-sesame-linux-$(uname -m).deb" --owner ScopeCreep-zip
 
 ---
 
+## [1.4.0](https://github.com/ScopeCreep-zip/open-sesame/compare/v1.3.2...v1.4.0) (2026-03-17)
+
+### ✨ Features
+
+* **auth:** multi-factor vault auth policy engine ([957d113](https://github.com/ScopeCreep-zip/open-sesame/commit/957d1135ecd97731fdddb95c804940a9d6ea17e5))
+* **auth:** multi-factor vault auth policy engine ([b908f80](https://github.com/ScopeCreep-zip/open-sesame/commit/b908f80e23328dfdb4bb785997827ab8e9e5abdf))
+* **cli,auth:** require explicit SSH key selection for enrollment ([4ad176c](https://github.com/ScopeCreep-zip/open-sesame/commit/4ad176c58de7120a39f6f14263a3a49b8ed48bf4))
+* **sandbox:** resolve nix store symlinks for Landlock config access ([aed1a9d](https://github.com/ScopeCreep-zip/open-sesame/commit/aed1a9d265a465354a539456d4d31fd742dbb8f9))
+
+### 🐛 Bug Fixes
+
+* **init:** bootstrap runtime dir before starting systemd services ([17df9c4](https://github.com/ScopeCreep-zip/open-sesame/commit/17df9c4f54a24fd2406857f7fbeea04a4676fa4c))
+* **ipc:** evict stale connection on key rotation reconnect ([b89cfa8](https://github.com/ScopeCreep-zip/open-sesame/commit/b89cfa888cba533ef161eaf4a18ddf833428d50d))
+* **nix:** update outputHashes keys for cosmic-protocols 0.2.0 ([37767f5](https://github.com/ScopeCreep-zip/open-sesame/commit/37767f5e578338c017a5a244209dbe6141d30728))
+* **sandbox:** add NOTIFY_SOCKET Landlock rule to daemon-wm, add sd_notify diagnostics ([f147dc4](https://github.com/ScopeCreep-zip/open-sesame/commit/f147dc40204b733e7ada7153e0f45b7a629f360c))
+* **sandbox:** add SIGSYS handler for seccomp violation visibility ([2a4e84f](https://github.com/ScopeCreep-zip/open-sesame/commit/2a4e84fc6a5b4255ba0f30e1df5bf9bf23775d4d))
+* **sandbox:** complete seccomp allowlists for daemon-wm and daemon-secrets ([3eaf332](https://github.com/ScopeCreep-zip/open-sesame/commit/3eaf33227cc1b8a8bd5cda44b68cd9cfd14005f1))
+* **seccomp:** add fsync to daemon-secrets, launcher, clipboard allowlists ([02803bd](https://github.com/ScopeCreep-zip/open-sesame/commit/02803bd98e1777333695063f1de513e38ebe02db))
+* **seccomp:** add inotify syscalls for config hot-reload, add watchdog visibility ([302d347](https://github.com/ScopeCreep-zip/open-sesame/commit/302d3477de1134348501b0781bc95bf972ff7835))
+* **seccomp:** add readlink to 4 daemon allowlists (strace-verified) ([2a6167a](https://github.com/ScopeCreep-zip/open-sesame/commit/2a6167a98a84e59cd143e66cfb87547db3b7f720))
+* **secrets:** add missing SQLite WAL syscalls, application-owned bootstrap ([6bad5ca](https://github.com/ScopeCreep-zip/open-sesame/commit/6bad5ca02aaeb5a3c76c352f2a6e28cc70f046a5))
+* **systemd:** add missing ReadWritePaths for clipboard cache and fontconfig ([43baa4a](https://github.com/ScopeCreep-zip/open-sesame/commit/43baa4aae2f19eff8033caeb400c7e97adc22004))
+* **systemd:** add RuntimeDirectory=pds to all units for mount namespace bootstrap ([7ba4869](https://github.com/ScopeCreep-zip/open-sesame/commit/7ba4869d7c94769c2db2c35901786f3ebcafe854))
+* **systemd:** align all units — Type=notify, watchdog, hardening, correct paths ([a3d9d10](https://github.com/ScopeCreep-zip/open-sesame/commit/a3d9d104bc45f53db50d92ede547705855d34314))
+* **systemd:** use tmpfiles.d for runtime dir, drop broken RuntimeDirectory ([080ff4d](https://github.com/ScopeCreep-zip/open-sesame/commit/080ff4d6bc0c878b41321ed0ffa94ba5a96a40dd))
+
+## Quick Install
+
+### APT Repository (recommended)
+
+```bash
+curl -fsSL https://scopecreep-zip.github.io/open-sesame/gpg.key \
+  | sudo gpg --dearmor -o /usr/share/keyrings/open-sesame.gpg
+echo "deb [signed-by=/usr/share/keyrings/open-sesame.gpg] https://scopecreep-zip.github.io/open-sesame noble main" \
+  | sudo tee /etc/apt/sources.list.d/open-sesame.list
+sudo apt update && sudo apt install -y open-sesame
+sesame --setup-keybinding
+```
+
+### Direct Download
+
+See release assets below for `.deb` packages (amd64/arm64) with SHA256 checksums.
+
+## What You Get
+
+- **Alt+Space** - Window switcher overlay with Vimium-style letter hints
+- **Alt+Tab** - Quick-switch to previous window
+
+## Documentation
+
+- **[User Guide](https://scopecreep-zip.github.io/open-sesame/book/)** - Configuration, keybindings, theming
+- **[API Docs](https://scopecreep-zip.github.io/open-sesame/doc/open_sesame/)** - Library reference
+
+## Supply Chain Security
+
+All `.deb` packages include [SLSA Build Provenance](https://slsa.dev/) attestations. Verify with:
+```bash
+gh attestation verify "open-sesame-linux-$(uname -m).deb" --owner ScopeCreep-zip
+```
+
+---
+
 ## [1.3.2](https://github.com/ScopeCreep-zip/open-sesame/compare/v1.3.1...v1.3.2) (2026-03-16)
 
 ### 🐛 Bug Fixes
