@@ -14,8 +14,11 @@ use anyhow::Context;
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use comfy_table::{Table, presets::UTF8_FULL};
+use core_auth::VaultAuthBackend as _;
 use core_ipc::BusClient;
-use core_types::{DaemonId, EventKind, ProfileId, SecurityLevel, SensitiveBytes, TrustProfileName};
+use core_types::{
+    AuthFactorId, DaemonId, EventKind, ProfileId, SecurityLevel, SensitiveBytes, TrustProfileName,
+};
 use owo_colors::OwoColorize;
 use std::time::Duration;
 use zeroize::Zeroize;
@@ -50,6 +53,17 @@ enum Command {
         /// Organization domain for namespace scoping (e.g., "braincraft.io").
         #[arg(long)]
         org: Option<String>,
+
+        /// SSH key fingerprint for SSH-key-only or dual-factor init (e.g., "SHA256:...").
+        /// When provided without --password, creates an SSH-key-only vault with no password.
+        /// When provided with --password, creates a dual-factor vault.
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Use password authentication. Required with --key for dual-factor init.
+        /// Without --key, this is the default behavior.
+        #[arg(long)]
+        password: bool,
     },
 
     /// Show daemon status, active profiles, and lock state.
@@ -618,11 +632,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             no_keybinding,
             wipe_reset_destroy_all_data,
             org,
+            key,
+            password,
         } => {
             if wipe_reset_destroy_all_data {
                 init::cmd_wipe()
             } else {
-                init::cmd_init(no_keybinding, org).await
+                init::cmd_init(no_keybinding, org, key, password).await
             }
         }
         Command::Status => cmd_status().await,
@@ -636,7 +652,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             ProfileCmd::Show { name } => cmd_profile_show(&name),
         },
         Command::Ssh(sub) => match sub {
-            SshCmd::Enroll { profile, key_fingerprint } => cmd_ssh_enroll(profile, key_fingerprint).await,
+            SshCmd::Enroll {
+                profile,
+                key_fingerprint,
+            } => cmd_ssh_enroll(profile, key_fingerprint).await,
             SshCmd::List { profile } => cmd_ssh_list(profile).await,
             SshCmd::Revoke { profile } => cmd_ssh_revoke(profile).await,
         },
@@ -717,6 +736,60 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 // ============================================================================
 // IPC connection helper
 // ============================================================================
+
+/// Find the index of an SSH key by fingerprint in the agent's eligible key list.
+pub(crate) async fn find_ssh_key_index(fingerprint: &str) -> anyhow::Result<usize> {
+    let sock_path =
+        std::env::var("SSH_AUTH_SOCK").context("SSH_AUTH_SOCK not set — is ssh-agent running?")?;
+    let mut agent = ssh_agent_client_rs::Client::connect(std::path::Path::new(&sock_path))
+        .context("failed to connect to SSH agent")?;
+    let identities = agent
+        .list_all_identities()
+        .context("failed to list SSH agent keys")?;
+
+    let eligible: Vec<_> = identities
+        .into_iter()
+        .filter(|id| {
+            let algo = match id {
+                ssh_agent_client_rs::Identity::PublicKey(cow) => cow.algorithm(),
+                ssh_agent_client_rs::Identity::Certificate(cow) => cow.algorithm(),
+            };
+            core_auth::SshKeyType::from_algorithm(&algo).is_ok()
+        })
+        .collect();
+
+    if eligible.is_empty() {
+        anyhow::bail!(
+            "no eligible SSH keys found in agent.\n\
+             Only Ed25519 and RSA keys are supported (ECDSA uses non-deterministic signatures).\n\
+             Add a key with: ssh-add ~/.ssh/id_ed25519"
+        );
+    }
+
+    let fp_normalized = fingerprint.strip_prefix("SHA256:").unwrap_or(fingerprint);
+
+    eligible
+        .iter()
+        .position(|id| {
+            let id_fp = match id {
+                ssh_agent_client_rs::Identity::PublicKey(cow) => {
+                    cow.fingerprint(ssh_key::HashAlg::Sha256).to_string()
+                }
+                ssh_agent_client_rs::Identity::Certificate(cow) => cow
+                    .public_key()
+                    .fingerprint(ssh_key::HashAlg::Sha256)
+                    .to_string(),
+            };
+            let id_fp_bare = id_fp.strip_prefix("SHA256:").unwrap_or(&id_fp);
+            id_fp_bare == fp_normalized
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "SSH key with fingerprint '{fingerprint}' not found in agent.\n\
+                 Use `ssh-add -l` to list loaded keys."
+            )
+        })
+}
 
 pub(crate) async fn connect() -> anyhow::Result<BusClient> {
     let socket_path = core_ipc::socket_path().context("failed to resolve IPC socket path")?;
@@ -922,6 +995,168 @@ async fn fetch_multi_profile_secrets(
     Ok(merged)
 }
 
+/// Submit a single factor via `FactorSubmit` IPC and handle the response.
+///
+/// Returns `Ok(true)` if the vault is now fully unlocked, `Ok(false)` if more
+/// factors are still needed (partial unlock accepted), or an error on rejection.
+async fn submit_factor(
+    client: &BusClient,
+    factor_id: AuthFactorId,
+    outcome: core_auth::UnlockOutcome,
+    profile: &TrustProfileName,
+) -> anyhow::Result<bool> {
+    let event = EventKind::FactorSubmit {
+        factor_id,
+        key_material: SensitiveBytes::new(outcome.master_key.into_vec()),
+        profile: profile.clone(),
+        audit_metadata: outcome.audit_metadata,
+    };
+
+    match rpc(client, event, SecurityLevel::SecretsOnly).await? {
+        EventKind::FactorResponse {
+            accepted: true,
+            unlock_complete: true,
+            profile: p,
+            ..
+        } => {
+            println!(
+                "{}",
+                format!("Vault '{p}' unlocked via {factor_id}.").green()
+            );
+            Ok(true)
+        }
+        EventKind::FactorResponse {
+            accepted: true,
+            unlock_complete: false,
+            remaining_factors,
+            remaining_additional,
+            ..
+        } => {
+            let remaining_names: Vec<String> =
+                remaining_factors.iter().map(|f| f.to_string()).collect();
+            tracing::debug!(
+                remaining = ?remaining_names,
+                additional = remaining_additional,
+                "factor accepted, more required"
+            );
+            Ok(false)
+        }
+        EventKind::FactorResponse {
+            accepted: false,
+            error,
+            ..
+        } => {
+            let msg = error.unwrap_or_else(|| "unknown error".into());
+            anyhow::bail!("factor {factor_id} rejected: {msg}");
+        }
+        EventKind::UnlockRejected {
+            reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
+            profile: p,
+        } => {
+            println!(
+                "{}",
+                format!(
+                    "Vault '{}' already unlocked.",
+                    p.as_ref().map_or("unknown", |v| v.as_ref())
+                )
+                .yellow()
+            );
+            Ok(true)
+        }
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Try to submit a non-interactive factor (SSH agent).
+/// Returns `Ok(Some(true))` if vault is unlocked, `Ok(Some(false))` if partial,
+/// `Ok(None)` if factor was not attempted, or `Err` on hard failure.
+async fn try_auto_factor(
+    client: &BusClient,
+    factor_id: AuthFactorId,
+    meta: &core_auth::VaultMetadata,
+    profile: &TrustProfileName,
+    config_dir: &std::path::Path,
+    salt: &[u8],
+) -> anyhow::Result<Option<bool>> {
+    if !meta.has_factor(factor_id) {
+        return Ok(None);
+    }
+
+    match factor_id {
+        AuthFactorId::SshAgent => {
+            let backend = core_auth::SshAgentBackend::new();
+            if !backend.can_unlock(profile, config_dir).await {
+                return Ok(None);
+            }
+            match core_auth::VaultAuthBackend::unlock(&backend, profile, config_dir, salt).await {
+                Ok(outcome) => match submit_factor(client, factor_id, outcome, profile).await {
+                    Ok(complete) => Ok(Some(complete)),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "SSH factor rejected");
+                        Ok(None)
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(error = %e, "SSH auto-unlock failed");
+                    Ok(None)
+                }
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Prompt for password and submit as a factor.
+/// Returns `Ok(true)` if vault is unlocked, `Ok(false)` if partial.
+async fn prompt_password_factor(
+    client: &BusClient,
+    profile: &TrustProfileName,
+    profile_name: &str,
+    config_dir: &std::path::Path,
+    salt: &[u8],
+) -> anyhow::Result<bool> {
+    let mut password = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        dialoguer::Password::new()
+            .with_prompt(format!("Password for vault '{profile_name}'"))
+            .interact()
+            .context("failed to read password")?
+    } else {
+        let mut buf = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+            .context("failed to read password from stdin")?;
+        if buf.ends_with('\n') {
+            buf.pop();
+            if buf.ends_with('\r') {
+                buf.pop();
+            }
+        }
+        if buf.is_empty() {
+            anyhow::bail!(
+                "empty password from stdin for vault '{profile_name}' — refusing to unlock"
+            );
+        }
+        buf
+    };
+
+    let mut password_sv = core_crypto::SecureVec::new();
+    for ch in password.chars() {
+        password_sv.push_char(ch);
+    }
+    password.zeroize();
+
+    let pw_backend = core_auth::PasswordBackend::new().with_password(password_sv);
+    let outcome = core_auth::VaultAuthBackend::unlock(&pw_backend, profile, config_dir, salt)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "password unlock failed for vault '{profile_name}': {e}\n\
+                 Check your password or re-initialize the vault."
+            )
+        })?;
+
+    submit_factor(client, AuthFactorId::Password, outcome, profile).await
+}
+
 async fn cmd_unlock(profile_arg: Option<String>) -> anyhow::Result<()> {
     let client = connect().await?;
 
@@ -933,145 +1168,133 @@ async fn cmd_unlock(profile_arg: Option<String>) -> anyhow::Result<()> {
         let target_profile = TrustProfileName::try_from(profile_name.as_str())
             .map_err(|e| anyhow::anyhow!("invalid profile name '{profile_name}': {e}"))?;
 
-        // Try SSH-agent auto-unlock first
         let salt_path = config_dir
             .join("vaults")
             .join(format!("{target_profile}.salt"));
-        if let Ok(salt) = std::fs::read(&salt_path) {
-            let dispatcher = core_auth::AuthDispatcher::new();
-            if let Some(backend) = dispatcher
-                .find_auto_backend(&target_profile, &config_dir)
-                .await
+        let salt = std::fs::read(&salt_path)
+            .context("failed to read vault salt — is the vault initialized?")?;
+
+        let meta = core_auth::VaultMetadata::load(&config_dir, &target_profile)
+            .context("failed to load vault metadata — is the vault initialized?")?;
+
+        // Collect enrolled factor IDs for iteration.
+        let enrolled: Vec<AuthFactorId> =
+            meta.enrolled_factors.iter().map(|f| f.factor_id).collect();
+
+        // Phase 1: Submit all non-interactive factors (SSH agent).
+        let mut unlocked = false;
+        for &factor in &enrolled {
+            if unlocked {
+                break;
+            }
+            match try_auto_factor(&client, factor, &meta, &target_profile, &config_dir, &salt)
+                .await?
             {
-                match backend.unlock(&target_profile, &config_dir, &salt).await {
-                    Ok(outcome) => {
-                        let fp = outcome
-                            .audit_metadata
-                            .get("ssh_fingerprint")
-                            .cloned()
-                            .unwrap_or_default();
-                        // Transfer master key bytes without creating an
-                        // unprotected intermediate copy. into_vec() moves
-                        // the backing allocation directly into SensitiveBytes.
-                        let event = EventKind::SshUnlockRequest {
-                            master_key: SensitiveBytes::new(outcome.master_key.into_vec()),
-                            profile: target_profile.clone(),
-                            ssh_fingerprint: fp,
-                        };
-                        match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-                            EventKind::UnlockResponse {
-                                success: true,
-                                profile,
-                            } => {
-                                println!(
-                                    "{}",
-                                    format!("Vault '{profile}' unlocked via SSH agent.").green()
-                                );
-                                continue;
-                            }
-                            EventKind::UnlockRejected {
-                                reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
-                                profile,
-                            } => {
-                                println!(
-                                    "{}",
-                                    format!(
-                                        "Vault '{}' already unlocked.",
-                                        profile.as_ref().map_or("unknown", |p| p.as_ref())
-                                    )
-                                    .yellow()
-                                );
-                                continue;
-                            }
-                            EventKind::UnlockResponse { success: false, .. } => {
-                                tracing::debug!(
-                                    "SSH unlock rejected by daemon-secrets, falling back to password"
-                                );
-                            }
-                            _ => {
-                                tracing::debug!(
-                                    "unexpected SSH unlock response, falling back to password"
-                                );
-                            }
+                Some(true) => {
+                    unlocked = true;
+                }
+                Some(false) => {
+                    tracing::debug!(
+                        factor = %factor,
+                        "auto factor accepted, more factors needed"
+                    );
+                }
+                None => {}
+            }
+        }
+
+        if unlocked {
+            continue;
+        }
+
+        // Phase 2: Query daemon for remaining factors.
+        let remaining = match rpc(
+            &client,
+            EventKind::VaultAuthQuery {
+                profile: target_profile.clone(),
+            },
+            SecurityLevel::SecretsOnly,
+        )
+        .await?
+        {
+            EventKind::VaultAuthQueryResponse {
+                enrolled_factors: ef,
+                partial_in_progress,
+                received_factors,
+                ..
+            } => {
+                if partial_in_progress {
+                    // Filter out already-received factors.
+                    ef.iter()
+                        .filter(|f| !received_factors.contains(f))
+                        .copied()
+                        .collect::<Vec<_>>()
+                } else {
+                    ef
+                }
+            }
+            _ => enrolled.clone(),
+        };
+
+        // Phase 3: Submit interactive factors.
+        for &factor in &remaining {
+            if unlocked {
+                break;
+            }
+            match factor {
+                AuthFactorId::Password => {
+                    if !meta.has_factor(AuthFactorId::Password) {
+                        continue;
+                    }
+                    match prompt_password_factor(
+                        &client,
+                        &target_profile,
+                        profile_name,
+                        &config_dir,
+                        &salt,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            unlocked = true;
+                        }
+                        Ok(false) => {
+                            tracing::debug!("password factor accepted, more factors needed");
+                        }
+                        Err(e) => {
+                            anyhow::bail!(
+                                "password unlock failed for vault '{profile_name}': {e}\n\
+                                 Check your password or re-initialize the vault."
+                            );
                         }
                     }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "SSH auto-unlock failed, falling back to password");
-                    }
+                }
+                other => {
+                    // Future factors (FIDO2, TPM, etc.) are not yet implemented.
+                    anyhow::bail!(
+                        "vault '{profile_name}' requires factor '{other}' which is not \
+                         yet supported in this CLI version.\n\
+                         Enrolled factors: {enrolled:?}"
+                    );
                 }
             }
         }
 
-        // Fall through to password prompt
-        let mut password = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            dialoguer::Password::new()
-                .with_prompt(format!("Password for vault '{profile_name}'"))
-                .interact()
-                .context("failed to read password")?
-        } else {
-            let mut buf = String::new();
-            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
-                .context("failed to read password from stdin")?;
-            if buf.ends_with('\n') {
-                buf.pop();
-                if buf.ends_with('\r') {
-                    buf.pop();
-                }
-            }
-            if buf.is_empty() {
-                anyhow::bail!(
-                    "empty password from stdin for vault '{profile_name}' — refusing to unlock with no password"
-                );
-            }
-            buf
-        };
-
-        let mut password_bytes = password.as_bytes().to_vec();
-        password.zeroize();
-
-        let event = EventKind::UnlockRequest {
-            password: SensitiveBytes::new(std::mem::take(&mut password_bytes)),
-            profile: Some(target_profile),
-        };
-        password_bytes.zeroize();
-
-        match rpc(&client, event, SecurityLevel::SecretsOnly).await? {
-            EventKind::UnlockResponse {
-                success: true,
-                profile,
-            } => {
-                println!("{}", format!("Vault '{}' unlocked.", profile).green());
-            }
-            EventKind::UnlockResponse {
-                success: false,
-                profile,
-            } => {
-                anyhow::bail!(
-                    "unlock failed for vault '{}' — wrong password or keyring error",
-                    profile
-                );
-            }
-            EventKind::UnlockRejected {
-                reason: core_types::UnlockRejectedReason::AlreadyUnlocked,
-                profile,
-            } => {
-                println!(
-                    "{}",
-                    format!(
-                        "Vault '{}' already unlocked.",
-                        profile.as_ref().map_or("unknown", |p| p.as_ref())
-                    )
-                    .yellow()
-                );
-            }
-            other => anyhow::bail!("unexpected response: {other:?}"),
+        if !unlocked {
+            anyhow::bail!(
+                "failed to unlock vault '{profile_name}' — all available factors exhausted.\n\
+                 Ensure your SSH key is loaded (ssh-add -l) or check your vault auth policy."
+            );
         }
     }
 
     Ok(())
 }
 
-async fn cmd_ssh_enroll(profile_arg: Option<String>, key_fingerprint: Option<String>) -> anyhow::Result<()> {
+async fn cmd_ssh_enroll(
+    profile_arg: Option<String>,
+    key_fingerprint: Option<String>,
+) -> anyhow::Result<()> {
     let specs = resolve_profile_specs(profile_arg.as_deref());
     let config_dir = core_config::config_dir();
 
@@ -1171,9 +1394,10 @@ async fn cmd_ssh_enroll(profile_arg: Option<String>, key_fingerprint: Option<Str
                         ssh_agent_client_rs::Identity::PublicKey(cow) => {
                             cow.fingerprint(ssh_key::HashAlg::Sha256).to_string()
                         }
-                        ssh_agent_client_rs::Identity::Certificate(cow) => {
-                            cow.public_key().fingerprint(ssh_key::HashAlg::Sha256).to_string()
-                        }
+                        ssh_agent_client_rs::Identity::Certificate(cow) => cow
+                            .public_key()
+                            .fingerprint(ssh_key::HashAlg::Sha256)
+                            .to_string(),
                     };
                     // Match with or without "SHA256:" prefix.
                     let id_fp_bare = id_fp.strip_prefix("SHA256:").unwrap_or(&id_fp);
@@ -1213,6 +1437,23 @@ async fn cmd_ssh_enroll(profile_arg: Option<String>, key_fingerprint: Option<Str
             Some(selection),
         )
         .await?;
+
+        // Update vault metadata to record the new SSH factor.
+        let fingerprint = match &eligible[selection] {
+            ssh_agent_client_rs::Identity::PublicKey(cow) => {
+                cow.fingerprint(ssh_key::HashAlg::Sha256).to_string()
+            }
+            ssh_agent_client_rs::Identity::Certificate(cow) => cow
+                .public_key()
+                .fingerprint(ssh_key::HashAlg::Sha256)
+                .to_string(),
+        };
+        let mut meta = core_auth::VaultMetadata::load(&config_dir, &target).unwrap_or_else(|_| {
+            core_auth::VaultMetadata::new_password(core_types::AuthCombineMode::Any)
+        });
+        meta.add_factor(core_types::AuthFactorId::SshAgent, fingerprint);
+        meta.save(&config_dir, &target)
+            .context("failed to update vault metadata")?;
 
         println!(
             "{}",

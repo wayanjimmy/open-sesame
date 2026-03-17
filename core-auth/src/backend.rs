@@ -2,7 +2,7 @@
 
 use crate::AuthError;
 use core_crypto::SecureBytes;
-use core_types::TrustProfileName;
+use core_types::{AuthFactorId, TrustProfileName};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -28,6 +28,17 @@ pub enum IpcUnlockStrategy {
     DirectMasterKey,
 }
 
+/// Which piece of the unlock this backend is providing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactorContribution {
+    /// This backend provides a complete master key (unwrapped independently).
+    /// Used in `Any` and `Policy` modes.
+    CompleteMasterKey,
+    /// This backend provides a factor piece for combined derivation.
+    /// Used in `All` mode where the master key is HKDF'd from all pieces.
+    FactorPiece,
+}
+
 /// Result of a successful backend unlock.
 pub struct UnlockOutcome {
     /// The 32-byte master key (for `DirectMasterKey`) or password bytes (for `PasswordUnlock`).
@@ -36,11 +47,16 @@ pub struct UnlockOutcome {
     pub audit_metadata: BTreeMap<String, String>,
     /// Which IPC message type to use.
     pub ipc_strategy: IpcUnlockStrategy,
+    /// Which factor this outcome represents.
+    pub factor_id: AuthFactorId,
 }
 
 /// A pluggable authentication backend for vault unlock.
 #[async_trait::async_trait]
 pub trait VaultAuthBackend: Send + Sync {
+    /// Which auth factor this backend provides.
+    fn factor_id(&self) -> AuthFactorId;
+
     /// Human-readable name for audit logs and overlay display.
     fn name(&self) -> &str;
 

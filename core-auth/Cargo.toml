@@ -20,6 +20,8 @@ async-trait = { workspace = true }
 ssh-key.workspace = true
 ssh-agent-client-rs.workspace = true
 getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true

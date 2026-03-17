@@ -48,7 +48,8 @@ use core_crypto::SecureBytes;
 use core_ipc::{BusClient, Message};
 use core_secrets::{JitDelivery, SecretsStore, SqlCipherStore};
 use core_types::{
-    DaemonId, EventKind, SecretDenialReason, SecurityLevel, SensitiveBytes, TrustProfileName,
+    AuthCombineMode, AuthFactorId, DaemonId, EventKind, SecretDenialReason, SecurityLevel,
+    SensitiveBytes, TrustProfileName,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -73,6 +74,42 @@ struct Cli {
     log_format: String,
 }
 
+/// Timeout for partial multi-factor unlock state (seconds).
+const PARTIAL_UNLOCK_TIMEOUT_SECS: u64 = 120;
+
+/// Interval for sweeping expired partial unlock state (seconds).
+const PARTIAL_UNLOCK_SWEEP_INTERVAL_SECS: u64 = 30;
+
+/// BLAKE3 key derivation context prefix for combining factor pieces in `All` mode.
+/// The full context is `"{ALL_MODE_KDF_CONTEXT} {profile_name}"`.
+const ALL_MODE_KDF_CONTEXT: &str = "pds v2 combined-master-key";
+
+/// Partial unlock state for a profile awaiting additional factors.
+struct PartialUnlock {
+    /// Master key candidates from factors received so far.
+    /// For any/policy mode: each factor independently unwraps to the same master key.
+    /// For all mode: factor pieces collected here, combined when all present.
+    received_factors: HashMap<AuthFactorId, SecureBytes>,
+    /// Which factors are still needed.
+    remaining_required: HashSet<AuthFactorId>,
+    /// How many additional factors are still needed (beyond required).
+    remaining_additional: u32,
+    /// Deadline after which partial state is discarded.
+    deadline: tokio::time::Instant,
+}
+
+impl PartialUnlock {
+    /// Check if the unlock policy is fully satisfied.
+    fn is_complete(&self) -> bool {
+        self.remaining_required.is_empty() && self.remaining_additional == 0
+    }
+
+    /// Check if the deadline has passed.
+    fn is_expired(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline
+    }
+}
+
 /// Runtime state for the secrets daemon.
 ///
 /// Always present after daemon init (as an empty container). Individual profiles
@@ -89,6 +126,8 @@ struct VaultState {
     /// Distinct from `vaults.keys()`: a profile may be authorized before its vault
     /// is lazily opened, or a vault may be open while deactivation is in progress.
     active_profiles: HashSet<TrustProfileName>,
+    /// In-progress multi-factor unlocks. At most one per profile.
+    partial_unlocks: HashMap<TrustProfileName, PartialUnlock>,
     /// JIT TTL from CLI.
     ttl: Duration,
     /// Config directory for vault DB storage.
@@ -438,14 +477,31 @@ async fn main() -> anyhow::Result<()> {
         master_keys: HashMap::new(),
         vaults: HashMap::new(),
         active_profiles: HashSet::new(),
+        partial_unlocks: HashMap::new(),
         ttl: Duration::from_secs(cli.ttl),
         config_dir: config_dir.clone(),
     };
     let mut rate_limiter = SecretRateLimiter::new();
 
     let mut watchdog_count: u64 = 0;
+    let mut partial_sweep =
+        tokio::time::interval(Duration::from_secs(PARTIAL_UNLOCK_SWEEP_INTERVAL_SECS));
+    partial_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = partial_sweep.tick() => {
+                let now = tokio::time::Instant::now();
+                let expired: Vec<TrustProfileName> = vault_state
+                    .partial_unlocks
+                    .iter()
+                    .filter(|(_, p)| now >= p.deadline)
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                for name in &expired {
+                    vault_state.partial_unlocks.remove(name);
+                    tracing::info!(profile = %name, "expired partial unlock state removed");
+                }
+            }
             _ = watchdog.tick() => {
                 watchdog_count += 1;
                 if watchdog_count <= 3 || watchdog_count.is_multiple_of(20) {
@@ -781,6 +837,300 @@ async fn handle_message(
             })
         }
 
+        // -- Multi-factor: submit a single factor --
+        EventKind::FactorSubmit {
+            factor_id,
+            key_material,
+            profile,
+            audit_metadata,
+        } => {
+            let target = profile.clone();
+
+            if ctx.vault_state.master_keys.contains_key(&target) {
+                return send_response(
+                    ctx.client,
+                    msg,
+                    EventKind::FactorResponse {
+                        accepted: false,
+                        unlock_complete: false,
+                        remaining_factors: vec![],
+                        remaining_additional: 0,
+                        profile: target,
+                        error: Some("already unlocked".into()),
+                    },
+                    ctx.daemon_id,
+                )
+                .await;
+            }
+
+            // Load vault metadata.
+            let meta = match core_auth::VaultMetadata::load(&ctx.vault_state.config_dir, &target) {
+                Ok(m) => m,
+                Err(e) => {
+                    return send_response(
+                        ctx.client,
+                        msg,
+                        EventKind::FactorResponse {
+                            accepted: false,
+                            unlock_complete: false,
+                            remaining_factors: vec![],
+                            remaining_additional: 0,
+                            profile: target,
+                            error: Some(format!("vault metadata error: {e}")),
+                        },
+                        ctx.daemon_id,
+                    )
+                    .await;
+                }
+            };
+
+            // Verify factor is enrolled.
+            if !meta.has_factor(*factor_id) {
+                return send_response(
+                    ctx.client,
+                    msg,
+                    EventKind::FactorResponse {
+                        accepted: false,
+                        unlock_complete: false,
+                        remaining_factors: vec![],
+                        remaining_additional: 0,
+                        profile: target,
+                        error: Some(format!("factor {factor_id} not enrolled")),
+                    },
+                    ctx.daemon_id,
+                )
+                .await;
+            }
+
+            // Convert SensitiveBytes to SecureBytes (copy into mlock'd memory).
+            let secure_key = SecureBytes::new(key_material.as_bytes().to_vec());
+
+            // For any/policy mode: verify the key against the vault DB.
+            let vault_path = ctx
+                .vault_state
+                .config_dir
+                .join("vaults")
+                .join(format!("{target}.db"));
+            if vault_path.exists()
+                && meta.contribution_type() == core_auth::FactorContribution::CompleteMasterKey
+            {
+                let vault_key = core_crypto::derive_vault_key(secure_key.as_bytes(), &target);
+                let vp = vault_path;
+                let verify_ok = matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        tokio::task::spawn_blocking(move || SqlCipherStore::open(&vp, &vault_key)),
+                    )
+                    .await,
+                    Ok(Ok(Ok(_store)))
+                );
+                if !verify_ok {
+                    audit_secret_access(
+                        "factor-submit",
+                        msg.sender,
+                        &target,
+                        None,
+                        "factor-verification-failed",
+                    );
+                    return send_response(
+                        ctx.client,
+                        msg,
+                        EventKind::FactorResponse {
+                            accepted: false,
+                            unlock_complete: false,
+                            remaining_factors: vec![],
+                            remaining_additional: 0,
+                            profile: target,
+                            error: Some("factor key verification failed".into()),
+                        },
+                        ctx.daemon_id,
+                    )
+                    .await;
+                }
+            }
+
+            // Determine required factors based on policy.
+            let (remaining_required, remaining_additional) = match &meta.auth_policy {
+                AuthCombineMode::Any => {
+                    // Any single factor suffices — no partial state needed.
+                    (HashSet::new(), 0u32)
+                }
+                AuthCombineMode::All => {
+                    let all_factors: HashSet<AuthFactorId> =
+                        meta.enrolled_factors.iter().map(|f| f.factor_id).collect();
+                    (all_factors, 0)
+                }
+                AuthCombineMode::Policy(policy) => {
+                    let required: HashSet<AuthFactorId> = policy.required.iter().copied().collect();
+                    (required, policy.additional_required)
+                }
+            };
+
+            // Get or create partial unlock state.
+            let partial = ctx
+                .vault_state
+                .partial_unlocks
+                .entry(target.clone())
+                .or_insert_with(|| PartialUnlock {
+                    received_factors: HashMap::new(),
+                    remaining_required: remaining_required.clone(),
+                    remaining_additional,
+                    deadline: tokio::time::Instant::now()
+                        + Duration::from_secs(PARTIAL_UNLOCK_TIMEOUT_SECS),
+                });
+
+            // Check if expired.
+            if partial.is_expired() {
+                ctx.vault_state.partial_unlocks.remove(&target);
+                return send_response(
+                    ctx.client,
+                    msg,
+                    EventKind::FactorResponse {
+                        accepted: false,
+                        unlock_complete: false,
+                        remaining_factors: vec![],
+                        remaining_additional: 0,
+                        profile: target,
+                        error: Some("partial unlock expired".into()),
+                    },
+                    ctx.daemon_id,
+                )
+                .await;
+            }
+
+            // Record factor.
+            let partial = ctx.vault_state.partial_unlocks.get_mut(&target).unwrap();
+            partial
+                .received_factors
+                .insert(*factor_id, secure_key.clone());
+            partial.remaining_required.remove(factor_id);
+
+            // For policy mode: check if this factor counts as an additional.
+            if !remaining_required.contains(factor_id) && partial.remaining_additional > 0 {
+                partial.remaining_additional -= 1;
+            }
+
+            // For "any" mode: one factor is enough.
+            if matches!(meta.auth_policy, AuthCombineMode::Any) {
+                partial.remaining_required.clear();
+                partial.remaining_additional = 0;
+            }
+
+            let complete = partial.is_complete();
+            let remaining_factors_list: Vec<AuthFactorId> =
+                partial.remaining_required.iter().copied().collect();
+            let remaining_add = partial.remaining_additional;
+
+            if complete {
+                // Promote to unlocked.
+                let partial = ctx.vault_state.partial_unlocks.remove(&target).unwrap();
+
+                // For "all" mode: combine factor pieces via HKDF.
+                let master_key =
+                    if meta.contribution_type() == core_auth::FactorContribution::FactorPiece {
+                        let mut pieces: Vec<_> = partial.received_factors.into_iter().collect();
+                        pieces.sort_by_key(|(id, _)| *id);
+                        let mut combined = Vec::new();
+                        for (_id, piece) in &pieces {
+                            combined.extend_from_slice(piece.as_bytes());
+                        }
+                        let ctx_str = format!("{ALL_MODE_KDF_CONTEXT} {target}");
+                        let derived: [u8; 32] = blake3::derive_key(&ctx_str, &combined);
+                        combined.zeroize();
+                        SecureBytes::new(derived.to_vec())
+                    } else {
+                        // Any/policy mode: all factors unwrap to the same key.
+                        // Use the first one.
+                        partial
+                            .received_factors
+                            .into_values()
+                            .next()
+                            .expect("at least one factor received")
+                    };
+
+                ctx.vault_state
+                    .master_keys
+                    .insert(target.clone(), master_key);
+
+                let fp = audit_metadata
+                    .get("ssh_fingerprint")
+                    .cloned()
+                    .unwrap_or_default();
+                tracing::info!(
+                    profile = %target,
+                    factor = %factor_id,
+                    ssh_fingerprint = %fp,
+                    "vault unlocked via multi-factor"
+                );
+                audit_secret_access("factor-unlock", msg.sender, &target, None, "success");
+            } else {
+                tracing::info!(
+                    profile = %target,
+                    factor = %factor_id,
+                    remaining = ?remaining_factors_list,
+                    remaining_additional = remaining_add,
+                    "factor accepted, awaiting more"
+                );
+                audit_secret_access(
+                    "factor-submit",
+                    msg.sender,
+                    &target,
+                    None,
+                    "accepted-partial",
+                );
+            }
+
+            Some(EventKind::FactorResponse {
+                accepted: true,
+                unlock_complete: complete,
+                remaining_factors: remaining_factors_list,
+                remaining_additional: remaining_add,
+                profile: target,
+                error: None,
+            })
+        }
+
+        // -- Multi-factor: query vault auth requirements --
+        EventKind::VaultAuthQuery { profile } => {
+            let target = profile.clone();
+            let meta = core_auth::VaultMetadata::load(&ctx.vault_state.config_dir, &target);
+
+            match meta {
+                Ok(m) => {
+                    let enrolled: Vec<AuthFactorId> =
+                        m.enrolled_factors.iter().map(|f| f.factor_id).collect();
+                    let partial_in_progress = ctx.vault_state.partial_unlocks.contains_key(&target);
+                    let received: Vec<AuthFactorId> = ctx
+                        .vault_state
+                        .partial_unlocks
+                        .get(&target)
+                        .map(|p| p.received_factors.keys().copied().collect())
+                        .unwrap_or_default();
+                    Some(EventKind::VaultAuthQueryResponse {
+                        profile: target,
+                        enrolled_factors: enrolled,
+                        auth_policy: m.auth_policy,
+                        partial_in_progress,
+                        received_factors: received,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        profile = %target,
+                        error = %e,
+                        "vault auth query failed"
+                    );
+                    Some(EventKind::VaultAuthQueryResponse {
+                        profile: target,
+                        enrolled_factors: vec![],
+                        auth_policy: AuthCombineMode::Any,
+                        partial_in_progress: false,
+                        received_factors: vec![],
+                    })
+                }
+            }
+        }
+
         // -- Lock (per-profile or all) --
         EventKind::LockRequest { profile } => {
             let profiles_locked: Vec<TrustProfileName> = match profile {
@@ -793,6 +1143,7 @@ async fn handle_message(
                         drop(vault);
                     }
                     ctx.vault_state.master_keys.remove(target); // zeroizes on drop
+                    ctx.vault_state.partial_unlocks.remove(target); // zeroizes on drop
                     #[cfg(target_os = "linux")]
                     keyring_delete_profile(target).await;
                     tracing::info!(profile = %target, "vault locked, key material zeroized");
@@ -809,6 +1160,7 @@ async fn handle_message(
                         drop(vault);
                     }
                     ctx.vault_state.master_keys.clear(); // each SecureBytes zeroizes on drop
+                    ctx.vault_state.partial_unlocks.clear(); // each SecureBytes zeroizes on drop
                     #[cfg(target_os = "linux")]
                     keyring_delete_all(&locked).await;
                     tracing::info!("all vaults locked, key material zeroized");
@@ -2286,6 +2638,7 @@ mod tests {
             master_keys,
             vaults: HashMap::new(),
             active_profiles: HashSet::new(),
+            partial_unlocks: HashMap::new(),
             ttl: Duration::from_secs(60),
             config_dir: config_dir.to_path_buf(),
         }
@@ -2471,6 +2824,7 @@ mod tests {
             master_keys: HashMap::new(),
             vaults: HashMap::new(),
             active_profiles: HashSet::new(),
+            partial_unlocks: HashMap::new(),
             ttl: Duration::from_secs(60),
             config_dir: dir.path().to_path_buf(),
         };
@@ -2568,6 +2922,7 @@ mod tests {
             master_keys: HashMap::new(),
             vaults: HashMap::new(),
             active_profiles: HashSet::new(),
+            partial_unlocks: HashMap::new(),
             ttl: Duration::from_secs(60),
             config_dir: dir.path().to_path_buf(),
         };
@@ -2787,5 +3142,85 @@ mod tests {
     fn test_keylocker_account_format() {
         let p = profile("work");
         assert_eq!(keylocker_account(&p), "vault-key-work");
+    }
+
+    // -- G. PartialUnlock state machine --
+
+    #[tokio::test]
+    async fn test_partial_unlock_is_complete_when_no_remaining() {
+        let partial = PartialUnlock {
+            received_factors: HashMap::new(),
+            remaining_required: HashSet::new(),
+            remaining_additional: 0,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+        };
+        assert!(partial.is_complete());
+        assert!(!partial.is_expired());
+    }
+
+    #[tokio::test]
+    async fn test_partial_unlock_not_complete_with_required() {
+        let mut remaining = HashSet::new();
+        remaining.insert(AuthFactorId::Password);
+        let partial = PartialUnlock {
+            received_factors: HashMap::new(),
+            remaining_required: remaining,
+            remaining_additional: 0,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+        };
+        assert!(!partial.is_complete());
+    }
+
+    #[tokio::test]
+    async fn test_partial_unlock_not_complete_with_additional() {
+        let partial = PartialUnlock {
+            received_factors: HashMap::new(),
+            remaining_required: HashSet::new(),
+            remaining_additional: 1,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+        };
+        assert!(!partial.is_complete());
+    }
+
+    #[tokio::test]
+    async fn test_partial_unlock_expired() {
+        let partial = PartialUnlock {
+            received_factors: HashMap::new(),
+            remaining_required: HashSet::new(),
+            remaining_additional: 0,
+            deadline: tokio::time::Instant::now() - Duration::from_secs(1),
+        };
+        assert!(partial.is_expired());
+    }
+
+    #[tokio::test]
+    async fn test_partial_unlock_factor_tracking() {
+        let mut remaining = HashSet::new();
+        remaining.insert(AuthFactorId::Password);
+        remaining.insert(AuthFactorId::SshAgent);
+
+        let mut partial = PartialUnlock {
+            received_factors: HashMap::new(),
+            remaining_required: remaining,
+            remaining_additional: 0,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+        };
+
+        assert!(!partial.is_complete());
+
+        // Submit password factor.
+        let key = SecureBytes::new(vec![1u8; 32]);
+        partial.received_factors.insert(AuthFactorId::Password, key);
+        partial.remaining_required.remove(&AuthFactorId::Password);
+        assert!(!partial.is_complete());
+
+        // Submit SSH factor.
+        let key2 = SecureBytes::new(vec![2u8; 32]);
+        partial
+            .received_factors
+            .insert(AuthFactorId::SshAgent, key2);
+        partial.remaining_required.remove(&AuthFactorId::SshAgent);
+        assert!(partial.is_complete());
+        assert_eq!(partial.received_factors.len(), 2);
     }
 }

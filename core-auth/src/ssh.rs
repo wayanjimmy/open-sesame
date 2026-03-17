@@ -9,6 +9,7 @@ use crate::AuthError;
 use crate::backend::{AuthInteraction, IpcUnlockStrategy, UnlockOutcome, VaultAuthBackend};
 use crate::ssh_types::{EnrollmentBlob, SshKeyType};
 use core_crypto::SecureBytes;
+use core_types::AuthFactorId;
 use core_types::TrustProfileName;
 use ssh_agent_client_rs::Identity;
 use std::collections::BTreeMap;
@@ -96,6 +97,10 @@ impl Default for SshAgentBackend {
 #[async_trait::async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl VaultAuthBackend for SshAgentBackend {
+    fn factor_id(&self) -> AuthFactorId {
+        AuthFactorId::SshAgent
+    }
+
     fn name(&self) -> &str {
         "SSH Agent"
     }
@@ -216,6 +221,7 @@ impl VaultAuthBackend for SshAgentBackend {
             master_key: master_key_bytes,
             audit_metadata,
             ipc_strategy: IpcUnlockStrategy::DirectMasterKey,
+            factor_id: AuthFactorId::SshAgent,
         })
     }
 
@@ -257,9 +263,7 @@ impl VaultAuthBackend for SshAgentBackend {
                 // Caller MUST provide an explicit key index. Silent default
                 // selection is never acceptable — the user must declare which
                 // key to use.
-                let idx = selected_key_index.ok_or_else(|| {
-                    AuthError::NoEligibleKey
-                })?;
+                let idx = selected_key_index.ok_or(AuthError::NoEligibleKey)?;
                 if idx >= eligible.len() {
                     return Err(AuthError::NoEligibleKey);
                 }

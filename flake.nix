@@ -229,6 +229,7 @@
                 ProtectSystem = "strict";
                 ReadWritePaths = [ "%t/pds" "%h/.config/pds" ];
                 LimitNOFILE = 4096;
+                LimitCORE = 0;
                 MemoryMax = "128M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
                 # SSH agent env written by profile.d hook on each SSH login.
@@ -263,6 +264,7 @@
 
                 ReadWritePaths = [ "%t/pds" "%h/.config/pds" ];
                 LimitNOFILE = 1024;
+                LimitCORE = 0;
                 LimitMEMLOCK = "64M";
                 MemoryMax = "256M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
@@ -294,6 +296,7 @@
 
                 ReadWritePaths = [ "%t/pds" "%h/.config/pds" ];
                 LimitNOFILE = 4096;
+                LimitCORE = 0;
                 MemoryMax = "128M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };
@@ -325,6 +328,7 @@
                 ProtectSystem = "strict";
                 ReadWritePaths = [ "%t/pds" "%h/.cache/open-sesame" "%h/.cache/fontconfig" ];
                 LimitNOFILE = 4096;
+                LimitCORE = 0;
                 MemoryMax = "128M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
                 # SSH agent env for auto-unlock via forwarded agent.
@@ -356,6 +360,7 @@
                 ProtectSystem = "strict";
                 ReadWritePaths = [ "%t/pds" "%h/.cache/open-sesame" ];
                 LimitNOFILE = 4096;
+                LimitCORE = 0;
                 MemoryMax = "128M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };
@@ -387,6 +392,7 @@
 
                 ReadWritePaths = [ "%t/pds" ];
                 LimitNOFILE = 4096;
+                LimitCORE = 0;
                 MemoryMax = "128M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };
@@ -417,6 +423,7 @@
 
                 ReadWritePaths = [ "%t/pds" ];
                 LimitNOFILE = 4096;
+                LimitCORE = 0;
                 MemoryMax = "128M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };

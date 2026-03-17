@@ -11,14 +11,20 @@
 mod backend;
 mod dispatcher;
 mod password;
+pub mod password_wrap;
 mod ssh;
 mod ssh_types;
+pub mod vault_meta;
 
-pub use backend::{AuthInteraction, IpcUnlockStrategy, UnlockOutcome, VaultAuthBackend};
+pub use backend::{
+    AuthInteraction, FactorContribution, IpcUnlockStrategy, UnlockOutcome, VaultAuthBackend,
+};
 pub use dispatcher::AuthDispatcher;
 pub use password::PasswordBackend;
+pub use password_wrap::{PASSWORD_WRAP_VERSION, PasswordWrapBlob};
 pub use ssh::SshAgentBackend;
 pub use ssh_types::{ENROLLMENT_VERSION, EnrollmentBlob, SshKeyType};
+pub use vault_meta::{EnrolledFactor, VAULT_META_VERSION, VaultInitMode, VaultMetadata};
 
 /// Errors from authentication backends.
 ///

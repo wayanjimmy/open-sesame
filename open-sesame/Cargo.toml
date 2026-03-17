@@ -40,6 +40,7 @@ core-auth    = { workspace = true }
 core-crypto  = { workspace = true }
 ssh-key      = { workspace = true }
 ssh-agent-client-rs = { workspace = true }
+getrandom    = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux   = { workspace = true }
