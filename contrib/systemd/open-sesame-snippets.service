@@ -22,6 +22,7 @@ ReadWritePaths=%t/pds
 
 # Resource limits
 LimitNOFILE=4096
+LimitCORE=0
 MemoryMax=128M
 
 # Environment
