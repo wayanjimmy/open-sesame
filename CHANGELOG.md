@@ -34,6 +34,48 @@ gh attestation verify "open-sesame-linux-$(uname -m).deb" --owner ScopeCreep-zip
 
 ---
 
+## [1.4.2](https://github.com/ScopeCreep-zip/open-sesame/compare/v1.4.1...v1.4.2) (2026-03-20)
+
+### 🐛 Bug Fixes
+
+* **ci:** remove trailing blank line from apt Packages file ([86187cb](https://github.com/ScopeCreep-zip/open-sesame/commit/86187cb55c262b35710c562b7356cf85488632f2))
+
+## Quick Install
+
+### APT Repository (recommended)
+
+```bash
+curl -fsSL https://scopecreep-zip.github.io/open-sesame/gpg.key \
+  | sudo gpg --dearmor -o /usr/share/keyrings/open-sesame.gpg
+echo "deb [signed-by=/usr/share/keyrings/open-sesame.gpg] https://scopecreep-zip.github.io/open-sesame noble main" \
+  | sudo tee /etc/apt/sources.list.d/open-sesame.list
+sudo apt update && sudo apt install -y open-sesame
+sesame --setup-keybinding
+```
+
+### Direct Download
+
+See release assets below for `.deb` packages (amd64/arm64) with SHA256 checksums.
+
+## What You Get
+
+- **Alt+Space** - Window switcher overlay with Vimium-style letter hints
+- **Alt+Tab** - Quick-switch to previous window
+
+## Documentation
+
+- **[User Guide](https://scopecreep-zip.github.io/open-sesame/book/)** - Configuration, keybindings, theming
+- **[API Docs](https://scopecreep-zip.github.io/open-sesame/doc/open_sesame/)** - Library reference
+
+## Supply Chain Security
+
+All `.deb` packages include [SLSA Build Provenance](https://slsa.dev/) attestations. Verify with:
+```bash
+gh attestation verify "open-sesame-linux-$(uname -m).deb" --owner ScopeCreep-zip
+```
+
+---
+
 ## [1.4.1](https://github.com/ScopeCreep-zip/open-sesame/compare/v1.4.0...v1.4.1) (2026-03-17)
 
 ### 🐛 Bug Fixes
