@@ -10,6 +10,7 @@ mod client;
 mod framing;
 mod message;
 pub mod noise;
+pub(crate) mod noise_keys;
 pub mod registry;
 mod server;
 mod transport;
