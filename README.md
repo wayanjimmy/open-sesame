@@ -21,10 +21,15 @@ The system runs as seven cooperating daemons under systemd, communicating over a
 
 ### Two packages
 
-| Package | What's inside | Where it runs |
-|---------|--------------|---------------|
-| **open-sesame** | `sesame` CLI, daemon-profile, daemon-secrets, daemon-launcher, daemon-snippets | Desktops, servers, containers, VMs -- anywhere with systemd |
-| **open-sesame-desktop** | daemon-wm, daemon-clipboard, daemon-input | COSMIC and Wayland desktops (depends on open-sesame) |
+**`open-sesame`** -- headless core
+> `sesame` CLI, daemon-profile, daemon-secrets, daemon-launcher, daemon-snippets
+>
+> Runs anywhere with systemd: desktops, servers, containers, VMs.
+
+**`open-sesame-desktop`** -- GUI layer (depends on `open-sesame`)
+> daemon-wm, daemon-clipboard, daemon-input
+>
+> Requires a COSMIC or Wayland desktop.
 
 Install `open-sesame-desktop` and it pulls in `open-sesame` automatically. On a server or in a container, install just `open-sesame` for encrypted secrets and application launching without any GUI dependencies.
 
