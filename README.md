@@ -1,10 +1,12 @@
 # Open Sesame
 
-## Programmable Desktop Suite for COSMIC/Wayland
+## Programmable Desktop Suite for Linux
 
-Open Sesame is a multi-daemon desktop orchestration platform. It combines Vimium-style window switching, an application launcher with fuzzy search, encrypted per-profile secret vaults, clipboard management, input remapping, text snippet expansion, and workspace-scoped developer environments — all controlled through a single CLI.
+Open Sesame is a multi-daemon platform for desktop orchestration and secret management on Linux. It combines Vimium-style window switching, an application launcher with fuzzy search, encrypted per-profile secret vaults, clipboard management with security classification, input remapping, text snippet expansion, and workspace-scoped developer environments -- all controlled through a single CLI and orchestrated over a Noise IK encrypted IPC bus.
 
-Press `Alt+Space` to see all windows with letter hints. Type a letter to switch. Store secrets in encrypted vaults and inject them into your applications as environment variables. No mouse required.
+Press `Alt+Space` to see all windows with letter hints. Type a letter to switch. Store secrets in encrypted vaults and inject them into your applications as environment variables. Compose launch profiles that mix secrets, environment variables, and Nix devshells across trust profiles. No mouse required.
+
+Ships as two packages: **open-sesame** (headless core) runs everywhere -- servers, containers, VMs, bare metal, CI/CD pipelines. **open-sesame-desktop** adds the window switcher, clipboard manager, and keyboard input capture for COSMIC/Wayland desktops. Installing the desktop package automatically pulls in the headless package as a dependency.
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/ScopeCreep-zip/open-sesame)](https://github.com/ScopeCreep-zip/open-sesame/releases)
@@ -18,58 +20,110 @@ Press `Alt+Space` to see all windows with letter hints. Type a letter to switch.
 ## Quick Start
 
 ```bash
-# Install (see Installation below for full options)
-sudo apt update && sudo apt install -y open-sesame
+# Add APT repository
+curl -fsSL https://scopecreep-zip.github.io/open-sesame/gpg.key \
+  | sudo gpg --dearmor -o /usr/share/keyrings/open-sesame.gpg
+echo "deb [signed-by=/usr/share/keyrings/open-sesame.gpg] https://scopecreep-zip.github.io/open-sesame noble main" \
+  | sudo tee /etc/apt/sources.list.d/open-sesame.list
+sudo apt update
 
-# Initialize: creates config, starts daemons, sets master password
+# Desktop (full suite: window switcher + clipboard + input + headless core)
+sudo apt install -y open-sesame open-sesame-desktop
+
+# Or headless only (servers, containers, VMs -- no GUI dependencies)
+sudo apt install -y open-sesame
+
+# Initialize: creates config, generates keypairs, starts daemons, sets master password
 sesame init
-
-# Setup COSMIC keybindings (Alt+Tab, Alt+Shift+Tab, Alt+Space)
-sesame setup-keybinding
 
 # Check everything is running
 sesame status
 ```
 
-**That's it.** Press `Alt+Space` to see all windows with letter hints. Type a letter to switch.
+**That's it.** All services start automatically on install -- no manual `systemctl` commands needed. Press `Alt+Space` to see all windows with letter hints. Type a letter to switch.
+
+---
+
+## Packages
+
+Open Sesame ships as two composable `.deb` packages with automatic systemd user service lifecycle management.
+
+| Package | Binaries | Systemd Target | Use Case |
+|---------|----------|----------------|----------|
+| **open-sesame** | `sesame` CLI, `daemon-profile`, `daemon-secrets`, `daemon-launcher`, `daemon-snippets` | `open-sesame-headless.target` (WantedBy `default.target`) | Servers, containers, VMs, CI/CD, bare metal, IoT |
+| **open-sesame-desktop** | `daemon-wm`, `daemon-clipboard`, `daemon-input` | `open-sesame-desktop.target` (Requires `open-sesame-headless.target` + `graphical-session.target`) | COSMIC/Wayland desktops |
+
+- Installing `open-sesame-desktop` automatically pulls in `open-sesame` via APT dependency resolution
+- Removing `open-sesame-desktop` leaves headless daemons running undisturbed
+- The desktop target composes on top of the headless target -- starting desktop starts headless first
+- Stopping the desktop target does not stop headless daemons
+- Package postinst scripts use `systemctl --global enable` for persistence across all users and `systemctl --user -M "$uid@"` for immediate service activation -- the same pattern used by systemd-update-helper
 
 ---
 
 ## Features
 
-### Window Manager
-- **Vimium-style hints** — Every window gets a letter (g, gg, ggg for multiple instances)
-- **Quick switch** — Tap Alt+Tab to toggle between last two windows (MRU)
-- **Focus-or-launch** — Type a letter to focus an app or launch it if not running
-- **Arrow navigation** — Use arrows and Enter as an alternative to typing letters
-- **Instant activation** — Sub-200ms latency with smart disambiguation
+### Encrypted Secret Vaults
+- **Per-profile vaults** -- Each trust profile gets its own SQLCipher-encrypted database (AES-256-CBC + HMAC-SHA512)
+- **Multi-factor authentication** -- Password (Argon2id KDF), SSH agent (Ed25519/RSA deterministic signatures), or both
+- **Auth policies** -- `any` (either factor unlocks independently), `all` (every enrolled factor required via BLAKE3 combined key), or `policy` (required factors + additional threshold)
+- **Environment injection** -- Run any command with vault secrets as env vars: `sesame env -p work -- aws s3 ls`
+- **Export formats** -- Shell eval for bash/zsh/direnv, dotenv for Docker/node, JSON for programmatic use
+- **Zeroization** -- All key material is mlock'd to prevent swap exposure and zeroized on drop
+- **Rate limiting** -- Vault unlock attempts are throttled to prevent brute-force attacks
+- **Hash-chained audit** -- Every vault operation recorded in a BLAKE3 tamper-evident log
 
-### Encrypted Vaults
-- **Per-profile secrets** — Each profile gets its own SQLCipher-encrypted vault
-- **SSH agent unlock** — Enroll SSH keys for passwordless vault access (Ed25519, RSA)
-- **Environment injection** — Run commands with secrets as env vars: `sesame env -p work -- aws s3 ls`
-- **Export formats** — Shell eval, dotenv, JSON: `sesame export -p work -f dotenv > .env`
+### Window Manager (desktop package)
+- **Vimium-style hints** -- Every window gets a letter (`g`, `gg`, `ggg` for multiple instances of the same app)
+- **Quick switch** -- Tap `Alt+Tab` to instantly toggle between last two windows (MRU ordering)
+- **Focus-or-launch** -- Type a letter to focus a running app or launch it if not running
+- **Launcher mode** -- `Alt+Space` opens the full overlay immediately with fuzzy search
+- **Arrow navigation** -- Use arrows and Enter as an alternative to typing letters
+- **Inline vault unlock** -- If secrets are needed for a launch, auto-attempts SSH agent unlock, then touch prompt, then password fallback -- all inline in the overlay
+- **SCTK rendering** -- Native Wayland layer-shell overlay rendered with tiny-skia and cosmic-text, themed from COSMIC system settings
+- **Sub-200ms activation** -- Smart disambiguation with configurable delay, staged commit model (keypress selects, modifier release commits)
 
 ### Application Launcher
-- **Fuzzy search** — `sesame launch search firefox` with frecency ranking
-- **Desktop entry scanning** — Finds all installed applications automatically
-- **Profile-scoped frecency** — Different ranking per profile
+- **Fuzzy search** -- `sesame launch search firefox` with nucleo-powered matching and frecency ranking
+- **Desktop entry scanning** -- Automatic discovery of all installed applications from standard XDG directories
+- **Profile-scoped frecency** -- Different ranking per trust profile
+- **Secret injection** -- Launch profiles compose environment variables, vault secrets, and Nix devshells at launch time
+- **systemd scoping** -- Child processes isolated via `systemd-run --user --scope` so they survive launcher restarts
+- **Composable launch profiles** -- Tag key bindings with named profiles. Cross-profile references (`work:corp`) compose env vars from multiple trust boundaries
 
 ### Developer Workspaces
-- **Canonical paths** — `/workspace/<user>/<server>/<org>/<repo>`
-- **Profile linking** — Associate directories with profiles for automatic secret injection
-- **Shell injection** — `sesame workspace shell` opens a shell with vault secrets
+- **Canonical paths** -- `/workspace/<user>/<server>/<org>/<repo>` convention
+- **Git-aware cloning** -- `sesame workspace clone <url>` resolves HTTPS and SSH URLs to canonical paths
+- **Profile linking** -- `sesame workspace link -p work` associates a directory with a trust profile
+- **Shell injection** -- `sesame workspace shell` opens a shell with vault secrets injected as env vars
+- **Adopt mode** -- `sesame workspace clone --adopt` links pre-existing directories without re-cloning
+- **Per-directory config** -- `.sesame.toml` in project roots for directory-scoped defaults
 
-### Clipboard, Input, Snippets
-- **Clipboard history** — Per-profile, sensitivity-aware with configurable TTL
-- **Input remapping** — Layer-based keyboard remapping via evdev
-- **Snippet expansion** — Text expansion triggers per profile
+### Clipboard Management (desktop package)
+- **Per-profile history** -- Clipboard entries scoped to the active trust profile
+- **Sensitivity classification** -- Automatic detection of passwords, tokens, keys with configurable TTL auto-expiry
+- **SQLite storage** -- Persistent history backed by per-profile databases
+- **Wayland data-control** -- Native clipboard monitoring via Wayland protocol
 
-### Platform
-- **COSMIC integration** — Automatic keybinding setup, native Wayland compositor support
-- **Nix flake** — Full package with overlay, home-manager module, and headless variant
-- **APT packaging** — `.deb` with systemd user services for all 7 daemons
-- **Multi-platform staged** — Linux first, macOS and Windows platform crates scaffolded
+### Input Capture (desktop package)
+- **Compositor-independent shortcuts** -- evdev keyboard capture works regardless of focused window
+- **XKB keysym translation** -- Full keymap support with modifier tracking
+- **IPC key forwarding** -- Key events routed to daemon-wm over the encrypted IPC bus
+- **Layer-based remapping** -- Configurable keyboard layers per profile (roadmap)
+
+### Snippet Expansion
+- **Per-profile snippets** -- Text triggers scoped to trust profiles
+- **Template variables** -- Variable substitution in snippet bodies
+- **In-memory store** -- Fast lookup with config-driven templates
+
+### Platform Support
+- **Two-package architecture** -- Headless core + desktop addon with proper systemd user service lifecycle
+- **COSMIC integration** -- Automatic keybinding setup for Alt+Tab/Alt+Space, native Wayland compositor protocol support
+- **Nix flake** -- Full packages, overlay, home-manager module with `headless` option for servers
+- **APT repository** -- GPG-signed, SLSA build provenance attestations on all packages
+- **Sandbox hardening** -- Landlock filesystem restrictions + seccomp-bpf syscall filtering per daemon
+- **systemd hardening** -- `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateNetwork` (secrets daemon), memory limits, `LimitCORE=0`
+- **Multi-platform scaffolded** -- macOS and Windows platform crates exist with trait definitions; Linux is the active implementation
 
 ---
 
@@ -77,23 +131,25 @@ sesame status
 
 ### Two Modes
 
-**Launcher Mode (Default: Alt+Space)**
-Shows a centered overlay with all windows and letter hints. Type a letter to switch, or use arrows to navigate.
+**Launcher Mode (Default: `Alt+Space`)**
 
-**Switcher Mode (Default: Alt+Tab)**
-Acts like traditional Alt+Tab but with letter hints for instant selection.
+Shows a centered overlay with all windows and letter hints. Type a letter to switch, or type to fuzzy-search applications and launch them. This is the primary interaction mode.
+
+**Switcher Mode (Default: `Alt+Tab`)**
+
+Acts like traditional Alt+Tab but with letter hints visible for instant selection. Designed for muscle memory compatibility.
 
 ### Quick Switch Behavior
 
-**Tap the keybinding** — Instantly switch to the previous window (MRU - Most Recently Used)
+**Tap the keybinding** -- Instantly switch to the previous window (MRU - Most Recently Used). If Alt is released within the quick-switch threshold (default 250ms), the switch commits immediately without showing the overlay.
 
-**Hold and type** — See the full overlay, type a letter or use arrows to select
+**Hold and type** -- See the full overlay, type a letter or use arrows to select a window. The overlay appears after a configurable delay (default 150ms) to prevent flicker on fast switches.
 
 ### Focus-or-Launch
 
-Configure key bindings for your favorite apps. If the app is running, Open Sesame focuses it. If not, it launches the app.
+Configure key bindings for your favorite apps. If the app is running, Open Sesame focuses it. If not, it launches the app with the configured launch profile (env vars, secrets, devshell).
 
-Example: Press `Alt+Space`, type `f` → switches to Firefox (or launches it)
+Example: Press `Alt+Space`, type `f` --> switches to Firefox (or launches it)
 
 ### Keyboard Shortcuts
 
@@ -105,7 +161,9 @@ Once the overlay appears:
 | **Arrow keys** | Navigate through window list |
 | **Enter** | Activate selected window |
 | **Escape** | Cancel and return to origin window |
-| **Repeat letter** | Type `gg`, `ggg` for multiple windows with same letter |
+| **Space** | Toggle launcher mode (fuzzy search) |
+| **Repeat letter** | Type `gg`, `ggg` for multiple windows with the same letter |
+| **Alt release** | Commit the current selection (staged commit model) |
 
 ---
 
@@ -113,7 +171,7 @@ Once the overlay appears:
 
 ### From APT Repository (Recommended)
 
-**Pop!_OS 24.04+ with COSMIC Desktop:**
+**Pop!_OS 24.04+ / Ubuntu 24.04+ with COSMIC Desktop:**
 
 ```bash
 # Add GPG key and repository
@@ -121,36 +179,55 @@ curl -fsSL https://scopecreep-zip.github.io/open-sesame/gpg.key \
   | sudo gpg --dearmor -o /usr/share/keyrings/open-sesame.gpg
 echo "deb [signed-by=/usr/share/keyrings/open-sesame.gpg] https://scopecreep-zip.github.io/open-sesame noble main" \
   | sudo tee /etc/apt/sources.list.d/open-sesame.list
+sudo apt update
 
-# Install and initialize
-sudo apt update && sudo apt install -y open-sesame
+# Full desktop install (pulls in headless automatically)
+sudo apt install -y open-sesame open-sesame-desktop
+
+# Initialize configuration and start services
 sesame init
 ```
 
-The `.deb` package installs 8 binaries (`sesame` CLI + 7 daemons) and systemd user services that start automatically on login via `graphical-session.target`.
+**Headless / Server / Container:**
+
+```bash
+# Same repository setup as above, then:
+sudo apt install -y open-sesame
+sesame init --no-keybinding
+```
+
+The `open-sesame` package installs 5 binaries (`sesame` CLI + 4 headless daemons) and systemd user services that start automatically via `open-sesame-headless.target`. The `open-sesame-desktop` package adds 3 GUI daemons under `open-sesame-desktop.target` which requires `graphical-session.target`.
 
 ### From GitHub Releases
 
-Download the `.deb` package for your architecture from [Releases](https://github.com/ScopeCreep-zip/open-sesame/releases):
-
 ```bash
-curl -fsSL "https://github.com/ScopeCreep-zip/open-sesame/releases/latest/download/open-sesame-linux-$(uname -m).deb" -o /tmp/open-sesame.deb
-```
+# Auto-detect architecture
+ARCH=$(uname -m)
 
-**Verify and install:**
+# Download both packages
+curl -fsSL "https://github.com/ScopeCreep-zip/open-sesame/releases/latest/download/open-sesame-linux-${ARCH}.deb" \
+  -o /tmp/open-sesame.deb
+curl -fsSL "https://github.com/ScopeCreep-zip/open-sesame/releases/latest/download/open-sesame-desktop-linux-${ARCH}.deb" \
+  -o /tmp/open-sesame-desktop.deb
 
-```bash
+# Verify build provenance
 gh attestation verify /tmp/open-sesame.deb --owner ScopeCreep-zip
-sudo dpkg -i /tmp/open-sesame.deb
+gh attestation verify /tmp/open-sesame-desktop.deb --owner ScopeCreep-zip
+
+# Install (headless first, then desktop)
+sudo dpkg -i /tmp/open-sesame.deb /tmp/open-sesame-desktop.deb
+
+# Initialize
 sesame init
 ```
 
 ### Verify Package Authenticity
 
-All packages include [SLSA Build Provenance](https://slsa.dev/) attestations:
+All packages include [SLSA Build Provenance](https://slsa.dev/) attestations generated by GitHub Actions:
 
 ```bash
 gh attestation verify "open-sesame-linux-$(uname -m).deb" --owner ScopeCreep-zip
+gh attestation verify "open-sesame-desktop-linux-$(uname -m).deb" --owner ScopeCreep-zip
 ```
 
 ### Nix Flake (Recommended for NixOS/home-manager)
@@ -175,6 +252,7 @@ Add the flake input and enable the home-manager module:
 
   programs.open-sesame = {
     enable = true;
+    # headless = true;  # servers/containers: only headless daemons
     settings = {
       key_bindings.g = {
         apps = [ "ghostty" "com.mitchellh.ghostty" ];
@@ -208,13 +286,15 @@ Add the flake input and enable the home-manager module:
 }
 ```
 
-The module generates `~/.config/pds/config.toml`, creates systemd user services for all 7 daemons, and configures `SSH_AUTH_SOCK` for SSH agent forwarding to systemd services.
+The module generates `~/.config/pds/config.toml`, creates systemd user services with dual targets (`open-sesame-headless.target` always, `open-sesame-desktop.target` when `headless = false`), configures `SSH_AUTH_SOCK` for SSH agent forwarding to systemd services, and sets up tmpfiles.d rules for runtime directories.
 
-A headless variant is available for servers (no GTK/Wayland deps):
+Available Nix packages:
 
-```nix
-programs.open-sesame.package = open-sesame.packages.${system}.open-sesame-headless;
-```
+| Package | Description |
+|---------|-------------|
+| `packages.open-sesame` | Headless: 5 binaries, no GUI deps (`openssl` + `libseccomp` only) |
+| `packages.open-sesame-desktop` | Desktop: 3 GUI daemons + CLI with keybinding commands (propagates headless via `propagatedBuildInputs`) |
+| `packages.default` | Desktop (alias) |
 
 ### Building from Source
 
@@ -237,29 +317,16 @@ sudo apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
-    libpcsclite-dev
+    libseccomp-dev
 
-# Required for GTK4 UI crates (daemon-wm, daemon-launcher)
+# Required for desktop crates (daemon-wm, daemon-clipboard, daemon-input)
 sudo apt-get install -y \
-    libgtk-4-dev \
-    libglib2.0-dev \
-    libcairo2-dev \
-    libpango1.0-dev \
-    libgraphene-1.0-dev \
-    libgdk-pixbuf-2.0-dev \
     libwayland-dev \
     libxkbcommon-dev \
-    libseccomp-dev \
     libfontconfig1-dev
-
-# gtk4-layer-shell C library (required for Wayland layer-shell overlays)
-# NOT packaged in Ubuntu 24.04 -- must build from source:
-#   https://github.com/wmww/gtk4-layer-shell
-# Or skip GUI crates:
-#   cargo check --workspace --exclude daemon-wm --exclude daemon-launcher
 ```
 
-Minimum Rust toolchain: see `rust-toolchain.toml` (currently channel 1.91).
+Minimum Rust toolchain: see `rust-toolchain.toml`.
 
 ```bash
 cargo check --workspace
@@ -270,10 +337,10 @@ cargo check --workspace
 | apt package | Crate(s) | Purpose |
 |---|---|---|
 | `libssl-dev` | `rusqlite` (bundled-sqlcipher) | OpenSSL headers for SQLCipher encryption |
-| `libpcsclite-dev` | `pcsc` | Smart card reader access for hardware key profile activation |
-| `libgtk-4-dev` | `gtk4` | GTK4 UI toolkit for overlay windows |
-| `libgtk4-layer-shell` (from source) | `gtk4-layer-shell` | Wayland layer-shell protocol for overlay positioning |
-| `libseccomp-dev` | `seccomp` | Landlock/seccomp sandboxing for daemons |
+| `libseccomp-dev` | `libseccomp` | seccomp-bpf syscall filtering for daemon sandboxes |
+| `libwayland-dev` | `wayland-client`, `smithay-client-toolkit` | Wayland protocol for overlay rendering and clipboard |
+| `libxkbcommon-dev` | `xkbcommon` | Keyboard keymap handling for input capture |
+| `libfontconfig1-dev` | `fontconfig` | Font discovery for overlay text rendering |
 
 ---
 
@@ -282,28 +349,41 @@ cargo check --workspace
 ### Initialization
 
 ```bash
-# First-time setup: creates config directory, generates keypairs,
+# First-time setup: creates config directory, generates Noise IK keypairs,
 # starts daemons, and prompts for master password
 sesame init
 
 # With organization namespace (enterprise deployments)
 sesame init --org braincraft.io
 
-# Factory reset (destructive — requires typing "destroy all data")
+# SSH-only vault (no password, random master key wrapped under SSH KEK)
+sesame init --ssh-key
+
+# Specific SSH key by fingerprint or file path
+sesame init --ssh-key SHA256:abc123...
+sesame init --ssh-key ~/.ssh/id_ed25519.pub
+
+# Dual-factor vault (password + SSH key)
+sesame init --ssh-key --password
+
+# Dual-factor with "all" policy (both factors required to unlock)
+sesame init --ssh-key --password --auth-policy all
+
+# Factory reset (destructive -- requires typing "destroy all data")
 sesame init --wipe-reset-destroy-all-data
 ```
 
 ### Vault Operations
 
 ```bash
-# Unlock your default vault (prompts for password)
+# Unlock your default vault (auto-tries SSH agent, then prompts for password)
 sesame unlock
 
 # Unlock specific profiles
 sesame unlock -p work
 sesame unlock -p "default,work"
 
-# Lock a vault (zeroizes cached key material)
+# Lock a vault (zeroizes cached key material from memory)
 sesame lock -p work
 
 # Lock all vaults
@@ -312,61 +392,72 @@ sesame lock
 
 ### SSH Agent Unlock
 
-Enroll SSH keys for passwordless vault unlock. Only Ed25519 and RSA keys are supported — their signatures are deterministic, which is required for KEK derivation.
+Enroll SSH keys for passwordless vault unlock. Only Ed25519 and RSA keys are supported -- their signatures are deterministic, which is required for consistent KEK derivation.
 
 ```bash
-# Enroll an SSH key (vault must be unlockable with password first)
+# Enroll an SSH key (interactive selection from agent)
 sesame ssh enroll -p default
+
+# Enroll a specific key by fingerprint
+sesame ssh enroll -p work -k SHA256:abc123...
+
+# Enroll by public key file path
+sesame ssh enroll -p work -k ~/.ssh/id_ed25519.pub
 
 # List enrollments
 sesame ssh list
+sesame ssh list -p work
 
 # Revoke enrollment
 sesame ssh revoke -p work
 ```
 
-After enrollment, `sesame unlock` and the overlay will attempt SSH agent unlock automatically before falling back to password prompt.
+After enrollment, `sesame unlock` and the window switcher overlay attempt SSH agent unlock automatically before falling back to password prompt. This enables fully non-interactive vault access for SSH sessions, forwarded agents, and headless environments.
 
 ### Secret Management
 
 ```bash
-# Store a secret (prompts for value)
-sesame secret set -p default AWS_SECRET_KEY
+# Store a secret (prompts for value on stdin)
+sesame secret set -p default github-token
 
-# Retrieve a secret
-sesame secret get -p default AWS_SECRET_KEY
+# Retrieve a secret value (prints to stdout)
+sesame secret get -p default github-token
 
 # List all keys in a profile (never shows values)
 sesame secret list -p work
 
 # Delete a secret
 sesame secret delete -p work old-api-key
-sesame secret delete -p work old-api-key --yes  # skip confirmation
+sesame secret delete -p work old-api-key --yes  # skip confirmation (scripted use)
 ```
 
 ### Environment Injection
 
-Run commands with vault secrets injected as environment variables. Secret keys are uppercased with hyphens converted to underscores (`api-key` → `API_KEY`).
+Run commands with vault secrets injected as environment variables. Secret keys are uppercased with hyphens converted to underscores (`api-key` becomes `API_KEY`).
 
 ```bash
 # Run a command with secrets from the work profile
 sesame env -p work -- aws s3 ls
 
-# With env var prefix
+# With env var prefix (api-key becomes MYAPP_API_KEY)
 sesame env -p work --prefix MYAPP -- ./start.sh
-# api-key → MYAPP_API_KEY
+
+# Multi-profile injection
+sesame env -p "default,work" -- make deploy
 ```
+
+A runtime denylist prevents injection of dangerous variables (`LD_PRELOAD`, `BASH_ENV`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `JAVA_TOOL_OPTIONS`, etc.) across all major language runtimes.
 
 ### Secret Export
 
 ```bash
-# Shell eval (default) — for bash/zsh/direnv
+# Shell eval (default) -- for bash/zsh/direnv
 eval "$(sesame export -p work)"
 
-# Dotenv format — for Docker, docker-compose, node
+# Dotenv format -- for Docker, docker-compose, node, python-dotenv
 sesame export -p work -f dotenv > .env.secrets
 
-# JSON — for jq, CI/CD, programmatic use
+# JSON -- for jq, CI/CD, programmatic consumers
 sesame export -p work -f json | jq .
 
 # With prefix
@@ -375,6 +466,8 @@ sesame export -p work --prefix MYAPP -f shell
 
 ### Profiles
 
+Trust profiles scope secrets, clipboard history, frecency ranking, audit logs, and launch configurations. Each profile can have its own vault with independent authentication.
+
 ```bash
 # List configured profiles
 sesame profile list
@@ -382,7 +475,7 @@ sesame profile list
 # Show profile configuration
 sesame profile show work
 
-# Activate/deactivate profiles
+# Activate/deactivate profiles (opens/closes vault, registers namespace)
 sesame profile activate work
 sesame profile deactivate work
 
@@ -390,7 +483,7 @@ sesame profile deactivate work
 sesame profile default work
 ```
 
-### Window Manager
+### Window Manager (desktop package)
 
 ```bash
 # Open the window switcher overlay
@@ -399,14 +492,17 @@ sesame wm overlay
 # Launcher mode (full overlay immediately, no border-only phase)
 sesame wm overlay --launcher
 
-# Switch to next/previous window in MRU order
+# Backward direction (start from previous window in MRU)
+sesame wm overlay --backward
+
+# Switch to next/previous window in MRU order (without overlay)
 sesame wm switch
 sesame wm switch --backward
 
-# Focus a specific window
+# Focus a specific window by ID or app ID
 sesame wm focus firefox
 
-# List windows known to daemon-wm
+# List all windows known to daemon-wm
 sesame wm list
 ```
 
@@ -419,26 +515,28 @@ sesame launch search "visual studio" -n 5
 
 # Launch by desktop entry ID
 sesame launch run org.mozilla.firefox
+
+# Launch with profile context (for frecency ranking and secret injection)
 sesame launch run org.mozilla.firefox -p work
 ```
 
-### Clipboard
+### Clipboard (desktop package)
 
 ```bash
-# Show clipboard history
+# Show clipboard history for a profile
 sesame clipboard history -p default
 sesame clipboard history -p default -n 50
 
-# Clear clipboard history
+# Clear clipboard history for a profile
 sesame clipboard clear -p work
 
-# Get a specific entry
+# Get a specific clipboard entry by ID
 sesame clipboard get <entry-id>
 ```
 
 ### Audit Log
 
-All vault operations are recorded in a hash-chained audit log.
+All vault operations are recorded in a BLAKE3 hash-chained audit log. Each entry includes a hash of the previous entry, making the chain tamper-evident -- modifying, deleting, or reordering any entry breaks the chain.
 
 ```bash
 # Verify hash chain integrity
@@ -452,14 +550,14 @@ sesame audit tail -n 50
 sesame audit tail -f
 ```
 
-### COSMIC Keybindings
+### COSMIC Keybindings (desktop package)
 
 ```bash
 # Setup keybindings (Alt+Tab, Alt+Shift+Tab, launcher key)
 sesame setup-keybinding              # default: alt+space
 sesame setup-keybinding super+space  # custom launcher key
 
-# Check status
+# Check keybinding status
 sesame keybinding-status
 
 # Remove keybindings
@@ -468,10 +566,10 @@ sesame remove-keybinding
 
 ### Workspaces
 
-Workspaces are directory-scoped project environments with canonical paths.
+Workspaces are directory-scoped project environments with canonical paths and automatic secret injection.
 
 ```bash
-# Initialize workspace root
+# Initialize workspace root directory
 sesame workspace init
 sesame workspace init --root /mnt/workspace
 
@@ -479,37 +577,38 @@ sesame workspace init --root /mnt/workspace
 sesame workspace clone https://github.com/org/repo
 sesame workspace clone git@github.com:org/repo --depth 1
 
+# Adopt a pre-existing directory (links without re-cloning)
+sesame workspace clone https://github.com/org/repo --adopt true
+
 # Link workspace to a profile (enables automatic secret injection)
 sesame workspace link -p work
 
-# List workspaces
+# List all discovered workspaces
 sesame workspace list
-sesame workspace list --server github.com --org myorg
-sesame workspace list -f json
 
-# Show workspace status
+# Show workspace status and metadata
 sesame workspace status
-sesame workspace status -v  # verbose with disk usage
 
-# Open a shell with vault secrets injected
+# Open a shell with vault secrets injected as environment variables
 sesame workspace shell
 sesame workspace shell -p work
 sesame workspace shell -- make build  # run a command instead of interactive shell
+sesame workspace shell --prefix MYAPP # prefix for env var names
 
-# Show resolved config with provenance
+# Show resolved workspace configuration
 sesame workspace config show
 
 # Unlink profile association
 sesame workspace unlink
 ```
 
-### Input Remapping
+### Input Remapping (desktop package)
 
 ```bash
 # List configured input layers
 sesame input layers
 
-# Show input daemon status
+# Show input daemon status (active layer, grabbed devices)
 sesame input status
 ```
 
@@ -519,10 +618,10 @@ sesame input status
 # List snippets for a profile
 sesame snippet list -p default
 
-# Add a snippet
+# Add a new snippet
 sesame snippet add -p default "@@sig" "Best regards,\nJohn"
 
-# Expand a trigger
+# Expand a snippet trigger
 sesame snippet expand -p default "@@sig"
 ```
 
@@ -532,7 +631,7 @@ sesame snippet expand -p default "@@sig"
 
 ### Configuration File Locations
 
-Open Sesame v2 uses `~/.config/pds/` as its config directory with layered inheritance:
+Open Sesame uses `~/.config/pds/` as its config directory with layered inheritance:
 
 ```text
 /etc/pds/policy.toml                       # System policy (enterprise, read-only)
@@ -549,6 +648,8 @@ Additional data locations:
 ~/.config/pds/vaults/                      # Encrypted SQLCipher vault databases
 ~/.config/pds/keys/                        # Noise IK daemon keypairs
 ~/.config/pds/enrollments/                 # SSH key enrollment blobs
+~/.config/pds/audit.jsonl                  # Hash-chained audit log
+$XDG_RUNTIME_DIR/pds/                      # Runtime: IPC socket, bus public key
 ```
 
 ### Example Configuration
@@ -559,63 +660,84 @@ config_version = 3
 [global]
 default_profile = "default"
 
+[global.ipc]
+# channel_capacity = 1024
+# slow_subscriber_timeout_ms = 5000
+
 [global.logging]
 level = "info"
-journald = true
+# json = false
+# journald = true
 
 # ── Profile: default ──────────────────────────────────────────────
 
 [profiles.default]
 name = "default"
 
+# Authentication: how vault unlock factors combine
+# "any"    — any single enrolled factor unlocks (password OR ssh-agent)
+# "all"    — all enrolled factors required (BLAKE3 combined key)
+# "policy" — required factors + threshold of additional enrolled factors
+[profiles.default.auth]
+mode = "any"
+# required = ["password", "ssh-agent"]  # for mode = "policy"
+# additional_required = 0               # for mode = "policy"
+
+# Window Manager settings
 [profiles.default.wm]
-# Characters used for Vimium-style window hints
 hint_keys = "asdfghjkl"
-
-# Delay (ms) before showing full overlay (0 = immediate)
-overlay_delay_ms = 150
-
-# Delay (ms) before activating a match when multiple hints exist
-# Allows time for typing gg, ggg without 'g' firing immediately
-activation_delay_ms = 200
-
-# Quick-switch threshold (ms) — tap within this time = instant MRU switch
-quick_switch_threshold_ms = 250
-
-# Focus indicator border
+overlay_delay_ms = 150          # ms before full overlay appears
+activation_delay_ms = 200       # ms delay before committing a hint match
+quick_switch_threshold_ms = 250 # Alt+Tab released within this = instant switch
 border_width = 4.0
 border_color = "#89b4fa"
-
-# Overlay colors (hex: #RRGGBB or #RRGGBBAA)
 background_color = "#000000c8"
 card_color = "#1e1e1ef0"
 text_color = "#ffffff"
 hint_color = "#646464"
 hint_matched_color = "#4caf50"
-
-# Maximum windows visible in the overlay
+show_title = true
+show_app_id = false
 max_visible_windows = 20
 
-# ── Key bindings ──────────────────────────────────────────────────
-# Each key binding maps a letter to app IDs and an optional launch command.
-# Find your app_ids with: sesame wm list
+# ── Key Bindings ──────────────────────────────────────────────────
+# Each section maps a letter to app IDs and an optional launch command.
+# Multiple windows of the same app get repeated keys: g, gg, ggg
+# Find your app_ids: sesame wm list
 
+# Terminals
 [profiles.default.wm.key_bindings.g]
 apps = ["ghostty", "com.mitchellh.ghostty"]
 launch = "ghostty"
 
+# Browsers
 [profiles.default.wm.key_bindings.f]
-apps = ["firefox", "org.mozilla.firefox"]
+apps = ["firefox", "org.mozilla.firefox", "Firefox"]
 launch = "firefox"
 
-[profiles.default.wm.key_bindings.v]
-apps = ["code", "Code", "cursor", "Cursor"]
-launch = "code"
+[profiles.default.wm.key_bindings.e]
+apps = ["microsoft-edge", "com.microsoft.Edge", "Microsoft-edge"]
+launch = "microsoft-edge"
 
+[profiles.default.wm.key_bindings.v]
+apps = ["vivaldi", "vivaldi-stable"]
+launch = "vivaldi"
+
+[profiles.default.wm.key_bindings.c]
+apps = ["chromium", "google-chrome", "Chromium", "Google-chrome"]
+# No launch — just focus existing windows
+
+# Editors
+[profiles.default.wm.key_bindings.z]
+apps = ["zed", "dev.zed.Zed"]
+launch = "zed-editor"
+
+# File Managers
 [profiles.default.wm.key_bindings.n]
 apps = ["nautilus", "org.gnome.Nautilus", "com.system76.CosmicFiles"]
 launch = "nautilus"
 
+# Communication
 [profiles.default.wm.key_bindings.s]
 apps = ["slack", "Slack"]
 launch = "slack"
@@ -624,67 +746,76 @@ launch = "slack"
 apps = ["discord", "Discord"]
 launch = "discord"
 
-# No launch command = focus only (won't launch if not running)
-[profiles.default.wm.key_bindings.c]
-apps = ["chromium", "google-chrome"]
+[profiles.default.wm.key_bindings.t]
+apps = ["thunderbird", "Thunderbird"]
+launch = "thunderbird"
 
-# ── Launch profiles ───────────────────────────────────────────────
-# Named, composable environment injection profiles.
-# Tag key bindings with launch profile names to compose at launch time.
+# Media
+[profiles.default.wm.key_bindings.m]
+apps = ["spotify", "Spotify"]
+launch = "spotify"
 
-[profiles.default.launch_profiles.dev-rust]
-env = { RUST_LOG = "debug", CARGO_HOME = "/workspace/.cargo" }
-secrets = ["github-token", "crates-io-token"]
-devshell = "/workspace/myproject#rust"
+# ── Launch Profiles ───────────────────────────────────────────────
+# Named, composable environment bundles applied via the `tags` field on
+# key bindings. Tags support cross-profile references: "work:corp" resolves
+# the "corp" launch profile in the "work" trust profile.
+#
+# When multiple tags are applied, env vars merge (later tag wins on conflict),
+# secrets accumulate, and last devshell/cwd wins.
 
-# ── Key binding with launch profile tags ──────────────────────────
-# Tags reference launch profiles. Cross-profile references use "profile:tag".
+[profiles.default.launch_profiles.dev]
+env = { RUST_LOG = "debug" }
+secrets = ["github-token"]
+# devshell = "/workspace/myproject#rust"
+# cwd = "/workspace/usrbinkat/github.com/org/repo"
 
-# [profiles.default.wm.key_bindings.g]
-# apps = ["ghostty"]
-# launch = "ghostty"
-# tags = ["dev-rust", "work:corp"]
-# launch_args = ["--working-directory=/workspace/user/github.com/org/repo"]
+# Launcher settings
+[profiles.default.launcher]
+max_results = 20
+frecency = true
 
-# ── Profile: work ────────────────────────────────────────────────
-
-[profiles.work]
-name = "work"
-color = "#ff6b6b"
-
-[profiles.work.launch_profiles.corp]
-env = { CORP_ENV = "production" }
-secrets = ["corp-api-key", "corp-database-url"]
-
-# ── Clipboard ────────────────────────────────────────────────────
-
+# Clipboard settings
 [profiles.default.clipboard]
 max_history = 1000
 sensitive_ttl_s = 30
 detect_sensitive = true
 
-# ── Audit ────────────────────────────────────────────────────────
-
+# Audit settings
 [profiles.default.audit]
 enabled = true
 retention_days = 90
 
-# ── Activation rules (contextual profile switching) ───────────────
+# ── Profile: work ────────────────────────────────────────────────
 
-# [profiles.work.activation]
-# wifi_ssids = ["CorpNet", "CorpNet-5G"]
-# usb_devices = ["1050:0407"]  # YubiKey
-# require_security_key = true
+# [profiles.work]
+# name = "work"
+#
+# [profiles.work.auth]
+# mode = "all"
+#
+# [profiles.work.launch_profiles.corp]
+# env = { CORP_ENV = "production" }
+# secrets = ["corp-api-key", "corp-signing-key"]
+# cwd = "/workspace/usrbinkat/github.com/acme-corp"
+#
+# # Tag a key binding with a cross-profile launch profile:
+# # [profiles.default.wm.key_bindings.g]
+# # apps = ["ghostty"]
+# # launch = "ghostty"
+# # tags = ["dev", "work:corp"]
+# #
+# # This composes: "dev" from default profile + "corp" from work profile.
+# # Environment merges, secrets accumulate, last devshell/cwd wins.
 
-# ── Cryptographic algorithms ──────────────────────────────────────
+# ── Cryptographic Algorithms ──────────────────────────────────────
 
 [crypto]
-kdf = "argon2id"
-hkdf = "blake3"
-noise_cipher = "chacha-poly"
-noise_hash = "blake2s"
-audit_hash = "blake3"
-minimum_peer_profile = "leading-edge"
+kdf = "argon2id"             # or "pbkdf2-sha256"
+hkdf = "blake3"              # or "hkdf-sha256"
+noise_cipher = "chacha-poly" # or "aes-gcm"
+noise_hash = "blake2s"       # or "sha256"
+audit_hash = "blake3"        # or "sha256"
+minimum_peer_profile = "leading-edge"  # or "governance-compatible", "custom"
 ```
 
 ### Advanced Launch Configuration
@@ -705,9 +836,9 @@ tags = ["dev-rust", "work:corp"]
 launch_args = ["--working-directory=/workspace/user/github.com/org/repo"]
 
 [profiles.default.launch_profiles.dev-rust]
-env = { RUST_LOG = "debug" }
-secrets = ["github-token"]
-devshell = "/workspace/project#rust"
+env = { RUST_LOG = "debug", CARGO_HOME = "/workspace/.cargo" }
+secrets = ["github-token", "crates-io-token"]
+devshell = "/workspace/myproject#rust"
 cwd = "/workspace/user/github.com/org/repo"
 ```
 
@@ -754,15 +885,12 @@ default_ssh = true
 sesame status
 
 # Check systemd services
-systemctl --user status open-sesame.target
-systemctl --user status open-sesame-profile
+systemctl --user list-units "open-sesame-*"
 
-# Restart all daemons
-systemctl --user restart open-sesame.target
-
-# View daemon logs
+# Check specific daemon logs
 journalctl --user -u open-sesame-profile -f
 journalctl --user -u open-sesame-wm -f
+journalctl --user -u open-sesame-secrets -f
 ```
 
 ### No Windows Appear
@@ -772,7 +900,7 @@ journalctl --user -u open-sesame-wm -f
 sesame wm list
 ```
 
-If no windows appear, ensure you're running on COSMIC desktop with Wayland (not X11).
+If no windows appear, ensure you're running on COSMIC desktop with Wayland (not X11). Open Sesame uses the `ext-foreign-toplevel` and `zcosmic-toplevel` Wayland protocols which require compositor support.
 
 ### Wrong App IDs
 
@@ -810,7 +938,7 @@ sesame unlock -p default
 sesame ssh enroll -p default
 ```
 
-For SSH agent forwarding (remote VMs), ensure `SSH_AUTH_SOCK` is available to systemd user services. The home-manager module handles this automatically via `~/.ssh/agent.sock` stable symlink.
+For SSH agent forwarding (remote VMs), ensure `SSH_AUTH_SOCK` is available to systemd user services. The home-manager module handles this automatically via `~/.ssh/agent.sock` stable symlink and `systemd.user.sessionVariables`.
 
 ### Input Daemon Requires `input` Group
 
@@ -824,11 +952,12 @@ sudo usermod -aG input $USER
 ### Debug Logging
 
 ```bash
-# Set RUST_LOG for all daemons
+# Set RUST_LOG for all daemons via systemd environment
 systemctl --user set-environment RUST_LOG=debug
-systemctl --user restart open-sesame.target
+systemctl --user restart open-sesame-headless.target
+systemctl --user restart open-sesame-desktop.target
 
-# Or for a single daemon
+# Or run a single daemon manually with debug logging
 systemctl --user stop open-sesame-wm
 RUST_LOG=debug daemon-wm
 ```
@@ -839,87 +968,130 @@ If the overlay feels slow, reduce delays in your config:
 
 ```toml
 [profiles.default.wm]
-overlay_delay_ms = 0    # Show immediately
-activation_delay_ms = 100  # Faster activation (may skip gg, ggg)
+overlay_delay_ms = 0       # Show immediately
+activation_delay_ms = 100  # Faster activation (may skip gg, ggg disambiguation)
 ```
 
 ---
 
 ## Architecture
 
-Open Sesame v2 is a multi-daemon system with 17 Rust crates communicating over a Noise IK encrypted IPC bus.
+Open Sesame is a multi-daemon system with 21 Rust crates communicating over a Noise IK encrypted IPC bus.
+
+### IPC Bus
+
+All inter-daemon communication flows through `daemon-profile` which hosts a `BusServer` on a Unix domain socket at `$XDG_RUNTIME_DIR/pds/bus.sock`. Every connection is authenticated via Noise Protocol Framework (IK pattern) with X25519 key exchange and ChaChaPoly AEAD. Peer identity is bound via UCred (PID, UID) in the Noise prologue. Messages are postcard-encoded with security level enforcement -- a daemon can only send messages at or below its registered clearance level.
+
+### Systemd Targets
+
+| Target | WantedBy | Daemons |
+|--------|----------|---------|
+| `open-sesame-headless.target` | `default.target` | profile, secrets, launcher, snippets |
+| `open-sesame-desktop.target` | `graphical-session.target` | wm, clipboard, input |
+
+The desktop target `Requires` the headless target. Starting desktop starts headless first. Stopping desktop leaves headless running.
 
 ### Daemons
 
-| Daemon | Type | Purpose |
-|---|---|---|
-| `daemon-profile` | `notify` | IPC bus host, key management, audit logging, profile activation |
-| `daemon-secrets` | `notify` | SQLCipher vault operations, ACL enforcement, rate limiting |
-| `daemon-wm` | `notify` | Window management, overlay rendering (COSMIC compositor) |
-| `daemon-launcher` | `simple` | Application search, frecency ranking, desktop entry scanning |
-| `daemon-clipboard` | `simple` | Clipboard monitoring and per-profile history |
-| `daemon-input` | `simple` | Keyboard input capture and layer-based remapping |
-| `daemon-snippets` | `simple` | Text snippet trigger detection and expansion |
+| Daemon | Package | Type | Sandbox | Purpose |
+|--------|---------|------|---------|---------|
+| `daemon-profile` | headless | `notify` | Landlock + seccomp | IPC bus host, Noise IK key management, profile lifecycle, hash-chained audit logging, SSID/focus context monitors |
+| `daemon-secrets` | headless | `notify` | Landlock + seccomp + `PrivateNetwork` | SQLCipher vault CRUD, multi-factor unlock state machine, ACL enforcement, rate limiting, keyring caching |
+| `daemon-launcher` | headless | `notify` | Kernel control-plane hardening | Desktop entry scanning, nucleo fuzzy search, frecency ranking, `systemd-run --scope` child isolation |
+| `daemon-snippets` | headless | `notify` | Landlock + seccomp | In-memory snippet store, template expansion, profile-scoped namespaces |
+| `daemon-wm` | desktop | `notify` | Landlock + seccomp | SCTK layer-shell overlay, COSMIC compositor integration, MRU window ordering, inline vault unlock UX |
+| `daemon-clipboard` | desktop | `notify` | Landlock + seccomp | Wayland data-control clipboard monitoring, SQLite history, sensitivity classification |
+| `daemon-input` | desktop | `notify` | Landlock + seccomp | evdev keyboard capture, XKB keysym translation, IPC key forwarding to daemon-wm |
 
-All daemons start as systemd user services under `open-sesame.target`, which is pulled in by `graphical-session.target` on login. `daemon-profile` must start first — all other daemons `Requires` and `After` it.
+All daemons use `Type=notify` with `WatchdogSec=30` for health monitoring. `daemon-profile` must start first -- all other daemons `Requires` and `After` it.
 
 ### Core Libraries
 
 | Crate | Purpose |
-|---|---|
-| `core-ipc` | Noise IK transport, BusServer/BusClient, clearance registry |
-| `core-types` | Shared types, `EventKind` protocol schema, `DaemonId`, `SecurityLevel` |
-| `core-crypto` | KDF (Argon2id), HKDF (BLAKE3), AES-256-GCM encryption |
-| `core-config` | TOML configuration with XDG layered inheritance and hot-reload watcher |
-| `core-auth` | Authentication backends: password (Argon2id), SSH agent (KEK wrapping) |
-| `core-profile` | Profile context, hash-chained audit log |
-| `core-secrets` | SQLCipher database operations |
-| `core-fuzzy` | Fuzzy search (nucleo) with frecency scoring |
+|-------|---------|
+| `core-ipc` | Noise IK transport (X25519 + ChaChaPoly + BLAKE2s), BusServer/BusClient, clearance registry, postcard framing, UCred binding |
+| `core-types` | Canonical type system: `EventKind` protocol schema, `DaemonId`, `SecurityLevel`, `TrustProfileName`, `SensitiveBytes` with mlock |
+| `core-crypto` | Argon2id KDF, BLAKE3 HKDF, AES-256-GCM encryption, `SecureBytes`/`SecureVec` with mlock + zeroize-on-drop |
+| `core-config` | TOML configuration schema with XDG layered inheritance, inotify hot-reload watcher, config validation |
+| `core-auth` | Multi-factor authentication: `PasswordBackend` (Argon2id KEK wrapping), `SshAgentBackend` (deterministic signature KEK), `AuthDispatcher`, `VaultMetadata` persistence |
+| `core-secrets` | SQLCipher database abstraction, `KeyLocker` trait, JIT secret cache |
+| `core-profile` | Profile context evaluation, hash-chained BLAKE3 audit logger |
+| `core-fuzzy` | Nucleo fuzzy matching engine with frecency scoring backed by SQLite |
 
 ### Platform and Tooling
 
 | Crate | Purpose |
-|---|---|
-| `open-sesame` | CLI binary (`sesame`) — all user interaction |
-| `platform-linux` | Wayland/COSMIC compositor integration, Landlock sandbox, D-Bus |
-| `platform-macos` | macOS platform abstractions (scaffolded for future) |
-| `platform-windows` | Windows platform abstractions (scaffolded for future) |
-| `sesame-workspace` | Workspace discovery, canonical path convention, git operations |
-| `extension-host` | WASI extension runtime |
-| `extension-sdk` | Extension development SDK |
+|-------|---------|
+| `open-sesame` | CLI binary (`sesame`) -- all user-facing commands |
+| `platform-linux` | Wayland/COSMIC compositor backends (`CosmicBackend`, `WlrBackend`), Landlock sandbox, seccomp-bpf, D-Bus (SSID monitor, Secret Service), COSMIC key injection, systemd notify |
+| `platform-macos` | macOS platform abstractions (scaffolded: accessibility, keychain, launch agents) |
+| `platform-windows` | Windows platform abstractions (scaffolded: credential vault, hotkeys, UI automation) |
+| `sesame-workspace` | Workspace discovery, canonical path convention, git operations, platform-specific root resolution |
+| `extension-host` | WASI extension runtime (Wasmtime + component model) |
+| `extension-sdk` | Extension development SDK (WIT bindings) |
+
+### Key Hierarchy
+
+```text
+User Password
+  |
+  v
+Argon2id(password, per-profile-salt) --> Master Key (32 bytes, mlock'd SecureBytes)
+  |
+  +--> BLAKE3 derive_key("pds v2 vault-key {profile}")          --> SQLCipher page key
+  +--> BLAKE3 derive_key("pds v2 clipboard-key {profile}")       --> Clipboard encryption key
+  +--> BLAKE3 derive_key("pds v2 ipc-auth-token {profile}")      --> IPC auth token
+  +--> BLAKE3 derive_key("pds v2 ipc-encryption-key {profile}")  --> IPC field encryption key
+
+SSH Agent (alternative/additional factor):
+  SSH sign(challenge) --> BLAKE3 derive_key("pds v2 ssh-vault-kek {profile}") --> KEK
+    KEK wraps Master Key via AES-256-GCM --> EnrollmentBlob on disk
+
+All-mode (both factors required):
+  BLAKE3 derive_key("pds v2 combined-master-key {profile}", sorted_factor_pieces) --> Combined Key
+```
 
 ### Security Model
 
-- **Encrypted IPC** — All inter-daemon communication via Noise IK with static keypairs
-- **Encrypted vaults** — SQLCipher (AES-256-CBC with HMAC-SHA512) with Argon2id key derivation
-- **SSH agent unlock** — Master key wrapped under KEK derived from deterministic SSH signatures
-- **Landlock sandboxing** — Filesystem access restricted per daemon on Linux
-- **Hash-chained audit** — Tamper-evident logging of all vault operations
-- **Rate limiting** — Vault unlock attempt throttling
-- **Systemd hardening** — `NoNewPrivileges`, `ProtectSystem=strict`, memory limits
+- **Noise IK encrypted IPC** -- All inter-daemon communication authenticated and encrypted with forward secrecy
+- **SQLCipher encrypted vaults** -- AES-256-CBC with HMAC-SHA512 per page, Argon2id key derivation (19 MiB memory, 2 iterations)
+- **SSH agent unlock** -- Master key wrapped under KEK derived from deterministic SSH signatures (Ed25519/RSA PKCS#1 v1.5)
+- **mlock'd key material** -- `SecureBytes` and `SecureVec` use `mlock(2)` to prevent swap exposure, `MADV_DONTDUMP` to exclude from core dumps, and zeroize all bytes on drop
+- **Landlock filesystem sandboxing** -- Per-daemon path-based access control. Daemons can only access their specific runtime directories. Partially enforced Landlock is treated as a fatal error -- no degradation
+- **seccomp-bpf syscall filtering** -- Per-daemon allowlists. Unallowed syscalls terminate the offending thread (`SECCOMP_RET_KILL_THREAD`) with a SIGSYS handler for visibility
+- **Hash-chained audit log** -- BLAKE3 hash chain provides tamper evidence for all vault operations. `sesame audit verify` detects modifications, deletions, and reorderings
+- **Rate limiting** -- Vault unlock attempts throttled via governor token bucket
+- **systemd hardening** -- `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateNetwork` (secrets daemon), `LimitCORE=0`, memory limits, capability bounding
+- **Environment injection denylist** -- Blocks `LD_PRELOAD`, `BASH_ENV`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `JAVA_TOOL_OPTIONS`, and 30+ other injection vectors across all major runtimes
 
 ### Design Principles
 
-- **Multi-daemon isolation** — Each concern in its own process with minimal privileges
-- **Profile-scoped everything** — Secrets, clipboard, frecency, snippets all scoped to profiles
-- **Fast activation** — Sub-200ms window switching, zero-config defaults
-- **Graceful degradation** — SSH unlock falls back to password, missing daemons don't crash others
-- **Composable configuration** — System policy → user config → drop-ins → profile overrides
+- **Multi-daemon isolation** -- Each concern in its own process with minimal privileges and tailored sandbox
+- **Profile-scoped everything** -- Secrets, clipboard, frecency, snippets, audit all scoped to trust profiles
+- **Fast activation** -- Sub-200ms window switching with staged commit model
+- **Headless-first** -- Every CLI command works from explicit primitives without interactive prompts
+- **Composable configuration** -- System policy --> user config --> drop-ins --> profile overrides --> workspace overrides
+- **Zero graceful degradation** -- Security controls that fail are fatal. No silent fallbacks to weaker modes
+- **Deterministic security** -- No race conditions in lock/unlock. No "should never happen" code paths
 
 ---
 
 ## Requirements
 
-- **COSMIC Desktop Environment** (Pop!_OS 24.04+ or other COSMIC-based distributions)
-- **Wayland** (X11 not supported)
-- **fontconfig** with at least one font installed
-- **Rust 1.91+** (for building from source)
+**Headless (`open-sesame`):**
+- Linux with systemd (255+)
+- libc6, libseccomp2
+
+**Desktop (`open-sesame-desktop`):**
+- COSMIC Desktop Environment or Wayland compositor with `ext-foreign-toplevel` protocol support
+- libwayland-client0, libxkbcommon0, libfontconfig1, libfreetype6, fonts-dejavu-core
+- `input` group membership for daemon-input keyboard capture
 
 **Optional for development:**
 
-- `nix` — Reproducible dev environment with all native deps
-- `mise` — Development task runner (100+ tasks defined in `.mise.toml`)
-- `cargo-deb` — Debian package builder
+- `nix` -- Reproducible dev environment with all native deps
+- `mise` -- Development task runner (100+ tasks defined in `.mise.toml`)
+- `cargo-deb` -- Debian package builder
 
 ---
 
@@ -927,10 +1099,10 @@ All daemons start as systemd user services under `open-sesame.target`, which is 
 
 Contributions are welcome! This project values:
 
-- **Quality over speed** — Take time to write excellent code
-- **Clear documentation** — Code should be self-explanatory
-- **Comprehensive testing** — All quality gates must pass
-- **User empathy** — Features should solve real problems
+- **Quality over speed** -- Take time to write excellent code
+- **Clear documentation** -- Code should be self-explanatory
+- **Comprehensive testing** -- All quality gates must pass
+- **User empathy** -- Features should solve real problems
 
 Before contributing, run the quality gates:
 
@@ -967,12 +1139,16 @@ GNU General Public License for more details.
 
 Built with:
 
-- [Rust](https://www.rust-lang.org/) — Systems programming language
-- [Smithay](https://github.com/Smithay/client-toolkit) — Wayland client toolkit
-- [COSMIC Protocols](https://github.com/pop-os/cosmic-protocols) — System76 COSMIC desktop protocols
-- [snow](https://github.com/mcginty/snow) — Noise protocol framework
-- [SQLCipher](https://www.zetetic.net/sqlcipher/) — Encrypted SQLite (via rusqlite bundled-sqlcipher)
-- [GTK4](https://gtk.org/) — UI toolkit for overlay windows
-- [gtk4-layer-shell](https://github.com/wmww/gtk4-layer-shell) — Wayland layer-shell protocol
+- [Rust](https://www.rust-lang.org/) -- Systems programming language
+- [smithay-client-toolkit](https://github.com/Smithay/client-toolkit) -- Wayland client toolkit for SCTK layer-shell overlay
+- [COSMIC Protocols](https://github.com/pop-os/cosmic-protocols) -- System76 COSMIC desktop Wayland protocols
+- [snow](https://github.com/mcginty/snow) -- Noise Protocol Framework implementation
+- [SQLCipher](https://www.zetetic.net/sqlcipher/) -- Encrypted SQLite (via rusqlite bundled-sqlcipher-vendored-openssl)
+- [tiny-skia](https://github.com/nickel-corp/tiny-skia) -- 2D rendering for overlay
+- [cosmic-text](https://github.com/nickel-corp/cosmic-text) -- Text layout and rendering
+- [nucleo](https://github.com/helix-editor/nucleo) -- Fuzzy matching engine (from Helix editor)
+- [argon2](https://crates.io/crates/argon2) -- Memory-hard password hashing
+- [blake3](https://github.com/BLAKE3-team/BLAKE3) -- HKDF and audit hash chain
+- [aes-gcm](https://crates.io/crates/aes-gcm) -- Authenticated encryption for key wrapping
 
-Inspired by [Vimium](https://github.com/philc/vimium) — The browser extension that proves keyboard navigation is superior.
+Inspired by [Vimium](https://github.com/philc/vimium) -- The browser extension that proves keyboard navigation is superior.
