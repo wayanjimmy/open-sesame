@@ -443,7 +443,12 @@ fn init_installation(org: Option<&str>) -> anyhow::Result<()> {
 async fn init_services() -> anyhow::Result<()> {
     // Check if already running.
     let is_active = std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", "open-sesame.target"])
+        .args([
+            "--user",
+            "is-active",
+            "--quiet",
+            "open-sesame-headless.target",
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -470,38 +475,61 @@ async fn init_services() -> anyhow::Result<()> {
         .status();
 
     // Reset any failed units from prior crash-loops.
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "reset-failed", "open-sesame.target"])
-        .status();
+    // Headless units are always present; desktop units may not be installed.
+    for target in ["open-sesame-headless.target", "open-sesame-desktop.target"] {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "reset-failed", target])
+            .status();
+    }
     for unit in [
         "open-sesame-profile",
         "open-sesame-secrets",
-        "open-sesame-wm",
         "open-sesame-launcher",
+        "open-sesame-snippets",
+        "open-sesame-wm",
         "open-sesame-clipboard",
         "open-sesame-input",
-        "open-sesame-snippets",
     ] {
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "reset-failed", unit])
             .status();
     }
 
-    // Start the target (idempotent if already running).
+    // Start the headless target (always present).
     let start = std::process::Command::new("systemctl")
-        .args(["--user", "start", "open-sesame.target"])
+        .args(["--user", "start", "open-sesame-headless.target"])
         .output()
         .context("failed to run systemctl")?;
 
     if !start.status.success() {
         let stderr = String::from_utf8_lossy(&start.stderr);
         anyhow::bail!(
-            "failed to start daemons: {stderr}\n\
+            "failed to start headless daemons: {stderr}\n\
              Check: journalctl --user -u open-sesame-profile"
         );
     }
 
-    step_done("Starting daemons");
+    step_done("Starting headless daemons");
+
+    // Start the desktop target if installed (non-fatal if missing).
+    let desktop_installed = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "list-unit-files",
+            "open-sesame-desktop.target",
+            "--no-pager",
+            "--no-legend",
+        ])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+
+    if desktop_installed {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "start", "open-sesame-desktop.target"])
+            .status();
+        step_done("Starting desktop daemons");
+    }
 
     // Poll for bus.pub (up to 10s).
     print!("        Waiting for IPC bus ... ");
@@ -833,9 +861,12 @@ pub fn cmd_wipe() -> anyhow::Result<()> {
 
     println!();
 
-    // Stop daemons.
+    // Stop daemons — desktop first, then headless.
     let _ = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "open-sesame.target"])
+        .args(["--user", "stop", "open-sesame-desktop.target"])
+        .status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "open-sesame-headless.target"])
         .status();
     println!("  Stopping daemons ... {}", "done".green());
 

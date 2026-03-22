@@ -92,10 +92,19 @@ run = "cross build --release --target ${TARGET}"
 hide = true
 run = "cargo deb -p open-sesame --no-build"
 
+[tasks."cargo:deb:desktop"]
+hide = true
+run = "cargo deb -p daemon-wm --no-build"
+
 [tasks."cargo:deb:arm64"]
 hide = true
 env.TARGET = "{{vars.arch_arm64}}"
 run = "cargo deb -p open-sesame --no-build --target ${TARGET}"
+
+[tasks."cargo:deb:desktop:arm64"]
+hide = true
+env.TARGET = "{{vars.arch_arm64}}"
+run = "cargo deb -p daemon-wm --no-build --target ${TARGET}"
 
 [tasks."cargo:clean"]
 hide = true
@@ -144,11 +153,7 @@ description = "Build release binary (arm64)"
 
 [tasks."build:deb"]
 alias = [ "bde" ]
-description = "Build all .deb packages (open-sesame + dependencies)"
-depends = [ "build:deb:open-sesame" ]
-
-[tasks."build:deb:open-sesame"]
-description = "Build open-sesame .deb package"
+description = "Build all .deb packages (headless + desktop)"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -158,8 +163,6 @@ mise run docs:man
 mise run docs:completions
 
 # Strip nix store paths from release binaries so .deb works on stock Debian/Ubuntu.
-# The nix devshell's cc-wrapper bakes /nix/store/... as the ELF interpreter and RUNPATH;
-# patchelf resets both to standard system paths before packaging.
 BINS=(sesame daemon-profile daemon-secrets daemon-wm daemon-launcher daemon-clipboard daemon-input daemon-snippets)
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -171,7 +174,11 @@ for bin in "${BINS[@]}"; do
   patchelf --set-interpreter "$INTERP" --remove-rpath "target/release/${bin}"
 done
 
+echo "==> Building headless .deb (open-sesame)..."
 cargo deb -p open-sesame --no-build
+
+echo "==> Building desktop .deb (open-sesame-desktop)..."
+cargo deb -p daemon-wm --no-build
 """
 
 [tasks."build:deb:debug"]
@@ -212,48 +219,70 @@ depends = [ "build:deb:all" ]
 
 [tasks.install]
 alias = [ "i" ]
-description = "Build, install, and start all .deb packages"
+description = "Build, install, and start all .deb packages (headless + desktop)"
 depends = [ "build:deb" ]
 env.BIN = "{{vars.bin}}"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── Stop running services ──────────────────────────────────────────────
-echo "==> Stopping open-sesame services..."
-systemctl --user stop open-sesame.target 2>/dev/null || true
-
-# ── Install .deb packages ─────────────────────────────────────────────
 echo "==> Installing .deb packages..."
-DEBS=()
-for deb in target/debian/open-sesame_*_amd64.deb; do
-  [ -f "$deb" ] && DEBS+=("$deb")
-done
-if [ -z "${DEBS[*]:-}" ]; then
-  echo "ERROR: no .deb packages found in target/debian/" >&2
+HEADLESS_DEB=$(ls -t target/debian/open-sesame_*_amd64.deb 2>/dev/null | head -1)
+DESKTOP_DEB=$(ls -t target/debian/open-sesame-desktop_*_amd64.deb 2>/dev/null | head -1)
+if [ -z "$HEADLESS_DEB" ]; then
+  echo "ERROR: no headless .deb found in target/debian/" >&2
   exit 1
 fi
-sudo dpkg -i "${DEBS[@]}"
-
-# ── Reload and start services ─────────────────────────────────────────
-echo "==> Reloading systemd and starting services..."
-systemctl --user daemon-reload
-systemctl --user enable open-sesame.target
-systemctl --user restart open-sesame.target
+if [ -z "$DESKTOP_DEB" ]; then
+  echo "ERROR: no desktop .deb found in target/debian/" >&2
+  exit 1
+fi
+# dpkg prerm stops services, postinst daemon-reloads + restarts them.
+sudo dpkg -i "$HEADLESS_DEB" "$DESKTOP_DEB"
 
 # ── Verify ────────────────────────────────────────────────────────────
+sleep 2
+echo ""
 echo "==> Installed:"
 ${BIN} --version
 echo ""
 echo "==> Service status:"
-systemctl --user status open-sesame.target --no-pager 2>/dev/null || true
+systemctl --user list-units "open-sesame-*" --no-pager 2>/dev/null || true
+"""
+
+[tasks."install:desktop"]
+alias = [ "id" ]
+description = "Build, install, and start all .deb packages (headless + desktop)"
+depends = [ "install" ]
+
+[tasks."install:headless"]
+alias = [ "ih" ]
+description = "Build, install, and start headless .deb only"
+depends = [ "build:deb" ]
+env.BIN = "{{vars.bin}}"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Installing headless .deb..."
+HEADLESS_DEB=$(ls -t target/debian/open-sesame_*_amd64.deb 2>/dev/null | head -1)
+if [ -z "$HEADLESS_DEB" ]; then
+  echo "ERROR: no headless .deb found in target/debian/" >&2
+  exit 1
+fi
+sudo dpkg -i "$HEADLESS_DEB"
+
+sleep 2
 echo ""
-UNIT_GLOB="open-sesame-*"
-systemctl --user list-units "$UNIT_GLOB" --no-pager 2>/dev/null || true
+echo "==> Installed:"
+${BIN} --version
+echo ""
+echo "==> Service status:"
+systemctl --user list-units "open-sesame-*" --no-pager 2>/dev/null || true
 """
 
 [tasks."install:debug"]
-alias = [ "id" ]
+alias = [ "idbg" ]
 description = "Nuclear clean + install debug .deb + start services"
 env.BIN = "{{vars.bin}}"
 env.DIR_CFG = "{{vars.dir_cfg}}"
@@ -263,7 +292,7 @@ run = """
 set -euo pipefail
 
 echo "==> Stopping open-sesame services..."
-systemctl --user stop open-sesame.target 2>/dev/null || true
+systemctl --user stop open-sesame-headless.target 2>/dev/null || true
 
 mise run clean:all
 mise run build:deb:debug
@@ -275,8 +304,8 @@ ${BIN} --print-config > ~/${DIR_CFG}/config.toml
 
 echo "==> Reloading systemd and starting services..."
 systemctl --user daemon-reload
-systemctl --user enable open-sesame.target
-systemctl --user restart open-sesame.target
+systemctl --user enable open-sesame-headless.target
+systemctl --user restart open-sesame-headless.target
 
 ${BIN} --version
 echo ""
@@ -284,7 +313,7 @@ echo "Debug logging enabled. View logs with:"
 echo "  tail -f ~/${DIR_CACHE}/debug.log"
 echo ""
 echo "==> Service status:"
-systemctl --user status open-sesame.target --no-pager 2>/dev/null || true
+systemctl --user status open-sesame-headless.target --no-pager 2>/dev/null || true
 """
 
 # =============================================================================
@@ -553,7 +582,7 @@ echo "✓ All documentation artifacts generated successfully"
 env.RUSTDOCFLAGS = "-D warnings"
 
 [tasks."ci:build:deb"]
-description = "CI build .deb package (no quality gates - assumes ci:test passed)"
+description = "CI build both .deb packages (amd64)"
 env.TARGET = "{{vars.arch_amd64}}"
 run = """
 #!/usr/bin/env bash
@@ -563,10 +592,11 @@ cargo build --release --target ${TARGET}
 mise run docs:man
 mise run docs:completions
 cargo deb -p open-sesame --no-build --target ${TARGET}
+cargo deb -p daemon-wm --no-build --target ${TARGET}
 """
 
 [tasks."ci:build:deb:arm64"]
-description = "CI build .deb package for arm64"
+description = "CI build both .deb packages (arm64)"
 env.TARGET = "{{vars.arch_arm64}}"
 run = """
 #!/usr/bin/env bash
@@ -576,6 +606,7 @@ cargo build --release --target ${TARGET}
 mise run docs:man
 mise run docs:completions
 cargo deb -p open-sesame --no-build --target ${TARGET}
+cargo deb -p daemon-wm --no-build --target ${TARGET}
 """
 
 [tasks."ci:docs:all"]
@@ -598,23 +629,25 @@ cp -r docs/book combined-docs/book
 """
 
 [tasks."ci:release:rename-deb"]
-description = "CI rename .deb package for release (x86_64)"
+description = "CI rename .deb packages for release (x86_64)"
 env.TARGET = "{{vars.arch_amd64}}"
 run = """
 #!/usr/bin/env bash
 set -euxo pipefail
 # shellcheck disable=SC2086
-mv target/${TARGET}/debian/*.deb "open-sesame-linux-x86_64.deb"
+mv target/${TARGET}/debian/open-sesame_*.deb "open-sesame-linux-x86_64.deb"
+mv target/${TARGET}/debian/open-sesame-desktop_*.deb "open-sesame-desktop-linux-x86_64.deb"
 """
 
 [tasks."ci:release:rename-deb:arm64"]
-description = "CI rename .deb package for release (aarch64)"
+description = "CI rename .deb packages for release (aarch64)"
 env.TARGET = "{{vars.arch_arm64}}"
 run = """
 #!/usr/bin/env bash
 set -euxo pipefail
 # shellcheck disable=SC2086
-mv target/${TARGET}/debian/*.deb "open-sesame-linux-aarch64.deb"
+mv target/${TARGET}/debian/open-sesame_*.deb "open-sesame-linux-aarch64.deb"
+mv target/${TARGET}/debian/open-sesame-desktop_*.deb "open-sesame-desktop-linux-aarch64.deb"
 """
 
 [tasks."ci:release:apt-repo"]
@@ -792,13 +825,15 @@ QUALITY GATES:
 BUILD (all run quality gates first):
   build            (b)    Release binary
   build:debug      (bd)   Debug binary
-  build:deb        (bde)  .deb package
+  build:deb        (bde)  Both .deb packages (headless + desktop)
   build:deb:debug         .deb with debug logging
   build:all        (ba)   All packages
 
 INSTALL:
-  install          (i)    Build + install .deb
-  install:debug    (id)   Nuclear clean + debug .deb
+  install          (i)    Build + install both .debs (headless + desktop)
+  install:desktop  (id)   Same as install (explicit desktop)
+  install:headless (ih)   Build + install headless .deb only
+  install:debug    (idbg) Nuclear clean + debug .deb
 
 CLEAN:
   clean            (c)    Build artifacts (target/, docs/book/)

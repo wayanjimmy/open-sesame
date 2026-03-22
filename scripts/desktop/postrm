@@ -1,0 +1,14 @@
+#!/bin/bash
+# Post-removal script for open-sesame-desktop
+set -e
+
+case "$1" in
+    remove|purge)
+        systemctl reload 'user@*.service' 2>/dev/null || true
+        echo "open-sesame-desktop removed."
+        echo "Headless daemons (open-sesame) are still installed."
+        #DEBHELPER#
+        ;;
+esac
+
+exit 0

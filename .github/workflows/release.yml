@@ -155,12 +155,16 @@ jobs:
         run: |
           sha256sum ./*.deb > SHA256SUMS.txt
           cat SHA256SUMS.txt
-          SHA_X86_64=$(grep linux-x86_64 SHA256SUMS.txt | cut -d' ' -f1)
-          SHA_AARCH64=$(grep linux-aarch64 SHA256SUMS.txt | cut -d' ' -f1)
+          SHA_HEADLESS_X86_64=$(grep "^[a-f0-9].*open-sesame-linux-x86_64\.deb" SHA256SUMS.txt | cut -d' ' -f1)
+          SHA_HEADLESS_AARCH64=$(grep "^[a-f0-9].*open-sesame-linux-aarch64\.deb" SHA256SUMS.txt | cut -d' ' -f1)
+          SHA_DESKTOP_X86_64=$(grep "open-sesame-desktop-linux-x86_64" SHA256SUMS.txt | cut -d' ' -f1)
+          SHA_DESKTOP_AARCH64=$(grep "open-sesame-desktop-linux-aarch64" SHA256SUMS.txt | cut -d' ' -f1)
           sed -e "s/\${TAG}/${TAG}/g" \
               -e "s/\${VERSION}/${VERSION}/g" \
-              -e "s/\${SHA256_X86_64}/${SHA_X86_64}/g" \
-              -e "s/\${SHA256_AARCH64}/${SHA_AARCH64}/g" \
+              -e "s/\${SHA256_HEADLESS_X86_64}/${SHA_HEADLESS_X86_64}/g" \
+              -e "s/\${SHA256_HEADLESS_AARCH64}/${SHA_HEADLESS_AARCH64}/g" \
+              -e "s/\${SHA256_DESKTOP_X86_64}/${SHA_DESKTOP_X86_64}/g" \
+              -e "s/\${SHA256_DESKTOP_AARCH64}/${SHA_DESKTOP_AARCH64}/g" \
               .github/templates/RELEASE_BODY.md > install_instructions.md
 
       - name: Upload assets to release

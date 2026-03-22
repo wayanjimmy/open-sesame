@@ -3,7 +3,7 @@
 #
 # Prerequisites:
 #   - sesame binary in PATH
-#   - Open Sesame systemd user services running (open-sesame.target)
+#   - Open Sesame systemd user services running (open-sesame-headless.target)
 #   - No existing sesame state (or willingness to wipe it)
 #
 # Usage:

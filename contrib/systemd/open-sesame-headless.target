@@ -1,0 +1,8 @@
+[Unit]
+Description=Open Sesame Headless Suite
+Documentation=https://github.com/scopecreep-zip/open-sesame
+# Headless: secrets, profiles, launcher, snippets.
+# No display server required. Suitable for servers, containers, VMs.
+
+[Install]
+WantedBy=default.target

@@ -17,14 +17,18 @@
     in
     {
       packages = forAllSystems (system: {
-        default = (pkgsFor system).callPackage ./nix/package.nix { };
-        open-sesame = self.packages.${system}.default;
-        open-sesame-headless = (pkgsFor system).callPackage ./nix/package-headless.nix { };
+        open-sesame = (pkgsFor system).callPackage ./nix/package.nix { };
+        open-sesame-desktop = (pkgsFor system).callPackage ./nix/package-desktop.nix {
+          open-sesame = self.packages.${system}.open-sesame;
+        };
+        default = self.packages.${system}.open-sesame-desktop;
       });
 
       overlays.default = final: prev: {
         open-sesame = final.callPackage ./nix/package.nix { };
-        open-sesame-headless = final.callPackage ./nix/package-headless.nix { };
+        open-sesame-desktop = final.callPackage ./nix/package-desktop.nix {
+          open-sesame = final.open-sesame;
+        };
       };
 
       homeManagerModules.default =
@@ -38,8 +42,8 @@
           cfg = config.programs.open-sesame;
           tomlFormat = pkgs.formats.toml { };
           systemPkgs = self.packages.${pkgs.stdenv.hostPlatform.system};
-          headlessPkg = systemPkgs.open-sesame-headless;
-          desktopPkg = systemPkgs.default;
+          headlessPkg = systemPkgs.open-sesame;
+          desktopPkg = systemPkgs.open-sesame-desktop;
           isHeadless = cfg.headless;
         in
         {
@@ -192,30 +196,38 @@
               "d %h/.cache/fontconfig 0755 - - -"
             ];
 
-            # Grouping target — start/stop all daemons together.
-            # Desktop: pulled in by graphical-session.target.
-            # Headless: pulled in by default.target (no display server needed).
-            systemd.user.targets.open-sesame = {
+            # === Headless target — always installed ===
+            systemd.user.targets.open-sesame-headless = {
               Unit = {
-                Description = "Open Sesame ${if isHeadless then "Headless" else "Desktop"} Suite";
+                Description = "Open Sesame Headless Suite";
                 Documentation = "https://github.com/scopecreep-zip/open-sesame";
-              } // lib.optionalAttrs (!isHeadless) {
-                Requires = [ "graphical-session.target" ];
-                After = [ "graphical-session.target" ];
               };
               Install = {
-                WantedBy = [ (if isHeadless then "default.target" else "graphical-session.target") ];
+                WantedBy = [ "default.target" ];
               };
             };
+
+            # === Desktop target — only if not headless ===
+            systemd.user.targets.open-sesame-desktop = lib.mkIf (!isHeadless) {
+              Unit = {
+                Description = "Open Sesame Desktop Suite";
+                Documentation = "https://github.com/scopecreep-zip/open-sesame";
+                Requires = [ "open-sesame-headless.target" "graphical-session.target" ];
+                After = [ "open-sesame-headless.target" "graphical-session.target" ];
+              };
+              Install = {
+                WantedBy = [ "graphical-session.target" ];
+              };
+            };
+
+            # === Headless daemons ===
 
             # Profile daemon — IPC bus server, must start before all other daemons.
             systemd.user.services.open-sesame-profile = {
               Unit = {
                 Description = "Open Sesame profile daemon (IPC bus)";
                 Documentation = "https://github.com/scopecreep-zip/open-sesame";
-                PartOf = [ "open-sesame.target" ];
-              } // lib.optionalAttrs (!isHeadless) {
-                After = [ "graphical-session.target" ];
+                PartOf = [ "open-sesame-headless.target" ];
               };
               Service = {
                 Type = "notify";
@@ -232,12 +244,10 @@
                 LimitCORE = 0;
                 MemoryMax = "128M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
-                # SSH agent env written by profile.d hook on each SSH login.
-                # %h expands to user home; - prefix makes missing file non-fatal.
                 EnvironmentFile = [ "-%h/.config/pds/ssh-agent.env" ];
               };
               Install = {
-                WantedBy = [ "open-sesame.target" ];
+                WantedBy = [ "open-sesame-headless.target" ];
               };
             };
 
@@ -248,7 +258,7 @@
                 Documentation = "https://github.com/scopecreep-zip/open-sesame";
                 Requires = [ "open-sesame-profile.service" ];
                 After = [ "open-sesame-profile.service" ];
-                PartOf = [ "open-sesame.target" ];
+                PartOf = [ "open-sesame-headless.target" ];
               };
               Service = {
                 Type = "notify";
@@ -261,7 +271,6 @@
                 PrivateNetwork = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
-
                 ReadWritePaths = [ "%t/pds" "%h/.config/pds" ];
                 LimitNOFILE = 1024;
                 LimitCORE = 0;
@@ -270,7 +279,7 @@
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };
               Install = {
-                WantedBy = [ "open-sesame.target" ];
+                WantedBy = [ "open-sesame-headless.target" ];
               };
             };
 
@@ -281,7 +290,7 @@
                 Documentation = "https://github.com/scopecreep-zip/open-sesame";
                 Requires = [ "open-sesame-profile.service" ];
                 After = [ "open-sesame-profile.service" ];
-                PartOf = [ "open-sesame.target" ];
+                PartOf = [ "open-sesame-headless.target" ];
               };
               Service = {
                 Type = "notify";
@@ -291,8 +300,6 @@
                 TimeoutStopSec = 5;
                 WatchdogSec = 30;
                 NoNewPrivileges = true;
-                # No ProtectHome/ProtectSystem/MemoryMax — mount namespace and
-                # cgroup limits inherit to children even through systemd-run --scope.
                 ProtectClock = true;
                 ProtectKernelTunables = true;
                 ProtectKernelModules = true;
@@ -308,11 +315,41 @@
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };
               Install = {
-                WantedBy = [ "open-sesame.target" ];
+                WantedBy = [ "open-sesame-headless.target" ];
               };
             };
 
-            # === GUI-only daemons (skipped in headless mode) ===
+            # Snippets daemon.
+            systemd.user.services.open-sesame-snippets = {
+              Unit = {
+                Description = "Open Sesame snippets daemon";
+                Documentation = "https://github.com/scopecreep-zip/open-sesame";
+                Requires = [ "open-sesame-profile.service" ];
+                After = [ "open-sesame-profile.service" ];
+                PartOf = [ "open-sesame-headless.target" ];
+              };
+              Service = {
+                Type = "notify";
+                ExecStart = "${cfg.package}/bin/daemon-snippets";
+                Restart = "on-failure";
+                RestartSec = 5;
+                TimeoutStopSec = 5;
+                WatchdogSec = 30;
+                NoNewPrivileges = true;
+                ProtectHome = "read-only";
+                ProtectSystem = "strict";
+                ReadWritePaths = [ "%t/pds" ];
+                LimitNOFILE = 4096;
+                LimitCORE = 0;
+                MemoryMax = "128M";
+                Environment = [ "RUST_LOG=${cfg.logLevel}" ];
+              };
+              Install = {
+                WantedBy = [ "open-sesame-headless.target" ];
+              };
+            };
+
+            # === Desktop-only daemons (skipped in headless mode) ===
 
             # Window manager daemon — overlay window switcher.
             systemd.user.services.open-sesame-wm = lib.mkIf (!isHeadless) {
@@ -321,7 +358,7 @@
                 Documentation = "https://github.com/scopecreep-zip/open-sesame";
                 Requires = [ "open-sesame-profile.service" ];
                 After = [ "open-sesame-profile.service" ];
-                PartOf = [ "open-sesame.target" ];
+                PartOf = [ "open-sesame-desktop.target" ];
               };
               Service = {
                 Type = "notify";
@@ -338,11 +375,10 @@
                 LimitCORE = 0;
                 MemoryMax = "128M";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
-                # SSH agent env for auto-unlock via forwarded agent.
                 EnvironmentFile = [ "-%h/.config/pds/ssh-agent.env" ];
               };
               Install = {
-                WantedBy = [ "open-sesame.target" ];
+                WantedBy = [ "open-sesame-desktop.target" ];
               };
             };
 
@@ -353,7 +389,7 @@
                 Documentation = "https://github.com/scopecreep-zip/open-sesame";
                 Requires = [ "open-sesame-profile.service" ];
                 After = [ "open-sesame-profile.service" ];
-                PartOf = [ "open-sesame.target" ];
+                PartOf = [ "open-sesame-desktop.target" ];
               };
               Service = {
                 Type = "notify";
@@ -372,19 +408,18 @@
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };
               Install = {
-                WantedBy = [ "open-sesame.target" ];
+                WantedBy = [ "open-sesame-desktop.target" ];
               };
             };
 
             # Input daemon — evdev keyboard capture for IPC keyboard routing.
-            # Requires `input` group membership for /dev/input/* access.
             systemd.user.services.open-sesame-input = lib.mkIf (!isHeadless) {
               Unit = {
                 Description = "Open Sesame input daemon";
                 Documentation = "https://github.com/scopecreep-zip/open-sesame";
                 Requires = [ "open-sesame-profile.service" ];
                 After = [ "open-sesame-profile.service" ];
-                PartOf = [ "open-sesame.target" ];
+                PartOf = [ "open-sesame-desktop.target" ];
               };
               Service = {
                 Type = "notify";
@@ -396,7 +431,6 @@
                 NoNewPrivileges = true;
                 ProtectHome = "read-only";
                 ProtectSystem = "strict";
-
                 ReadWritePaths = [ "%t/pds" ];
                 LimitNOFILE = 4096;
                 LimitCORE = 0;
@@ -404,38 +438,7 @@
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
               };
               Install = {
-                WantedBy = [ "open-sesame.target" ];
-              };
-            };
-
-            # Snippets daemon.
-            systemd.user.services.open-sesame-snippets = {
-              Unit = {
-                Description = "Open Sesame snippets daemon";
-                Documentation = "https://github.com/scopecreep-zip/open-sesame";
-                Requires = [ "open-sesame-profile.service" ];
-                After = [ "open-sesame-profile.service" ];
-                PartOf = [ "open-sesame.target" ];
-              };
-              Service = {
-                Type = "notify";
-                ExecStart = "${cfg.package}/bin/daemon-snippets";
-                Restart = "on-failure";
-                RestartSec = 5;
-                TimeoutStopSec = 5;
-                WatchdogSec = 30;
-                NoNewPrivileges = true;
-                ProtectHome = "read-only";
-                ProtectSystem = "strict";
-
-                ReadWritePaths = [ "%t/pds" ];
-                LimitNOFILE = 4096;
-                LimitCORE = 0;
-                MemoryMax = "128M";
-                Environment = [ "RUST_LOG=${cfg.logLevel}" ];
-              };
-              Install = {
-                WantedBy = [ "open-sesame.target" ];
+                WantedBy = [ "open-sesame-desktop.target" ];
               };
             };
           };

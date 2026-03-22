@@ -53,3 +53,32 @@ platform-windows = { workspace = true }
 [dev-dependencies]
 tempfile    = { workspace = true }
 tokio-test  = { workspace = true }
+
+[package.metadata.deb]
+name = "open-sesame-desktop"
+maintainer = "usrbinkat"
+copyright = "2024-2026 scopecreep.zip"
+license-file = ["../LICENSE", "0"]
+depends = "open-sesame, libc6, libgcc-s1, libseccomp2, libxkbcommon0, libwayland-client0, libfontconfig1, libfreetype6, fonts-dejavu-core"
+recommends = "xdg-utils, fontconfig"
+suggests = "cosmic-desktop"
+section = "utils"
+priority = "optional"
+extended-description = """\
+Open Sesame desktop layer: Vimium-style window switcher, clipboard manager, \
+and keyboard input capture for COSMIC/Wayland. Requires the open-sesame \
+headless package for core infrastructure (profiles, secrets, launcher, snippets)."""
+
+maintainer-scripts = "../scripts/desktop/"
+
+assets = [
+    # Desktop daemon binaries
+    ["target/release/daemon-wm", "/usr/bin/daemon-wm", "755"],
+    ["target/release/daemon-clipboard", "/usr/bin/daemon-clipboard", "755"],
+    ["target/release/daemon-input", "/usr/bin/daemon-input", "755"],
+    # Desktop systemd units
+    ["../contrib/systemd/open-sesame-desktop.target", "/usr/lib/systemd/user/open-sesame-desktop.target", "644"],
+    ["../contrib/systemd/open-sesame-wm.service", "/usr/lib/systemd/user/open-sesame-wm.service", "644"],
+    ["../contrib/systemd/open-sesame-clipboard.service", "/usr/lib/systemd/user/open-sesame-clipboard.service", "644"],
+    ["../contrib/systemd/open-sesame-input.service", "/usr/lib/systemd/user/open-sesame-input.service", "644"],
+]

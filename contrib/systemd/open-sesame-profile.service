@@ -1,8 +1,7 @@
 [Unit]
 Description=Open Sesame profile daemon (IPC bus)
 Documentation=https://github.com/scopecreep-zip/open-sesame
-After=graphical-session.target
-PartOf=open-sesame.target
+PartOf=open-sesame-headless.target
 
 [Service]
 Type=notify
@@ -30,4 +29,4 @@ Environment=RUST_LOG=info
 EnvironmentFile=-%h/.config/pds/ssh-agent.env
 
 [Install]
-WantedBy=open-sesame.target
+WantedBy=open-sesame-headless.target

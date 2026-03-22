@@ -4,13 +4,7 @@
   rustPlatform,
   pkg-config,
   installShellFiles,
-  makeWrapper,
   openssl,
-  fontconfig,
-  wayland,
-  wayland-protocols,
-  libxkbcommon,
-  xkeyboard-config,
   libseccomp,
 }:
 
@@ -19,6 +13,8 @@ let
 
   # Source filter: only include files needed for cargo build.
   # Excludes docs, analysis files, CI configs, v1 source, and other non-build assets.
+  # NOTE: All crate dirs are included because Cargo.lock references workspace members
+  # and cargo needs their Cargo.toml files to resolve the lock, even if they aren't built.
   rootDir = ./..;
   rootEntries = builtins.attrNames (builtins.readDir rootDir);
   isCrateDir = name:
@@ -40,32 +36,26 @@ let
         ../rust-toolchain.toml
         ../config.example.toml
         ../.cargo
+        ../contrib
       ]
       ++ map (name: rootDir + "/${name}") crateDirs
     );
   };
 
-  # All crates that produce binaries (excludes library-only crates and xtask).
+  # Headless binary crates only — no GUI daemons.
   binaryCrates = [
     "open-sesame"
     "daemon-profile"
     "daemon-secrets"
     "daemon-launcher"
-    "daemon-wm"
-    "daemon-clipboard"
-    "daemon-input"
     "daemon-snippets"
   ];
 
-  # Expected binary names (open-sesame produces "sesame" via [[bin]]).
   expectedBinaries = [
     "sesame"
     "daemon-profile"
     "daemon-secrets"
     "daemon-launcher"
-    "daemon-wm"
-    "daemon-clipboard"
-    "daemon-input"
     "daemon-snippets"
   ];
 in
@@ -78,6 +68,7 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../Cargo.lock;
     outputHashes = {
+      # Required by Cargo.lock even though headless doesn't build these crates.
       "cosmic-client-toolkit-0.2.0" = "sha256-ymn+BUTTzyHquPn4hvuoA3y1owFj8LVrmsPu2cdkFQ8=";
       "cosmic-protocols-0.2.0" = "sha256-ymn+BUTTzyHquPn4hvuoA3y1owFj8LVrmsPu2cdkFQ8=";
       "nucleo-0.5.0" = "sha256-Hm4SxtTSBrcWpXrtSqeO0TACbUxq3gizg1zD/6Yw/sI=";
@@ -87,43 +78,26 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     pkg-config
     installShellFiles
-    makeWrapper
   ];
 
   buildInputs = [
     openssl
-    fontconfig
-    wayland
-    wayland-protocols
-    libxkbcommon
     libseccomp
   ];
 
-  # Explicit --package flags for each binary crate. Using --workspace would
-  # also work for the build, but cargoBuildHook may implicitly filter to
-  # pname-derived binaries. Explicit package list avoids ambiguity.
+  # Build headless crates with desktop features disabled.
   cargoBuildFlags =
-    lib.concatMap (c: [ "--package" c ]) binaryCrates;
+    (lib.concatMap (c: [ "--package" c ]) binaryCrates)
+    ++ [ "--no-default-features" ];
 
-  cargoTestFlags = [ "--workspace" ];
+  cargoTestFlags =
+    (lib.concatMap (c: [ "--package" c ]) binaryCrates)
+    ++ [ "--no-default-features" ];
 
-  # Tests that create $HOME/.cache/ dirs fail in the nix sandbox (/homeless-shelter)
   preCheck = ''
     export HOME=$(mktemp -d)
   '';
 
-  # Generate man pages and shell completions via xtask.
-  # TODO: xtask is in [workspace] exclude — cargo cannot resolve it as a
-  # workspace member and its deps are not in the vendored directory.
-  # Re-enable once xtask is moved into workspace members or given its own
-  # Cargo.lock for standalone vendoring.
-  # postBuild = ''
-  #   cargo run --manifest-path xtask/Cargo.toml -- man
-  #   cargo run --manifest-path xtask/Cargo.toml -- completions
-  # '';
-
-  # Bypass the default cargoInstallHook which only installs one binary.
-  # All binaries are already compiled in target/release/ by cargoBuildHook.
   dontCargoInstall = true;
 
   installPhase = ''
@@ -135,25 +109,21 @@ rustPlatform.buildRustPackage {
       install -Dm755 "$releaseDir/$bin" "$out/bin/$bin"
     done
 
-    # TODO: re-enable once xtask postBuild is restored
-    # installManPage target/man/sesame.1.gz
-    #
-    # installShellCompletion --cmd sesame \
-    #   --bash target/completions/sesame.bash \
-    #   --zsh target/completions/_sesame \
-    #   --fish target/completions/sesame.fish
-
     install -Dm644 config.example.toml $out/share/doc/open-sesame/config.example.toml
 
-    # daemon-wm uses libxkbcommon which needs evdev rules at runtime.
-    wrapProgram $out/bin/daemon-wm \
-      --set XKB_CONFIG_ROOT "${xkeyboard-config}/etc/X11/xkb"
+    # Headless systemd units
+    install -Dm644 contrib/systemd/open-sesame-headless.target \
+      $out/lib/systemd/user/open-sesame-headless.target
+    for svc in profile secrets launcher snippets; do
+      install -Dm644 "contrib/systemd/open-sesame-$svc.service" \
+        "$out/lib/systemd/user/open-sesame-$svc.service"
+    done
 
     runHook postInstall
   '';
 
   meta = with lib; {
-    description = "Programmable desktop suite — window switcher, launcher, secrets, and orchestration for COSMIC/Wayland";
+    description = "Open Sesame — secrets, profiles, launcher, snippets (headless)";
     homepage = "https://github.com/ScopeCreep-zip/open-sesame";
     license = licenses.mit;
     maintainers = [ ];

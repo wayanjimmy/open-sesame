@@ -1,0 +1,42 @@
+#!/bin/bash
+# Pre-removal script for open-sesame-desktop
+set -e
+
+active_user_uids() {
+    systemctl list-units 'user@*' --legend=no 2>/dev/null \
+        | sed -n 's/.*user@\([0-9]\+\)\.service.*/\1/p'
+}
+
+case "$1" in
+    remove|deconfigure)
+        for uid in $(active_user_uids); do
+            SYSTEMD_BUS_TIMEOUT=25s systemctl --user -M "$uid@" \
+                stop open-sesame-input.service 2>/dev/null || true
+            SYSTEMD_BUS_TIMEOUT=25s systemctl --user -M "$uid@" \
+                stop open-sesame-clipboard.service 2>/dev/null || true
+            SYSTEMD_BUS_TIMEOUT=25s systemctl --user -M "$uid@" \
+                stop open-sesame-wm.service 2>/dev/null || true
+        done
+
+        systemctl --global disable \
+            open-sesame-wm.service \
+            open-sesame-clipboard.service \
+            open-sesame-input.service \
+            open-sesame-desktop.target \
+            2>/dev/null || true
+        #DEBHELPER#
+        ;;
+    upgrade)
+        for uid in $(active_user_uids); do
+            SYSTEMD_BUS_TIMEOUT=25s systemctl --user -M "$uid@" \
+                stop open-sesame-input.service 2>/dev/null || true
+            SYSTEMD_BUS_TIMEOUT=25s systemctl --user -M "$uid@" \
+                stop open-sesame-clipboard.service 2>/dev/null || true
+            SYSTEMD_BUS_TIMEOUT=25s systemctl --user -M "$uid@" \
+                stop open-sesame-wm.service 2>/dev/null || true
+        done
+        #DEBHELPER#
+        ;;
+esac
+
+exit 0
