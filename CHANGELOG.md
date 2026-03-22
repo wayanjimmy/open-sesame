@@ -7,6 +7,84 @@ curl -fsSL https://scopecreep-zip.github.io/open-sesame/gpg.key \
   | sudo gpg --dearmor -o /usr/share/keyrings/open-sesame.gpg
 echo "deb [signed-by=/usr/share/keyrings/open-sesame.gpg] https://scopecreep-zip.github.io/open-sesame noble main" \
   | sudo tee /etc/apt/sources.list.d/open-sesame.list
+sudo apt update
+```
+
+**Desktop** (window switcher + clipboard + input + headless):
+```bash
+sudo apt install -y open-sesame open-sesame-desktop
+```
+
+**Headless** (secrets, profiles, launcher, snippets — no GUI):
+```bash
+sudo apt install -y open-sesame
+```
+
+### Direct Download
+
+See release assets below for `.deb` packages (amd64/arm64) with SHA256 checksums.
+
+## What You Get
+
+### open-sesame (headless)
+- **Encrypted secret vaults** with multi-factor auth (password + SSH agent)
+- **Trust profiles** with context-driven activation
+- **Application launcher** with fuzzy search and secret injection
+- **Snippet expansion** with variable substitution
+
+### open-sesame-desktop (requires open-sesame)
+- **Alt+Space** — Window switcher overlay with Vimium-style letter hints
+- **Alt+Tab** — Quick-switch to previous window
+- **Clipboard manager** with security classification
+- **Keyboard input capture** for compositor-independent shortcuts
+
+## Documentation
+
+- **[User Guide](https://scopecreep-zip.github.io/open-sesame/book/)** — Configuration, keybindings, theming
+- **[API Docs](https://scopecreep-zip.github.io/open-sesame/doc/open_sesame/)** — Library reference
+
+## Supply Chain Security
+
+All `.deb` packages include [SLSA Build Provenance](https://slsa.dev/) attestations. Verify with:
+```bash
+gh attestation verify "open-sesame-linux-$(uname -m).deb" --owner ScopeCreep-zip
+gh attestation verify "open-sesame-desktop-linux-$(uname -m).deb" --owner ScopeCreep-zip
+```
+
+---
+
+## [1.5.0](https://github.com/ScopeCreep-zip/open-sesame/compare/v1.4.2...v1.5.0) (2026-03-22)
+
+### ✨ Features
+
+* **packaging:** split into open-sesame (headless) and open-sesame-desktop packages ([627f7a8](https://github.com/ScopeCreep-zip/open-sesame/commit/627f7a8e2292924091b200e8846e9dc1eccc4d4f))
+
+### 🐛 Bug Fixes
+
+* **security:** harden memory protection, IPC clearance, and sandbox resilience ([1601fb4](https://github.com/ScopeCreep-zip/open-sesame/commit/1601fb4e857e31c554142979cd60255c8d80af56))
+* **wm,launcher:** audit remediations, launch pipeline, overlay rewrite ([0108d77](https://github.com/ScopeCreep-zip/open-sesame/commit/0108d779abc1016b2237ff3bd405879b059cf257))
+
+### ♻️ Code Refactoring
+
+* **core-config:** decompose schema and loader into domain modules ([b828345](https://github.com/ScopeCreep-zip/open-sesame/commit/b8283452f1a62cb275569ad2aa90b1de476181f7))
+* **core-ipc:** split noise.rs into protocol transport and key management ([284f947](https://github.com/ScopeCreep-zip/open-sesame/commit/284f947b07c53378904b0e70c4ceb43c0604e375))
+* **core-types:** decompose monolithic lib.rs into flat module structure ([ccbe8d2](https://github.com/ScopeCreep-zip/open-sesame/commit/ccbe8d2c46d84719a784f36646d00d2e3a49e685))
+* **daemon-launcher,daemon-wm:** final decomposition wave ([b96b231](https://github.com/ScopeCreep-zip/open-sesame/commit/b96b2317980e152a8baf630409cb9b47c5975b8e))
+* **daemon-profile:** decompose monolithic main.rs into flat module structure ([5eb22c3](https://github.com/ScopeCreep-zip/open-sesame/commit/5eb22c3000de3a10193b16f5d146e78331d47ea0))
+* **daemon-secrets:** decompose monolithic main.rs into flat module structure ([3fc9000](https://github.com/ScopeCreep-zip/open-sesame/commit/3fc9000c195bdf62262b09ab6b2b9637e2084a04))
+* **daemon-wm:** extract commands, sandbox, and ipc_keys from main.rs ([dca7522](https://github.com/ScopeCreep-zip/open-sesame/commit/dca75229c4d1d9d2c6cc20768db7695738f935d1))
+* **open-sesame:** decompose monolithic main.rs into flat module structure ([b504ed8](https://github.com/ScopeCreep-zip/open-sesame/commit/b504ed81df079c7b6b351c706de9fc7f7ee0cece))
+* **platform-linux:** decompose compositor.rs for multi-backend support ([346630d](https://github.com/ScopeCreep-zip/open-sesame/commit/346630d88743ec2e6befc4ebec3c667091afab12))
+
+## Quick Install
+
+### APT Repository (recommended)
+
+```bash
+curl -fsSL https://scopecreep-zip.github.io/open-sesame/gpg.key \
+  | sudo gpg --dearmor -o /usr/share/keyrings/open-sesame.gpg
+echo "deb [signed-by=/usr/share/keyrings/open-sesame.gpg] https://scopecreep-zip.github.io/open-sesame noble main" \
+  | sudo tee /etc/apt/sources.list.d/open-sesame.list
 sudo apt update && sudo apt install -y open-sesame
 sesame --setup-keybinding
 ```
