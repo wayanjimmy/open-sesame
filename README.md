@@ -37,25 +37,37 @@ Install `open-sesame-desktop` and it pulls in `open-sesame` automatically. On a 
 
 ## Quick Start
 
+Add the GPG key:
+
 ```bash
-# Add the APT repository
-curl -fsSL https://scopecreep-zip.github.io/open-sesame/gpg.key \
-  | sudo gpg --dearmor -o /usr/share/keyrings/open-sesame.gpg
-echo "deb [signed-by=/usr/share/keyrings/open-sesame.gpg] https://scopecreep-zip.github.io/open-sesame noble main" \
-  | sudo tee /etc/apt/sources.list.d/open-sesame.list
-sudo apt update
+curl -fsSL https://scopecreep-zip.github.io/open-sesame/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/open-sesame.gpg
+```
 
-# On a desktop
-sudo apt install -y open-sesame open-sesame-desktop
+Add the APT repository:
 
-# On a server (no GUI needed)
-sudo apt install -y open-sesame
+```bash
+echo "deb [signed-by=/usr/share/keyrings/open-sesame.gpg] https://scopecreep-zip.github.io/open-sesame noble main" | sudo tee /etc/apt/sources.list.d/open-sesame.list
+```
+
+Install on a desktop:
+
+```bash
+sudo apt update && sudo apt install -y open-sesame open-sesame-desktop
+```
+
+Or install headless only (servers, containers, VMs -- no GUI dependencies):
+
+```bash
+sudo apt update && sudo apt install -y open-sesame
 ```
 
 All daemons start automatically after install. Run `sesame init` to create your config directory, generate IPC keypairs, and set a master password for your first vault:
 
 ```bash
 sesame init
+```
+
+```bash
 sesame status
 ```
 
