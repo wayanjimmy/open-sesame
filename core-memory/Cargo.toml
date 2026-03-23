@@ -1,6 +1,6 @@
 [package]
 name = "core-memory"
-description = "Page-aligned secure memory allocator for secret-carrying buffers"
+description = "Page-aligned secure memory allocator backed by memfd_secret(2)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,6 @@ repository.workspace = true
 
 [features]
 default = []
-# When enabled, mlock failure is non-fatal. ONLY for testing in CI environments
-# with restricted RLIMIT_MEMLOCK. NEVER enable in production.
-soft-mlock = []
 
 [dependencies]
 zeroize = { workspace = true }

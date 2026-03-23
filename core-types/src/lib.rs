@@ -34,13 +34,16 @@ pub use security::*;
 pub use sensitive::*;
 pub use window::*;
 
-/// Initialize the secure memory subsystem. Must be called before seccomp
-/// sandbox is applied in every daemon process.
+/// Initialize the secure memory subsystem. **Must be called before seccomp
+/// sandbox is applied** in every daemon process.
 ///
-/// Probes for `memfd_secret(2)` support and caches the result. If seccomp
-/// is active when the first `ProtectedAlloc` is created, the probe syscall
-/// (447) would be blocked and kill the thread. Calling this function early
-/// ensures the probe happens before sandbox setup.
+/// Probes for `memfd_secret(2)` (syscall 447) and caches the result.
+/// Logs the security posture:
+/// - `INFO` with `backend=memfd_secret` when direct-map removal is active
+/// - `ERROR` with `SECURITY DEGRADED` when falling back to `mmap(MAP_ANONYMOUS)`
+///
+/// The degraded state means secret pages are readable via `/proc/pid/mem`
+/// and the deployment does not meet IL5/IL6/STIG/PCI-DSS requirements.
 pub fn init_secure_memory() {
     core_memory::init();
 }

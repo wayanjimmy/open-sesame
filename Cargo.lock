@@ -846,6 +846,7 @@ name = "core-memory"
 version = "1.5.2"
 dependencies = [
  "libc",
+ "tracing",
  "zeroize",
 ]
 

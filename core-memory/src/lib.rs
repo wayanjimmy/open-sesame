@@ -1,17 +1,22 @@
 //! Page-aligned secure memory allocator for Open Sesame.
 //!
 //! Provides [`ProtectedAlloc`] — a page-aligned memory region backed by
-//! `mmap(2)` with:
+//! `memfd_secret(2)` (Linux 5.14+, `CONFIG_SECRETMEM=y`) with:
 //!
-//! - **Guard pages**: `PROT_NONE` pages before and after the data region.
-//!   Buffer overflows and underflows trigger `SIGSEGV` immediately.
-//! - **mlock**: Prevents the kernel from swapping secret pages to disk.
-//! - **madvise(MADV_DONTDUMP)**: Excludes secret pages from core dumps
-//!   (Linux only; no equivalent on macOS).
-//! - **Canary values**: 16-byte random canary before user data, verified on
-//!   free to detect heap corruption.
-//! - **Zeroize-on-drop**: Volatile-write zeros to the entire data region
-//!   before `munmap`, preventing data remanence.
+//! - **Secret memory**: pages removed from the kernel direct map, invisible
+//!   to `/proc/pid/mem`, kernel modules, DMA attacks, and `ptrace` as root
+//! - **Guard pages**: `PROT_NONE` pages before and after the data region —
+//!   buffer overflows and underflows trigger `SIGSEGV` immediately
+//! - **Canary values**: 16-byte random canary before user data, verified in
+//!   constant time on drop — corruption aborts the process
+//! - **Zeroize-on-drop**: volatile-write zeros to the entire data region
+//!   before `munmap`, preventing data remanence
+//!
+//! On systems without `memfd_secret` (older kernels, missing `CONFIG_SECRETMEM`),
+//! falls back to `mmap(MAP_ANONYMOUS)` with `mlock` + `MADV_DONTDUMP`. This
+//! fallback is a **security degradation** — pages remain on the kernel direct
+//! map and are readable via `/proc/pid/mem`. An `ERROR`-level audit log is
+//! emitted on every daemon startup when operating in fallback mode.
 //!
 //! # Memory layout
 //!
@@ -21,14 +26,12 @@
 //! ```
 //!
 //! User data is right-aligned within the data pages so that buffer overflows
-//! hit the trailing guard page. A 16-byte canary sits immediately before the
-//! user data.
+//! hit the trailing guard page.
 //!
 //! # Platform support
 //!
-//! - **Linux**: full support (mmap, mlock, madvise MADV_DONTDUMP, getrandom)
-//! - **macOS**: full support (mmap, mlock, getentropy, MADV_ZERO_WIRED_PAGES)
-//! - **Other Unix**: compiles but returns `Unsupported` error at runtime
+//! - **Linux 5.14+** with `CONFIG_SECRETMEM=y`: full protection (memfd_secret)
+//! - **Linux < 5.14** or without `CONFIG_SECRETMEM`: degraded (mmap fallback, audit-logged)
 //! - **Non-Unix**: compiles with a stub that always returns `Unsupported`
 
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -43,45 +46,50 @@ pub use alloc::ProtectedAllocError;
 
 /// Initialize the secure memory subsystem.
 ///
-/// **Must be called before seccomp/sandbox is applied.** This probes for
-/// `memfd_secret(2)` support (Linux 5.14+) via a raw syscall. If seccomp
-/// is already active and doesn't allow syscall 447, the probe would kill
-/// the calling thread. Calling `init()` early caches the probe result so
-/// all subsequent allocations skip the probe.
+/// **Must be called before seccomp/sandbox is applied.** Probes for
+/// `memfd_secret(2)` via raw syscall 447. If seccomp is already active,
+/// the probe would be killed. Calling `init()` pre-sandbox caches the
+/// result for all subsequent allocations.
 ///
-/// Also initializes the process-wide canary and page size cache.
+/// Logs the security posture at `INFO` (memfd_secret available) or
+/// `ERROR` (fallback mode with degraded protection).
 ///
-/// Safe to call multiple times — all initializations are idempotent via
-/// `OnceLock`.
+/// Safe to call multiple times — all initializations are idempotent.
 pub fn init() {
     #[cfg(unix)]
     {
-        // Query RLIMIT_MEMLOCK for diagnostic logging.
-        // SAFETY: getrlimit with RLIMIT_MEMLOCK is always safe. rlim is
-        // a stack-allocated struct zeroed before the call.
+        // SAFETY: getrlimit with RLIMIT_MEMLOCK is always safe.
         let memlock_limit = unsafe {
             let mut rlim: libc::rlimit = std::mem::zeroed();
             libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim);
             rlim.rlim_cur
         };
 
-        // Force canary, page size, and memfd_secret probe initialization.
-        // The probe allocation exercises all code paths. The memfd_secret
-        // probe result is logged from within try_memfd_secret_mmap().
         match ProtectedAlloc::new(1) {
             Ok(probe) => {
-                let backend = if probe.is_secret_mem() {
-                    "memfd_secret (pages removed from kernel direct map)"
+                if probe.is_secret_mem() {
+                    tracing::info!(
+                        audit = "memory-protection",
+                        event_type = "secure-memory-ready",
+                        backend = "memfd_secret",
+                        rlimit_memlock_bytes = memlock_limit,
+                        "secure memory: memfd_secret active — secret pages removed from \
+                         kernel direct map, invisible to /proc/pid/mem and ptrace"
+                    );
                 } else {
-                    "mmap(MAP_ANONYMOUS) with mlock"
-                };
-                tracing::info!(
-                    audit = "memory-protection",
-                    event_type = "secure-memory-ready",
-                    backend,
-                    rlimit_memlock_bytes = memlock_limit,
-                    "secure memory subsystem ready"
-                );
+                    tracing::error!(
+                        audit = "memory-protection",
+                        event_type = "secure-memory-degraded",
+                        backend = "mmap(MAP_ANONYMOUS) fallback",
+                        rlimit_memlock_bytes = memlock_limit,
+                        "SECURITY DEGRADED: memfd_secret unavailable — using mmap fallback. \
+                         Secret pages remain on the kernel direct map and are readable via \
+                         /proc/pid/mem by any same-UID process. This does NOT meet the \
+                         security requirements for IL5/IL6, STIG, or PCI-DSS deployments. \
+                         Required: Linux >= 5.14 with CONFIG_SECRETMEM=y. \
+                         Check: zgrep CONFIG_SECRETMEM /proc/config.gz"
+                    );
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -89,9 +97,9 @@ pub fn init() {
                     event_type = "secure-memory-init-failed",
                     error = %e,
                     rlimit_memlock_bytes = memlock_limit,
-                    "secure memory initialization failed — all secret-carrying \
-                     types will panic on allocation. Check RLIMIT_MEMLOCK, \
-                     CAP_IPC_LOCK, and available address space."
+                    "secure memory initialization FAILED — all secret-carrying types \
+                     will panic on allocation. The daemon cannot safely handle secrets. \
+                     Check: RLIMIT_MEMLOCK (ulimit -l), CAP_IPC_LOCK, address space."
                 );
             }
         }
