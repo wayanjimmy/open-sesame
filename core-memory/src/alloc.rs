@@ -420,13 +420,15 @@ impl ProtectedAlloc {
         let guard2 = unsafe { base.add(3 * page + data_region_len) };
 
         // --- Guard pages ---
-        // SAFETY: All guard pointers are page-aligned and within the region.
+        // SAFETY: guard0 is page-aligned (mmap base), 1 page, within region.
         if unsafe { libc::mprotect(guard0.cast(), page, libc::PROT_NONE) } != 0 {
             return Err(ProtectedAllocError::MprotectFailed(errno(), "guard0"));
         }
+        // SAFETY: guard1 = base + 2*PAGE, page-aligned, within region.
         if unsafe { libc::mprotect(guard1.cast(), page, libc::PROT_NONE) } != 0 {
             return Err(ProtectedAllocError::MprotectFailed(errno(), "guard1"));
         }
+        // SAFETY: guard2 = base + 3*PAGE + data_region_len, page-aligned, last page.
         if unsafe { libc::mprotect(guard2.cast(), page, libc::PROT_NONE) } != 0 {
             return Err(ProtectedAllocError::MprotectFailed(errno(), "guard2"));
         }
@@ -597,17 +599,18 @@ impl ProtectedAlloc {
     }
 
     #[inline]
-    pub fn is_secret_mem(&self) -> bool {
+    pub(crate) fn is_secret_mem(&self) -> bool {
         self.is_secret_mem
     }
 
-    #[inline]
-    pub fn data_region_len(&self) -> usize {
-        self.data_region_len
-    }
-
-    /// Constant-time comparison.
-    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    /// Constant-time byte comparison for fixed-length inputs.
+    ///
+    /// The length check at the top is NOT constant-time — it leaks whether
+    /// the lengths match. This is acceptable because this function is only
+    /// called to verify the canary, which is always exactly `CANARY_SIZE`
+    /// bytes on both sides. For variable-length secret comparison, use a
+    /// proper constant-time comparison library.
+    fn fixed_len_constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         if a.len() != b.len() {
             return false;
         }
@@ -639,7 +642,7 @@ impl Drop for ProtectedAlloc {
             unsafe { std::slice::from_raw_parts(self.canary_ptr.as_ptr(), CANARY_SIZE) };
         let canary_expected = global_canary();
 
-        if !Self::constant_time_eq(canary_actual, canary_expected) {
+        if !Self::fixed_len_constant_time_eq(canary_actual, canary_expected) {
             tracing::error!(
                 audit = "memory-protection",
                 event_type = "canary-corruption",
@@ -662,14 +665,19 @@ impl Drop for ProtectedAlloc {
                 libc::munlock(self.data_region.as_ptr().cast(), self.data_region_len);
             }
 
+            // Re-enable core dump inclusion (Linux, mmap fallback only).
+            // memfd_secret pages were never marked DONTDUMP and are not in
+            // the direct map — DODUMP is meaningless for them.
             #[cfg(target_os = "linux")]
-            // SAFETY: data_region pointer/size are valid.
-            unsafe {
-                libc::madvise(
-                    self.data_region.as_ptr().cast(),
-                    self.data_region_len,
-                    libc::MADV_DODUMP,
-                );
+            if !self.is_secret_mem {
+                // SAFETY: data_region pointer/size are valid.
+                unsafe {
+                    libc::madvise(
+                        self.data_region.as_ptr().cast(),
+                        self.data_region_len,
+                        libc::MADV_DODUMP,
+                    );
+                }
             }
         }
 
@@ -864,11 +872,17 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_works() {
-        assert!(ProtectedAlloc::constant_time_eq(b"hello", b"hello"));
-        assert!(!ProtectedAlloc::constant_time_eq(b"hello", b"world"));
-        assert!(!ProtectedAlloc::constant_time_eq(b"hello", b"hell"));
-        assert!(ProtectedAlloc::constant_time_eq(b"", b""));
+    fn fixed_len_constant_time_eq_works() {
+        assert!(ProtectedAlloc::fixed_len_constant_time_eq(
+            b"hello", b"hello"
+        ));
+        assert!(!ProtectedAlloc::fixed_len_constant_time_eq(
+            b"hello", b"world"
+        ));
+        assert!(!ProtectedAlloc::fixed_len_constant_time_eq(
+            b"hello", b"hell"
+        ));
+        assert!(ProtectedAlloc::fixed_len_constant_time_eq(b"", b""));
     }
 
     #[test]

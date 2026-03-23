@@ -192,26 +192,6 @@ impl SecureVec {
         }
     }
 
-    /// Extract the buffer contents as a `Vec<u8>`, zeroize the protected
-    /// region, and reset the cursor.
-    ///
-    /// The caller receives a heap `Vec<u8>` and is responsible for zeroizing
-    /// it after use (e.g., passing to Argon2id which zeroizes its input).
-    pub fn take(&mut self) -> Vec<u8> {
-        if self.cursor == 0 {
-            return Vec::new();
-        }
-        let cur = self.cursor;
-        let alloc = self.alloc_mut();
-        let data = alloc.as_bytes()[..cur].to_vec();
-        // Zeroize the protected region.
-        for byte in &mut alloc.as_bytes_mut()[..cur] {
-            *byte = 0;
-        }
-        self.cursor = 0;
-        data
-    }
-
     /// Zeroize all bytes and reset the cursor to zero.
     ///
     /// Does NOT deallocate — the buffer can be reused for the next password
@@ -357,26 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn take_returns_bytes_and_resets() {
-        let mut sv = SecureVec::for_password();
-        sv.push_char('a');
-        sv.push_char('b');
-        sv.push_char('c');
-
-        let taken = sv.take();
-        assert_eq!(taken, b"abc");
-        assert!(sv.is_empty());
-        assert_eq!(sv.len(), 0);
-    }
-
-    #[test]
-    fn take_empty_returns_empty_vec() {
-        let mut sv = SecureVec::new();
-        let taken = sv.take();
-        assert!(taken.is_empty());
-    }
-
-    #[test]
     fn debug_does_not_leak_contents() {
         let mut sv = SecureVec::for_password();
         sv.push_char('p');
@@ -452,14 +412,5 @@ mod tests {
         sv.push_char('c');
         assert_eq!(sv.char_count(), 1);
         assert_eq!(sv.as_bytes(), b"c");
-    }
-
-    #[test]
-    fn take_returns_bytes() {
-        let mut sv = SecureVec::for_password();
-        sv.push_char('x');
-        let taken = sv.take();
-        assert_eq!(taken, b"x");
-        assert!(sv.is_empty());
     }
 }

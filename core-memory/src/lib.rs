@@ -143,6 +143,11 @@ mod stub {
             Err(ProtectedAllocError::Unsupported)
         }
 
+        /// Always returns `Err(Unsupported)` on non-Unix platforms.
+        pub fn from_slice_or_sentinel(_data: &[u8]) -> Result<Self, ProtectedAllocError> {
+            Err(ProtectedAllocError::Unsupported)
+        }
+
         /// Stub — unreachable on non-Unix.
         pub fn as_bytes(&self) -> &[u8] {
             unreachable!()
@@ -160,6 +165,11 @@ mod stub {
 
         /// Stub — unreachable on non-Unix.
         pub fn is_empty(&self) -> bool {
+            unreachable!()
+        }
+
+        /// Stub — unreachable on non-Unix.
+        pub(crate) fn is_secret_mem(&self) -> bool {
             unreachable!()
         }
     }

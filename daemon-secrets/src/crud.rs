@@ -204,7 +204,7 @@ async fn secret_gate_pipeline(
 fn deny_get(key: &str, reason: SecretDenialReason) -> EventKind {
     EventKind::SecretGetResponse {
         key: key.to_owned(),
-        value: SensitiveBytes::new(vec![]),
+        value: SensitiveBytes::from_slice(&[]),
         denial: Some(reason),
     }
 }
@@ -245,11 +245,15 @@ pub(crate) async fn handle_secret_get(
             Ok(secret) => {
                 #[cfg(feature = "ipc-field-encryption")]
                 let (value, denial) = match state.encrypt_for_ipc(profile, secret.as_bytes()) {
-                    Ok(v) => (SensitiveBytes::new(v), None),
+                    Ok(mut v) => {
+                        let sb = SensitiveBytes::from_slice(&v);
+                        zeroize::Zeroize::zeroize(&mut v);
+                        (sb, None)
+                    }
                     Err(e) => {
                         tracing::error!(profile = %profile, key, error = %e, "IPC encryption failed");
                         (
-                            SensitiveBytes::new(vec![]),
+                            SensitiveBytes::from_slice(&[]),
                             Some(SecretDenialReason::VaultError(format!(
                                 "IPC encryption failed: {e}"
                             ))),
@@ -258,7 +262,7 @@ pub(crate) async fn handle_secret_get(
                 };
                 #[cfg(not(feature = "ipc-field-encryption"))]
                 let (value, denial): (SensitiveBytes, Option<SecretDenialReason>) =
-                    (SensitiveBytes::new(secret.as_bytes().to_vec()), None);
+                    (SensitiveBytes::from_slice(secret.as_bytes()), None);
 
                 audit_secret_access("get", msg.sender, profile, Some(key), "success");
                 emit_audit_event(
@@ -292,7 +296,7 @@ pub(crate) async fn handle_secret_get(
                 .await;
                 Ok(Some(EventKind::SecretGetResponse {
                     key: key.to_owned(),
-                    value: SensitiveBytes::new(vec![]),
+                    value: SensitiveBytes::from_slice(&[]),
                     denial: Some(SecretDenialReason::NotFound),
                 }))
             }
@@ -312,7 +316,7 @@ pub(crate) async fn handle_secret_get(
             .await;
             Ok(Some(EventKind::SecretGetResponse {
                 key: key.to_owned(),
-                value: SensitiveBytes::new(vec![]),
+                value: SensitiveBytes::from_slice(&[]),
                 denial: Some(SecretDenialReason::VaultError(e.to_string())),
             }))
         }

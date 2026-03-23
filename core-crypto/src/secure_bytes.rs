@@ -28,25 +28,26 @@ pub struct SecureBytes {
     inner: ProtectedAlloc,
     /// Actual user data length. May be 0 even though `inner` holds 1 byte
     /// (sentinel for empty case). This field is the source of truth for
-    /// `len()`, `is_empty()`, `as_bytes()`, `into_vec()`, and `clone()`.
+    /// `len()`, `is_empty()`, `as_bytes()`, and `clone()`.
     actual_len: usize,
 }
 
 impl SecureBytes {
-    /// Create a new `SecureBytes` from a `Vec<u8>`.
+    /// Create a `SecureBytes` from a `Vec<u8>`.
     ///
-    /// The data is copied into a page-aligned protected allocation and the
-    /// source `Vec` is zeroized. Callers do not need to manually zeroize
-    /// the source after this call.
+    /// **Prefer [`from_slice`](Self::from_slice) whenever possible.** This
+    /// method exists only for callers that receive an owned `Vec<u8>` from
+    /// an external API (e.g., AES-GCM decrypt, platform keyring retrieve)
+    /// where a `&[u8]` is not available. The `Vec` is copied into protected
+    /// memory and zeroized, but the secret briefly exists on the unprotected
+    /// heap during the copy — `from_slice` avoids this by copying directly
+    /// from a borrowed reference.
     ///
-    /// Empty data is permitted and produces a valid `SecureBytes` with
-    /// `len() == 0` and `is_empty() == true`.
+    /// Empty data is permitted.
     ///
     /// # Panics
     ///
-    /// Panics if:
-    /// - `mlock` fails (check `ulimit -l` and `CAP_IPC_LOCK`)
-    /// - `mmap` or `mprotect` fails (out of address space or VMA limit)
+    /// Panics if mlock, mmap, or mprotect fails.
     pub fn new(mut data: Vec<u8>) -> Self {
         let actual_len = data.len();
         // ProtectedAlloc requires non-zero size. For empty data, use a
@@ -71,8 +72,7 @@ impl SecureBytes {
     /// Same as [`SecureBytes::new`].
     pub fn from_slice(data: &[u8]) -> Self {
         let actual_len = data.len();
-        let alloc_data: &[u8] = if data.is_empty() { &[0u8] } else { data };
-        let alloc = ProtectedAlloc::from_slice(alloc_data)
+        let alloc = ProtectedAlloc::from_slice_or_sentinel(data)
             .unwrap_or_else(|e| panic!("SecureBytes allocation failed: {e}"));
         SecureBytes {
             inner: alloc,
@@ -95,22 +95,6 @@ impl SecureBytes {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.actual_len == 0
-    }
-
-    /// Consume the `SecureBytes` and return the inner data as a `Vec<u8>`.
-    ///
-    /// The data is copied OUT of the protected allocation into a normal
-    /// heap `Vec<u8>`. The caller takes ownership and is responsible for
-    /// zeroizing it. The `ProtectedAlloc` is dropped (zeroed + munmap'd).
-    ///
-    /// Prefer `into_protected_alloc()` when the destination also uses
-    /// `ProtectedAlloc` (e.g., `SensitiveBytes::from_protected()`) to
-    /// avoid exposing secrets on the unprotected heap.
-    #[must_use]
-    pub fn into_vec(self) -> Vec<u8> {
-        // Copy out only actual_len bytes before ProtectedAlloc::drop zeroes the source.
-        self.as_bytes().to_vec()
-        // `self` is dropped here → ProtectedAlloc::drop runs → zeroes + munmap.
     }
 
     /// Consume the `SecureBytes` and return the inner `ProtectedAlloc` and
@@ -191,14 +175,6 @@ mod tests {
     }
 
     #[test]
-    fn into_vec_returns_data() {
-        let data = vec![10, 20, 30];
-        let sb = SecureBytes::new(data.clone());
-        let v = sb.into_vec();
-        assert_eq!(v, data);
-    }
-
-    #[test]
     fn clone_is_independent() {
         let sb1 = SecureBytes::new(vec![1, 2, 3]);
         let sb2 = sb1.clone();
@@ -228,13 +204,6 @@ mod tests {
         assert!(sb.is_empty());
         assert_eq!(sb.len(), 0);
         assert_eq!(sb.as_bytes(), &[]);
-    }
-
-    #[test]
-    fn empty_into_vec() {
-        let sb = SecureBytes::new(Vec::new());
-        let v = sb.into_vec();
-        assert!(v.is_empty());
     }
 
     #[test]

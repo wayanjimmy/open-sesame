@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn sensitive_bytes_debug_redacts() {
-        let sb = SensitiveBytes::new(b"super_secret".to_vec());
+        let sb = SensitiveBytes::from_slice(b"super_secret");
         let debug = format!("{sb:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("super_secret"));
@@ -354,24 +354,25 @@ mod tests {
 
     #[test]
     fn sensitive_bytes_accessors() {
-        let sb = SensitiveBytes::new(vec![1, 2, 3]);
+        let sb = SensitiveBytes::from_slice(&[1, 2, 3]);
         assert_eq!(sb.as_bytes(), &[1, 2, 3]);
         assert_eq!(sb.len(), 3);
         assert!(!sb.is_empty());
 
-        let empty = SensitiveBytes::new(vec![]);
+        let empty = SensitiveBytes::from_slice(&[]);
         assert!(empty.is_empty());
     }
 
     #[test]
-    fn sensitive_bytes_from_vec() {
-        let sb: SensitiveBytes = vec![0xAA, 0xBB].into();
+    fn sensitive_bytes_from_slice_trait() {
+        let data: &[u8] = &[0xAA, 0xBB];
+        let sb: SensitiveBytes = data.into();
         assert_eq!(sb.as_bytes(), &[0xAA, 0xBB]);
     }
 
     #[test]
     fn sensitive_bytes_clone() {
-        let sb1 = SensitiveBytes::new(vec![1, 2, 3]);
+        let sb1 = SensitiveBytes::from_slice(&[1, 2, 3]);
         let sb2 = sb1.clone();
         assert_eq!(sb1.as_bytes(), sb2.as_bytes());
         assert_eq!(sb1, sb2);
@@ -381,7 +382,7 @@ mod tests {
 
     #[test]
     fn sensitive_bytes_empty_clone() {
-        let sb1 = SensitiveBytes::new(vec![]);
+        let sb1 = SensitiveBytes::from_slice(&[]);
         let sb2 = sb1.clone();
         assert!(sb2.is_empty());
         assert_eq!(sb1, sb2);
@@ -389,7 +390,7 @@ mod tests {
 
     #[test]
     fn sensitive_bytes_postcard_round_trip() {
-        let original = SensitiveBytes::new(b"test secret value".to_vec());
+        let original = SensitiveBytes::from_slice(b"test secret value");
         let encoded = postcard::to_stdvec(&original).unwrap();
         let decoded: SensitiveBytes = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded.as_bytes(), b"test secret value");
@@ -398,7 +399,7 @@ mod tests {
 
     #[test]
     fn sensitive_bytes_postcard_round_trip_empty() {
-        let original = SensitiveBytes::new(vec![]);
+        let original = SensitiveBytes::from_slice(&[]);
         let encoded = postcard::to_stdvec(&original).unwrap();
         let decoded: SensitiveBytes = postcard::from_bytes(&encoded).unwrap();
         assert!(decoded.is_empty());
@@ -409,7 +410,7 @@ mod tests {
     fn sensitive_bytes_postcard_round_trip_binary() {
         // All byte values 0x00..0xFF to verify no encoding issues.
         let data: Vec<u8> = (0..=255).collect();
-        let original = SensitiveBytes::new(data.clone());
+        let original = SensitiveBytes::from_slice(&data);
         let encoded = postcard::to_stdvec(&original).unwrap();
         let decoded: SensitiveBytes = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded.as_bytes(), &data);
@@ -421,7 +422,7 @@ mod tests {
         // as a plain Vec<u8> would. This ensures wire compatibility
         // with the old #[serde(transparent)] implementation.
         let data = b"wire compat test".to_vec();
-        let sb = SensitiveBytes::new(data.clone());
+        let sb = SensitiveBytes::from_slice(&data);
         let sb_encoded = postcard::to_stdvec(&sb).unwrap();
         let vec_encoded = postcard::to_stdvec(&data).unwrap();
         assert_eq!(
@@ -470,7 +471,7 @@ mod tests {
     #[test]
     fn event_kind_debug_redacts_secrets() {
         let unlock = EventKind::UnlockRequest {
-            password: SensitiveBytes::new(b"hunter2".to_vec()),
+            password: SensitiveBytes::from_slice(b"hunter2"),
             profile: None,
         };
         let debug = format!("{unlock:?}");
@@ -479,7 +480,7 @@ mod tests {
 
         let get_resp = EventKind::SecretGetResponse {
             key: "api-key".into(),
-            value: SensitiveBytes::new(b"secret123".to_vec()),
+            value: SensitiveBytes::from_slice(b"secret123"),
             denial: None,
         };
         let debug = format!("{get_resp:?}");
@@ -490,7 +491,7 @@ mod tests {
         let set = EventKind::SecretSet {
             profile: TrustProfileName::try_from("work").unwrap(),
             key: "db-pass".into(),
-            value: SensitiveBytes::new(b"p@ssw0rd".to_vec()),
+            value: SensitiveBytes::from_slice(b"p@ssw0rd"),
         };
         let debug = format!("{set:?}");
         assert!(debug.contains("REDACTED"));
@@ -1098,7 +1099,7 @@ mod tests {
     #[test]
     fn test_unlock_request_roundtrip_with_profile() {
         let event = EventKind::UnlockRequest {
-            password: SensitiveBytes::new(b"secret".to_vec()),
+            password: SensitiveBytes::from_slice(b"secret"),
             profile: Some(TrustProfileName::try_from("work").unwrap()),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -1187,7 +1188,7 @@ mod tests {
     #[test]
     fn test_unlock_request_debug_redacts_password_shows_profile() {
         let event = EventKind::UnlockRequest {
-            password: SensitiveBytes::new(b"super-secret".to_vec()),
+            password: SensitiveBytes::from_slice(b"super-secret"),
             profile: Some(TrustProfileName::try_from("myprofile").unwrap()),
         };
         let debug = format!("{event:?}");

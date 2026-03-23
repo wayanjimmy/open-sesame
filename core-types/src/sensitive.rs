@@ -28,26 +28,6 @@ pub struct SensitiveBytes {
 }
 
 impl SensitiveBytes {
-    /// Create a new `SensitiveBytes` from a `Vec<u8>`.
-    ///
-    /// The data is copied into page-aligned protected memory and the source
-    /// Vec is zeroized. Empty data is permitted (for denial/error responses).
-    ///
-    /// # Panics
-    ///
-    /// Panics if mlock or mmap fails.
-    #[must_use]
-    pub fn new(mut data: Vec<u8>) -> Self {
-        let actual_len = data.len();
-        let alloc = ProtectedAlloc::from_slice_or_sentinel(&data)
-            .unwrap_or_else(|e| panic!("SensitiveBytes allocation failed: {e}"));
-        data.zeroize();
-        SensitiveBytes {
-            inner: alloc,
-            actual_len,
-        }
-    }
-
     /// Create a `SensitiveBytes` from a byte slice.
     ///
     /// Copies directly into protected memory. No intermediate heap allocation.
@@ -183,8 +163,8 @@ impl fmt::Debug for SensitiveBytes {
     }
 }
 
-impl From<Vec<u8>> for SensitiveBytes {
-    fn from(data: Vec<u8>) -> Self {
-        Self::new(data)
+impl From<&[u8]> for SensitiveBytes {
+    fn from(data: &[u8]) -> Self {
+        Self::from_slice(data)
     }
 }
