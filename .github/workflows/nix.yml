@@ -29,10 +29,10 @@ jobs:
       - uses: cachix/cachix-action@v15
         with:
           name: scopecreep-zip
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          authToken: ${{ secrets.SCOPE_CREEP_CACHIX_PRIVATE_KEY }}
 
       - name: Build packages (with raised mlock limit for ProtectedAlloc)
         run: |
           sudo prlimit --pid $$ --memlock=268435456:268435456
-          nix build .#packages.${{ matrix.system }}.open-sesame -L
-          nix build .#packages.${{ matrix.system }}.open-sesame-desktop -L
+          nix build .#packages.${{ matrix.system }}.open-sesame --accept-flake-config -L
+          nix build .#packages.${{ matrix.system }}.open-sesame-desktop --accept-flake-config -L
