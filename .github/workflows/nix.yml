@@ -1,13 +1,24 @@
 name: Nix Build & Cache
 
 on:
-  push:
-    branches: [main]
+  # Callable from release.yml
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Git ref to build (tag or branch)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      SCOPE_CREEP_CACHIX_PRIVATE_KEY:
+        required: true
+
+  # Also runs standalone on PRs for cache warming
   pull_request:
     branches: [main]
 
 jobs:
-  build:
+  nix-cache:
     name: Nix ${{ matrix.system }}
     strategy:
       fail-fast: false
@@ -21,6 +32,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: cachix/install-nix-action@v31
         with:
